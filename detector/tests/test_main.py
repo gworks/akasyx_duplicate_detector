@@ -52,6 +52,27 @@ def test_rejects_missing_source(make_config, archive, tmp_path):
         main.preflight(config)
 
 
+def test_rejects_missing_crawler_repo(make_config, archive, source, tmp_path):
+    """crawler が無ければ add / verify は実行前に断る（設計書 §12）。"""
+    write_file(os.path.join(source, "a.txt"), b"hello")
+    config = make_config(
+        archive_root=archive,
+        source_path=source,
+        crawler_repo=str(tmp_path / "absent"),
+    )
+    with pytest.raises(PreflightError, match="akasyx_crawler が見つかりません"):
+        main.preflight(config)
+
+
+def test_single_file_source_does_not_need_crawler_repo(make_config, archive, tmp_path):
+    """単一ファイルは crawler を使わないので、crawler 不在でも通る。"""
+    path = write_file(str(tmp_path / "solo" / "x.txt"), b"solo")
+    config = make_config(
+        archive_root=archive, source_path=path, crawler_repo=str(tmp_path / "absent")
+    )
+    main.preflight(config)  # 例外にならない
+
+
 def test_rejects_incomplete_crawler_scan(
     make_config, archive, source, tmp_path, fake_crawler
 ):
