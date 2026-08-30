@@ -121,6 +121,8 @@ git push origin release/0.2.0    # ← これだけ
 
 以降 `.github/workflows/release-branch.yml` が自動実行する:
 
+0. **リリースゲート**: pytest を実行する。**緑でなければ以降を一切実行しない**
+   （タグもリリースも作られない）
 1. `detector/pyproject.toml` の version を更新し bot がコミット＆push
 2. そのコミットに `v0.2.0` タグを付与
 3. 直前タグからの差分でリリースノートを生成し GitHub Release を作成
@@ -133,10 +135,16 @@ push 直後に手元で `git pull` して bot コミットを取り込むこと�
 
 | ファイル | 役割 |
 |---|---|
-| `.github/workflows/release.yml` | 人が手でタグを打った場合の保険（検証2点 + Release が無ければ作成） |
-| `.github/workflows/version-guard.yml` | release/hotfix を head とする PR での検証（保険） |
+| `.github/workflows/tests.yml` | テスト本体（再利用可能ワークフロー）。CI とリリースゲートの両方から呼ばれる |
 | `.github/workflows/ci.yml` | pytest（push: develop / master、PR: develop 宛） |
+| `.github/workflows/release.yml` | 人が手でタグを打った場合の保険（ゲート + 検証2点 + Release が無ければ作成） |
+| `.github/workflows/version-guard.yml` | release/hotfix を head とする PR での検証（保険） |
 | `.github/scripts/` | bump_version.sh / verify_version.sh / release_notes.sh |
+
+**テストが緑でないブランチはリリースできません。** `release-branch.yml` と `release.yml` は
+どちらも先頭に `tests.yml` を呼ぶゲートジョブを持ち、リリース処理は `needs: test` で
+それに依存しています。テストが落ちればタグも GitHub Release も作られません
+（手動タグの場合、タグ自体は既に人が打っているので取り消せませんが、Release の公開は止まります）。
 
 ### やり直し（タグ・Release を消して切り直す）
 

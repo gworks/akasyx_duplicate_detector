@@ -1,5 +1,10 @@
 # レベルB（全自動）リリース: release/x.y.z の push で bump → タグ → Release → master マージ → ブランチ削除
-# 出典: 40_Knowledge/release_version_tag_automation（develop 無し・master のみに適合。akasyx_crawler と同一運用）
+# 出典: 40_Knowledge/release_version_tag_automation（akasyx_crawler から移植）
+#
+# ★リリースゲート: 先に test ジョブでテストを回し、緑でなければ release ジョブを
+#   一切実行しない（needs)。レベルBは本来リリース前ゲートを持たないが、
+#   「テストが緑でないブランチはリリースできない」ようにするため最小のゲートを入れた。
+#   2026-08-30 に、CI が赤のまま v0.1.0 が公開された実例があったための対策。
 name: Release Branch
 on:
   push:
@@ -7,7 +12,11 @@ on:
 permissions:
   contents: write
 jobs:
+  test:
+    uses: ./.github/workflows/tests.yml
+
   release:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
