@@ -111,6 +111,9 @@ def make_config(tmp_path, archive):
             "archive_root": archive,
             "db_dir": str(tmp_path / "dist" / "db"),
             "log_dir": str(tmp_path / "dist" / "log"),
+            # 実機に ../akasyx_crawler があるかどうかでテスト結果が変わらないよう、
+            # 既定は必ず存在しないパスにする（使う場合は fake_crawler が差し替える）
+            "crawler_repo": str(tmp_path / "no_crawler_here"),
         }
         params.update(kwargs)
         cfg = DetectorConfig(**params)
@@ -154,6 +157,9 @@ def fake_crawler(monkeypatch):
                 root_dir=target,
             )
 
+        # preflight は resolve_crawler_repo を別途呼ぶ。run_crawler だけ差し替えると
+        # 実機に crawler がある環境でしか通らないテストになる（CI で発覚）
+        monkeypatch.setattr(crawler_client, "resolve_crawler_repo", lambda path: path)
         # ingest / verify は同じモジュールオブジェクトを参照するのでこれで足りる
         monkeypatch.setattr(crawler_client, "run_crawler", _run)
         return _run

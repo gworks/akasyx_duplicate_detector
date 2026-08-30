@@ -135,7 +135,7 @@ push 直後に手元で `git pull` して bot コミットを取り込むこと�
 |---|---|
 | `.github/workflows/release.yml` | 人が手でタグを打った場合の保険（検証2点 + Release が無ければ作成） |
 | `.github/workflows/version-guard.yml` | release/hotfix を head とする PR での検証（保険） |
-| `.github/workflows/ci.yml` | pytest（push: master / feature / release / hotfix、PR: master） |
+| `.github/workflows/ci.yml` | pytest（push: develop / master、PR: develop 宛） |
 | `.github/scripts/` | bump_version.sh / verify_version.sh / release_notes.sh |
 
 ### やり直し（タグ・Release を消して切り直す）
