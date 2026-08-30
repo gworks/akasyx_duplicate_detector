@@ -1,12 +1,16 @@
 # CI: pytest（設計書 §14）
-# release/hotfix を push トリガに含める: bot の push では CI が走らないため、
-# 人が release ブランチを push した時点が CI 実行機会になる
+#
+# トリガは develop への push・develop 宛の PR・master への push の3つ。
+# release/hotfix では回さない — その中身は develop の時点で既にテスト済みであり、
+# release ブランチを切る行為自体は検証対象ではないため。
+# master を含めるのは人が直接 push した場合の保険。リリース時に bot が行う master への
+# マージは GITHUB_TOKEN の push なのでワークフローを起動せず、二重実行にはならない。
 name: CI
 on:
   push:
-    branches: ["master", "feature/**", "release/**", "hotfix/**"]
+    branches: ["master", "develop"]
   pull_request:
-    branches: ["master"]
+    branches: ["develop"]
 jobs:
   test:
     runs-on: ubuntu-latest
