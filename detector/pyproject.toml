@@ -1,6 +1,6 @@
 [project]
 name = "akasyx-duplicate-detector"
-version = "0.1.0"
+version = "0.1.1"
 description = "重複判定アーカイバ（akasyx_crawler の探索結果で保存用フォルダを構築する）"
 requires-python = ">=3.12"
 dependencies = [
