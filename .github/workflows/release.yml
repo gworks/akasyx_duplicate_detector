@@ -1,5 +1,8 @@
 # 保険: 人が手でタグを打った場合の検証と Release 作成
 # bot（GITHUB_TOKEN）が打ったタグではこのワークフローは起動しない（再帰実行防止）
+#
+# ★リリースゲート: こちらも test を通らなければ Release を作らない。
+#   タグ自体は人が既に打っているので取り消せないが、Release の公開は止められる。
 name: Release (manual tag)
 on:
   push:
@@ -7,7 +10,11 @@ on:
 permissions:
   contents: write
 jobs:
+  test:
+    uses: ./.github/workflows/tests.yml
+
   release:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

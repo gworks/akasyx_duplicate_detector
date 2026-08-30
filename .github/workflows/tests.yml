@@ -1,0 +1,24 @@
+# テスト本体（再利用可能ワークフロー）
+#
+# ci.yml（develop / master の検証）と release 系ワークフロー（リリースゲート）の
+# 両方から呼ぶ。テストの定義を1箇所に集約し、CI とゲートで中身がずれるのを防ぐ。
+name: Tests
+on:
+  workflow_call:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: detector
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install dependencies
+        # 必須依存は sqlalchemy のみ。任意 extra は無い（設計書 §13）
+        run: uv sync
+      - name: Run tests
+        # akasyx_crawler は別リポジトリで CI には無い。テストは crawler を一切必要と
+        # しない（fake_crawler フィクスチャが crawler_client を丸ごと肩代わりし、
+        # 判定ロジックは fs_files 相当の一時 DB で回る — 設計書 §14）
+        run: uv run pytest
