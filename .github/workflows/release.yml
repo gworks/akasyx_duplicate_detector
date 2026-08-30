@@ -1,0 +1,46 @@
+# 保険: 人が手でタグを打った場合の検証と Release 作成
+# bot（GITHUB_TOKEN）が打ったタグではこのワークフローは起動しない（再帰実行防止）
+name: Release (manual tag)
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version from tag
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME#v}"
+          echo "$VER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::タグが vX.Y.Z 形式ではありません"; exit 1; }
+          echo "VER=${VER}" >> "$GITHUB_ENV"
+          echo "TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+
+      - name: Verify version files match tag
+        run: bash .github/scripts/verify_version.sh "$VER"
+
+      - name: Verify tag points at release/hotfix/master
+        run: |
+          set -euo pipefail
+          # develop 相当への誤タグを落とす包含チェック（§6）
+          CONTAINED="$(git branch -r --contains "$GITHUB_SHA" | sed 's/^[ *]*//')"
+          echo "$CONTAINED" | grep -qE "^origin/(release/${VER}|hotfix/${VER}|master)$" \
+            || { echo "::error::タグが release/${VER}・hotfix/${VER}・master のいずれにも含まれていません"; exit 1; }
+
+      - name: Create GitHub Release (if missing)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} は既に存在します。スキップします"; exit 0
+          fi
+          bash .github/scripts/release_notes.sh "$TAG" "$GITHUB_SHA" > release_notes.md
+          gh release create "${TAG}" --title "${TAG}" --notes-file release_notes.md

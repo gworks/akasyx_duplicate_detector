@@ -1,0 +1,87 @@
+# レベルB（全自動）リリース: release/x.y.z の push で bump → タグ → Release → master マージ → ブランチ削除
+# 出典: 40_Knowledge/release_version_tag_automation（develop 無し・master のみに適合。akasyx_crawler と同一運用）
+name: Release Branch
+on:
+  push:
+    branches: ["release/**", "hotfix/**"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 直前タグの判定に全履歴+タグが必要
+
+      - name: Resolve version from branch name
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME#*/}"
+          echo "$VER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::ブランチ名が release/x.y.z 形式ではありません"; exit 1; }
+          echo "VER=${VER}" >> "$GITHUB_ENV"
+          echo "TAG=v${VER}" >> "$GITHUB_ENV"
+
+      - name: Write version files
+        run: |
+          set -euo pipefail
+          bash .github/scripts/bump_version.sh "$VER"
+          if git diff --quiet; then echo "既に ${VER}"; exit 0; fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: bump version to ${VER}"
+          git push
+
+      - name: Record release commit
+        run: |
+          # GITHUB_SHA は bump 前のコミットを指すため使わない（§7-1）
+          echo "RELEASE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Create and push tag
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::warning::タグ ${TAG} は既に存在します。スキップします"
+            echo "TAG_CREATED=false" >> "$GITHUB_ENV"; exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "${TAG}"
+          git push origin "${TAG}"
+          echo "TAG_CREATED=true" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        if: env.TAG_CREATED == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bash .github/scripts/release_notes.sh "$TAG" "$RELEASE_SHA" > release_notes.md
+          gh release create "${TAG}" --title "${TAG}" --notes-file release_notes.md
+
+      - name: Merge into master
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin master
+          git checkout -B align-master origin/master
+          if git merge-base --is-ancestor "$RELEASE_SHA" origin/master; then
+            echo "master は反映済み"
+          else
+            # マージ元はブランチ名ではなく RELEASE_SHA（自 push 直後の ref 紛れを避ける）
+            if ! git merge --no-ff "$RELEASE_SHA" -m "Merge ${GITHUB_REF_NAME} into master (${TAG})"; then
+              git merge --abort || true
+              echo "::error::master へのマージが競合しました。手動でマージしてください"; exit 1
+            fi
+            git push origin "HEAD:master"
+          fi
+
+      - name: Delete release branch
+        run: |
+          set -euo pipefail
+          git fetch origin master
+          git merge-base --is-ancestor "$RELEASE_SHA" origin/master \
+            || { echo "::error::master に未反映。ブランチは削除しません"; exit 1; }
+          git push origin --delete "${GITHUB_REF_NAME}"

@@ -1,0 +1,21 @@
+[project]
+name = "akasyx-duplicate-detector"
+version = "0.1.0"
+description = "重複判定アーカイバ（akasyx_crawler の探索結果で保存用フォルダを構築する）"
+requires-python = ">=3.12"
+dependencies = [
+    "sqlalchemy>=2.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.uv]
+# モジュール直置きのフラット構成（設計書 §5）。
+# 自身はビルド・インストールせず、依存ライブラリのみを .venv に入れる。
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

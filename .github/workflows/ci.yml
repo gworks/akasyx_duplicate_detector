@@ -1,0 +1,25 @@
+# CI: pytest（設計書 §14）
+# release/hotfix を push トリガに含める: bot の push では CI が走らないため、
+# 人が release ブランチを push した時点が CI 実行機会になる
+name: CI
+on:
+  push:
+    branches: ["master", "feature/**", "release/**", "hotfix/**"]
+  pull_request:
+    branches: ["master"]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: detector
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install dependencies
+        # 必須依存は sqlalchemy のみ。任意 extra は無い（設計書 §13）
+        run: uv sync
+      - name: Run tests
+        # akasyx_crawler は別リポジトリで CI には無い。crawler 連携のテストは
+        # 自動でスキップされ、判定ロジックは fs_files 相当の一時 DB で回る（設計書 §14）
+        run: uv run pytest
