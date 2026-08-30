@@ -1,6 +1,7 @@
 # レベルB（全自動）リリース: release/x.y.z の push で bump → タグ → Release → master マージ → ブランチ削除
 # 出典: 40_Knowledge/release_version_tag_automation（akasyx_crawler から移植）
-# 本リポジトリは develop が本流のため、master に加えて develop にも戻しマージする
+# master と develop の両方へ戻しマージする（正本どおり。crawler は develop 無しの
+# 運用だったためこの部分が欠けており、移植時に補った）
 #
 # ★リリースゲート: 先に test ジョブでテストを回し、緑でなければ release ジョブを
 #   一切実行しない（needs)。レベルBは本来リリース前ゲートを持たないが、
@@ -70,51 +71,29 @@ jobs:
           bash .github/scripts/release_notes.sh "$TAG" "$RELEASE_SHA" > release_notes.md
           gh release create "${TAG}" --title "${TAG}" --notes-file release_notes.md
 
-      - name: Merge into master
+      - name: Merge into master and develop
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin master
-          git checkout -B align-master origin/master
-          if git merge-base --is-ancestor "$RELEASE_SHA" origin/master; then
-            echo "master は反映済み"
-          else
+          git fetch origin master develop
+          for TARGET in master develop; do
+            git checkout -B "align-${TARGET}" "origin/${TARGET}"
+            if git merge-base --is-ancestor "$RELEASE_SHA" "origin/${TARGET}"; then continue; fi
             # マージ元はブランチ名ではなく RELEASE_SHA（自 push 直後の ref 紛れを避ける）
-            if ! git merge --no-ff "$RELEASE_SHA" -m "Merge ${GITHUB_REF_NAME} into master (${TAG})"; then
+            if ! git merge --no-ff "$RELEASE_SHA" -m "Merge ${GITHUB_REF_NAME} into ${TARGET} (${TAG})"; then
               git merge --abort || true
-              echo "::error::master へのマージが競合しました。手動でマージしてください"; exit 1
+              echo "::error::${TARGET} へのマージが競合しました。手動でマージしてください"; exit 1
             fi
-            git push origin "HEAD:master"
-          fi
-
-      - name: Merge back into develop
-        run: |
-          set -euo pipefail
-          # develop が本流（コード修正もテストも develop で行い、release は展開するだけ）。
-          # bump コミットを develop に戻さないと version.txt が古いまま残り、
-          # develop と master が乖離して次回のマージで衝突する
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if ! git ls-remote --exit-code --heads origin develop >/dev/null 2>&1; then
-            echo "develop がありません。スキップします"; exit 0
-          fi
-          git fetch origin develop
-          git checkout -B align-develop origin/develop
-          if git merge-base --is-ancestor "$RELEASE_SHA" origin/develop; then
-            echo "develop は反映済み"
-          else
-            if ! git merge --no-ff "$RELEASE_SHA" -m "Merge ${GITHUB_REF_NAME} into develop (${TAG})"; then
-              git merge --abort || true
-              echo "::error::develop へのマージが競合しました。手動でマージしてください"; exit 1
-            fi
-            git push origin "HEAD:develop"
-          fi
+            git push origin "HEAD:${TARGET}"
+          done
 
       - name: Delete release branch
         run: |
           set -euo pipefail
-          git fetch origin master
-          git merge-base --is-ancestor "$RELEASE_SHA" origin/master \
-            || { echo "::error::master に未反映。ブランチは削除しません"; exit 1; }
+          git fetch origin master develop
+          for TARGET in master develop; do
+            git merge-base --is-ancestor "$RELEASE_SHA" "origin/${TARGET}" \
+              || { echo "::error::${TARGET} に未反映。ブランチは削除しません"; exit 1; }
+          done
           git push origin --delete "${GITHUB_REF_NAME}"

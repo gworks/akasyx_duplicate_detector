@@ -129,9 +129,8 @@ git push origin release/0.2.0    # ← これだけ
 1. `detector/pyproject.toml` の version を更新し bot がコミット＆push
 2. そのコミットに `v0.2.0` タグを付与
 3. 直前タグからの差分でリリースノートを生成し GitHub Release を作成
-4. master へ `--no-ff` マージ
-5. **develop へも `--no-ff` マージ**（bump コミットを本流に戻す）
-6. release ブランチを削除
+4. **master と develop の両方へ `--no-ff` マージ**（bump コミットを本流に戻す）
+5. 両方への反映を確認してから release ブランチを削除
 
 push 直後に手元で `git checkout develop && git pull` して bot コミットを取り込むこと。
 
@@ -142,6 +141,7 @@ push 直後に手元で `git checkout develop && git pull` して bot コミッ�
 | `.github/workflows/tests.yml` | テスト本体（再利用可能ワークフロー）。CI とリリースゲートの両方から呼ばれる |
 | `.github/workflows/ci.yml` | pytest（push: develop / master、PR: develop 宛） |
 | `.github/workflows/release.yml` | 人が手でタグを打った場合の保険（ゲート + 検証2点 + Release が無ければ作成） |
+| `.github/workflows/version-guard.yml` | release/hotfix を head とする PR での検証（保険） |
 | `.github/scripts/` | bump_version.sh / verify_version.sh / release_notes.sh |
 
 **テストが緑でないブランチはリリースできません。** `release-branch.yml` と `release.yml` は
