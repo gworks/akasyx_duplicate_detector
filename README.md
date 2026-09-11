@@ -1,3 +1,5 @@
+## test codex review
+
 # akasyx_duplicate_detector
 
 重複判定アーカイバ。指定した**保存用フォルダ**に、内容が重複しないファイル集合を構築する。
@@ -46,12 +48,12 @@ uv run main.py --help
 
 上から順に評価し、最初に該当したもので確定する。
 
-| 条件 | 判定 | 実体 |
-|---|---|---|
-| 0 バイト（`--min-size` 未満） | `skipped_empty` | 投入元に残す |
-| ハッシュが取れなかった | `skipped_nohash` | 投入元に残す |
-| 同一ハッシュが保存 DB にある | `duplicate` | **投入元に残す** |
-| 上記以外 | `moved` | 保存フォルダへ移動 |
+| 条件                          | 判定             | 実体               |
+| ----------------------------- | ---------------- | ------------------ |
+| 0 バイト（`--min-size` 未満） | `skipped_empty`  | 投入元に残す       |
+| ハッシュが取れなかった        | `skipped_nohash` | 投入元に残す       |
+| 同一ハッシュが保存 DB にある  | `duplicate`      | **投入元に残す**   |
+| 上記以外                      | `moved`          | 保存フォルダへ移動 |
 
 ### 保存フォルダの構造
 
@@ -84,12 +86,12 @@ uv run main.py --help
 
 ### 終了コード
 
-| 値 | 意味 |
-|---|---|
-| 0 | 正常終了 |
-| 1 | 致命的エラーで停止した |
-| 2 | 完走したが失敗が 1 件以上あった（人の確認が要る） |
-| 3 | 事前チェックで拒否した（入れ子・crawler 不在・crawler のスキャン不完全 等） |
+| 値  | 意味                                                                        |
+| --- | --------------------------------------------------------------------------- |
+| 0   | 正常終了                                                                    |
+| 1   | 致命的エラーで停止した                                                      |
+| 2   | 完走したが失敗が 1 件以上あった（人の確認が要る）                           |
+| 3   | 事前チェックで拒否した（入れ子・crawler 不在・crawler のスキャン不完全 等） |
 
 ## テスト
 
@@ -136,13 +138,13 @@ push 直後に手元で `git checkout develop && git pull` して bot コミッ�
 
 ### 補助ワークフロー
 
-| ファイル | 役割 |
-|---|---|
-| `.github/workflows/tests.yml` | テスト本体（再利用可能ワークフロー）。CI とリリースゲートの両方から呼ばれる |
-| `.github/workflows/ci.yml` | pytest（push: develop / master、PR: develop 宛） |
-| `.github/workflows/release.yml` | 人が手でタグを打った場合の保険（ゲート + 検証2点 + Release が無ければ作成） |
-| `.github/workflows/version-guard.yml` | release/hotfix を head とする PR での検証（保険） |
-| `.github/scripts/` | bump_version.sh / verify_version.sh / release_notes.sh |
+| ファイル                              | 役割                                                                        |
+| ------------------------------------- | --------------------------------------------------------------------------- |
+| `.github/workflows/tests.yml`         | テスト本体（再利用可能ワークフロー）。CI とリリースゲートの両方から呼ばれる |
+| `.github/workflows/ci.yml`            | pytest（push: develop / master、PR: develop 宛）                            |
+| `.github/workflows/release.yml`       | 人が手でタグを打った場合の保険（ゲート + 検証2点 + Release が無ければ作成） |
+| `.github/workflows/version-guard.yml` | release/hotfix を head とする PR での検証（保険）                           |
+| `.github/scripts/`                    | bump_version.sh / verify_version.sh / release_notes.sh                      |
 
 **テストが緑でないブランチはリリースできません。** `release-branch.yml` と `release.yml` は
 どちらも先頭に `tests.yml` を呼ぶゲートジョブを持ち、リリース処理は `needs: test` で
