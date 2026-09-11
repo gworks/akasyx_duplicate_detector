@@ -101,6 +101,65 @@ uv run pytest
 crawler は別リポジトリで CI には無いため、`fs_files` 相当の一時 SQLite を作って
 判定ロジックを回す。crawler の起動そのものは `crawler_client.py` に閉じ込めてある。
 
+## UI（Electron）
+
+パス入力とオプション指定を画面から行うためのフロントエンドです。`electron-ui/` に置き、
+**detector 側には一切手を入れていません**。UI はロジックを持たず、フォームの値から
+`uv run main.py ...` を組み立てて子プロセス起動し、標準出力・終了コードを表示するだけです
+（設計書 §16 の「境界を CLI に固定する」方針）。UI が壊れても CLI は無傷で、
+CLI で直せることは UI でも同じように直ります。
+
+### 起動
+
+```bash
+cd electron-ui
+npm install       # 初回のみ。Electron のバイナリ（約110MB）を取得する
+npm run dev
+```
+
+`npm install` が「Downloading Electron binary...」のまま進まないときは回線が細いだけなので、
+そのまま待つか `node node_modules/electron/install.js` で取得だけやり直す。
+
+Python 側の前提は CLI と同じです（`detector/` で `uv sync` 済み、`add`/`verify` で
+フォルダを扱うなら `../akasyx_crawler` も用意されていること）。
+
+### 画面でできること
+
+| タブ | 対応コマンド |
+|---|---|
+| 取り込み | `add`（dry-run、`--dest-subdir`、`--min-size` などを含む） |
+| 整合性チェック | `verify`（`--flag-quarantine` の4種別をチェックボックスで指定） |
+| 重複の後始末 | `delete-duplicates`（`--trash-dir` / `--yes`） |
+| 状態・履歴 | `report` |
+
+入力を楽にするための仕掛け:
+
+- **ドラッグ＆ドロップ** — パス欄にフォルダやファイルを落とすとパスが入ります
+- **保存用フォルダの履歴** — 過去に使ったものを入力欄の候補から選べます
+- **前回の入力を復元** — 次回起動時に同じ値が入っています
+  （ただし `--yes`（実削除）は毎回オフに戻ります）
+- **実行されるコマンドを常時表示** — 「コピー」でターミナルにそのまま貼れる形で取れます
+- **進捗の集計表示** — `add` の1ファイル1行の出力はログに流さず、件数と判定内訳に集計します
+- **CSV / ログへの導線** — 実行後に出力された CSV を Finder で開けます
+
+### 安全側の作り
+
+- 引数の組み立ては `electron-ui/commands.js` の 1 箇所だけで行い、画面に出す
+  コマンドプレビューと実際に実行するコマンドが食い違わないようにしています
+- `delete-duplicates --yes`（実削除）は、メインプロセス側で必ず確認ダイアログを出します
+  （画面側の実装に依存しません）
+- 「中断」は子プロセスのプロセスグループへ `SIGINT` を送ります。detector は
+  `KeyboardInterrupt` を受けて `status='interrupted'` で後片付けするので、
+  途中で止めても DB と実体の整合は保たれます
+- レンダラは `contextIsolation` / `sandbox` 有効、Node 統合なし、CSP で外部読み込み禁止
+
+### 配布について
+
+現状は**開発起動のみ**（`npm run dev`）です。`.app` へのパッケージングは、
+まず使ってみて要件が固まってから electron-builder を入れる想定です。
+`electron-ui/package.json` に version を持たせていないのは、
+バージョンの正本を `version.txt` 1 本に保つためです（UI はこれを読んで表示します）。
+
 ## リリース運用（レベルB・全自動）
 
 - **バージョンの正本**: リポジトリルートの `version.txt`（CLI の `--version` が読む）。
