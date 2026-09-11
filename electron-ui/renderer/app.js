@@ -248,16 +248,22 @@ async function start() {
   if (running) return;
   clearLog();
   const form = collectForm();
+  // 応答を待つ前に実行中にする。spawn 失敗（uv 不在など）では応答より先に run:exit が届くことがあり、
+  // 応答側で後から実行中に戻すと、子プロセスが無いのに操作不能になる
+  setRunning(true);
+  setStatus('info', '起動中…');
   const result = await api.start(form);
   if (!result.started) {
-    if (result.error) setStatus('error', result.error);
+    setRunning(false);
+    setStatus(result.error ? 'error' : 'info', result.error || 'キャンセルしました');
     return;
   }
   appendLog([{ stream: 'meta', text: `$ ${result.command}` }]);
-  setStatus('info', '実行中…');
-  setRunning(true);
   rememberRecent((form.archiveRoot || '').trim());
   persist();
+  // 応答より先に終了通知を受けて片付いていたら（onExit が running を落としている）、状態を上書きしない
+  if (!running) return;
+  setStatus('info', '実行中…');
 }
 
 function logDir() {
