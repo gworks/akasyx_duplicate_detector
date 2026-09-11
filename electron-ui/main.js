@@ -255,18 +255,26 @@ ipcMain.handle('command:preview', (_event, form) => {
   }
 });
 
+/**
+ * detector が出力したパス（CSV レポート、--log-dir 等）を絶対パスにします。
+ * 子プロセスは cwd=DETECTOR_DIR で動くので、相対で指定・出力されたものはそこ基準で解決する。
+ * Electron 自身の cwd（npm run dev なら electron-ui/）基準にすると別の場所を指してしまう。
+ */
+function resolveDetectorPath(target) {
+  return target ? path.resolve(DETECTOR_DIR, String(target)) : null;
+}
+
 ipcMain.handle('shell:reveal', (_event, target) => {
-  if (!target) return false;
-  if (fs.existsSync(target)) {
-    shell.showItemInFolder(target);
-    return true;
-  }
-  return false;
+  const resolved = resolveDetectorPath(target);
+  if (!resolved || !fs.existsSync(resolved)) return false;
+  shell.showItemInFolder(resolved);
+  return true;
 });
 
 ipcMain.handle('shell:open', (_event, target) => {
-  if (!target || !fs.existsSync(target)) return false;
-  shell.openPath(target);
+  const resolved = resolveDetectorPath(target);
+  if (!resolved || !fs.existsSync(resolved)) return false;
+  shell.openPath(resolved);
   return true;
 });
 

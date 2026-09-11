@@ -361,6 +361,8 @@ function wireRunEvents() {
   api.onLog(appendLog);
   api.onProgress(renderProgress);
   api.onExit((result) => {
+    // 開き直し直後、getContext() の後〜復元前に終わった場合に古い状態で復元しないようにする
+    context.run = null;
     setRunning(false);
     if (result.csvPath) {
       lastCsvPath = result.csvPath;
@@ -375,6 +377,8 @@ function wireRunEvents() {
 }
 
 async function init() {
+  // 最初の await より前に購読する。走り続けている実行の終了通知を取りこぼさないため
+  wireRunEvents();
   context = await api.getContext();
   dom.version.textContent = `v${context.version}`;
   if (!context.detectorFound) {
@@ -391,7 +395,6 @@ async function init() {
   wireDropTargets();
   wireForm();
   wireRunControls();
-  wireRunEvents();
   syncDestSubdir();
   setMode(mode);
   if (context.run) resumeRun(context.run);
