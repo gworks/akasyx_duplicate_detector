@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { buildArgs, formatCommand, FormError } = require('./commands');
+const { buildArgs, formatCommand, quoteArg, FormError } = require('./commands');
 
 // electron-ui/ はリポジトリルート直下に置く（設計書 §16）
 const REPO_ROOT = path.dirname(__dirname);
@@ -32,7 +32,14 @@ const EXIT_MEANINGS = {
 
 let mainWindow = null;
 let child = null;          // 同時実行は 1 本だけ
+let starting = false;      // buildArgs〜spawn の間（削除確認ダイアログ待ちを含む）も「実行中」扱いにする
+let activeRun = null;      // { command, startedAt, pump } ウィンドウを閉じて開き直したときの復元用
 let stoppedByUser = false;
+
+/** 今開いているウィンドウへ送る。閉じられていれば捨てる（子プロセス自体は走り続ける）。 */
+function sendToWindow(channel, payload) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
+}
 
 // --- 設定の保存（最後に使った値と保存用フォルダの履歴） ---------------------
 
@@ -196,6 +203,10 @@ function createStreamPump(send) {
   return {
     onStdout: makeReader('out'),
     onStderr: makeReader('err'),
+    /** 現時点の集計（ウィンドウを開き直したときの初期表示用）。 */
+    snapshot() {
+      return { processed, tally: { ...tally }, csvPath };
+    },
     finish() {
       if (timer) clearTimeout(timer);
       flush();
@@ -209,9 +220,15 @@ function createStreamPump(send) {
 ipcMain.handle('app:context', () => ({
   repoRoot: REPO_ROOT,
   detectorDir: DETECTOR_DIR,
+  // 「コピー」で `cd` に貼る用。スペース等を含むチェックアウト先でもそのまま貼れるようにする
+  detectorDirQuoted: quoteArg(DETECTOR_DIR),
   version: appVersion(),
   uvPath: resolveUv(),
   detectorFound: fs.existsSync(path.join(DETECTOR_DIR, 'main.py')),
+  // macOS でウィンドウを閉じても子プロセスは走り続けるので、開き直した画面に状態を返す
+  run: activeRun
+    ? { command: activeRun.command, startedAt: activeRun.startedAt, ...activeRun.pump.snapshot() }
+    : null,
 }));
 
 ipcMain.handle('settings:load', () => loadSettings());
@@ -258,9 +275,18 @@ ipcMain.handle('clipboard:write', (_event, text) => {
   return true;
 });
 
-ipcMain.handle('run:start', async (event, form) => {
-  if (child) return { started: false, error: '実行中です。終わるまで待つか中断してください' };
+ipcMain.handle('run:start', async (_event, form) => {
+  // 確認ダイアログを待っている間も含めて 1 本に絞る（child は spawn 後にしか立たない）
+  if (child || starting) return { started: false, error: '実行中です。終わるまで待つか中断してください' };
+  starting = true;
+  try {
+    return await startRun(form);
+  } finally {
+    starting = false; // spawn できていれば以降は child が「実行中」を表す
+  }
+});
 
+async function startRun(form) {
   let args;
   try {
     args = buildArgs(form);
@@ -285,11 +311,11 @@ ipcMain.handle('run:start', async (event, form) => {
     if (response !== 1) return { started: false, error: null, canceled: true };
   }
 
-  const send = (channel, payload) => {
-    if (!event.sender.isDestroyed()) event.sender.send(channel, payload);
-  };
+  // 起動時のウィンドウではなく「今のウィンドウ」へ送る。閉じて開き直しても制御を失わないようにする
+  const send = sendToWindow;
   const pump = createStreamPump(send);
   const uv = resolveUv();
+  const command = formatCommand(args);
   stoppedByUser = false;
 
   child = spawn(uv, ['run', 'main.py', ...args], {
@@ -297,11 +323,13 @@ ipcMain.handle('run:start', async (event, form) => {
     env: childEnv(),
     detached: true, // 中断をプロセスグループごと送るため（uv の下の python にも届く）
   });
+  activeRun = { command, startedAt: Date.now(), pump };
   let finished = false;
   const finish = (payload) => {
     if (finished) return;
     finished = true;
     child = null;
+    activeRun = null;
     send('run:exit', { ...payload, ...pump.finish() });
   };
   child.stdout.setEncoding('utf-8');
@@ -335,8 +363,8 @@ ipcMain.handle('run:start', async (event, form) => {
     });
   });
 
-  return { started: true, error: null, command: formatCommand(args) };
-});
+  return { started: true, error: null, command };
+}
 
 ipcMain.handle('run:stop', () => {
   if (!child) return false;

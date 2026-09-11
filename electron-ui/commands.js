@@ -115,4 +115,4 @@ function quoteArg(arg) {
   return /^[A-Za-z0-9_./:=+-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, "'\\''")}'`;
 }
 
-module.exports = { MODES, QUARANTINE_KINDS, FormError, buildArgs, formatCommand };
+module.exports = { MODES, QUARANTINE_KINDS, FormError, buildArgs, formatCommand, quoteArg };

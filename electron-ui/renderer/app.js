@@ -210,7 +210,8 @@ function renderProgress({ processed, tally }) {
 
 // ------------------------------------------------------------------ 実行
 
-function setRunning(next) {
+/** 実行中表示の切り替え。since を渡すと（開き直し時など）その時刻からの経過で表示する。 */
+function setRunning(next, since = Date.now()) {
   running = next;
   dom.run.disabled = next;
   dom.stop.disabled = !next;
@@ -219,15 +220,28 @@ function setRunning(next) {
 
   clearInterval(elapsedTimer);
   if (next) {
-    startedAt = Date.now();
-    dom.elapsed.textContent = '0:00';
-    elapsedTimer = setInterval(() => {
+    startedAt = since;
+    const renderElapsed = () => {
       const seconds = Math.floor((Date.now() - startedAt) / 1000);
       dom.elapsed.textContent = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
-    }, 1000);
+    };
+    renderElapsed();
+    elapsedTimer = setInterval(renderElapsed, 1000);
   } else {
     refreshPreview();
   }
+}
+
+/** ウィンドウを閉じて開き直したとき、走り続けている実行の表示と「中断」を取り戻す。 */
+function resumeRun(run) {
+  clearLog();
+  appendLog([
+    { stream: 'meta', text: `$ ${run.command}` },
+    { stream: 'meta', text: '（ウィンドウを開き直しました。ここまでのログは表示されませんが、実行は続いています）' },
+  ]);
+  if (run.processed) renderProgress(run);
+  setStatus('info', '実行中…');
+  setRunning(true, run.startedAt);
 }
 
 async function start() {
@@ -327,7 +341,8 @@ function wireRunControls() {
   dom.copyCommand.addEventListener('click', () => {
     const text = dom.commandText.textContent;
     if (text && !dom.commandText.classList.contains('invalid')) {
-      api.copy(`cd ${context.detectorDir} && ${text}`);
+      // cd 先はメインプロセスで引数と同じ規則でクォート済み（スペース入りパス対策）
+      api.copy(`cd ${context.detectorDirQuoted} && ${text}`);
       dom.copyCommand.textContent = 'コピーしました';
       setTimeout(() => { dom.copyCommand.textContent = 'コピー'; }, 1400);
     }
@@ -379,6 +394,7 @@ async function init() {
   wireRunEvents();
   syncDestSubdir();
   setMode(mode);
+  if (context.run) resumeRun(context.run);
 }
 
 init();
