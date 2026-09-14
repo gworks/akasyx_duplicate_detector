@@ -57,12 +57,14 @@
 
         <fieldset class="group">
           <legend>保存先</legend>
-          <label class="check">
-            <input type="checkbox" id="useDestSubdir" data-field="useDestSubdir" />
-            <span>第1階層名を指定する（既定は投入元フォルダ名）</span>
-          </label>
-          <input class="input" type="text" id="destSubdir" data-field="destSubdir"
-                 placeholder="空にすると保存フォルダ直下に展開" spellcheck="false" disabled />
+          <p class="hint block">
+            作成日の年月フォルダ（<code>YYYY-MM/</code>）の下に、投入元フォルダ名と投入元の階層をそのまま再現します。
+            ファイルが直接入るフォルダが上限件数に達すると <code>001/</code>, <code>002/</code>, … の枝に入ります。
+          </p>
+          <div class="field inline">
+            <label class="label small" for="folderLimit">1 フォルダに直接置く上限件数</label>
+            <input class="input narrow" type="number" id="folderLimit" data-field="folderLimit" min="1" step="1" value="500" />
+          </div>
         </fieldset>
 
         <fieldset class="group">
@@ -80,8 +82,8 @@
             <span>シンボリックリンクを追跡する</span>
           </label>
           <label class="check">
-            <input type="checkbox" id="pruneEmptyDirs" data-field="pruneEmptyDirs" />
-            <span>処理後に空になった投入元ディレクトリを削除する</span>
+            <input type="checkbox" id="pruneEmptyDirs" data-field="pruneEmptyDirs" checked />
+            <span>処理後に空になった投入元ディレクトリを削除する（<code>.DS_Store</code> しか無いフォルダも空とみなす）</span>
           </label>
         </fieldset>
       </div>
@@ -140,6 +142,14 @@
 
       <details class="advanced">
         <summary>詳細設定（既定のままで構いません）</summary>
+        <div class="field">
+          <label class="label small" for="archiveDb">正本 DB（全保存フォルダ共通・1 ファイル）</label>
+          <div class="path-row">
+            <input class="input drop" type="text" id="archiveDb" data-field="archiveDb"
+                   placeholder="既定: <リポジトリ>/dist/archive.db" spellcheck="false" />
+          </div>
+          <p class="hint">保存フォルダの外・ローカルディスクに置きます。保存フォルダはこの DB の中で ID 管理され、複数登録できます。</p>
+        </div>
         <div class="field">
           <label class="label small" for="crawlerRepo">akasyx_crawler のパス</label>
           <div class="path-row">

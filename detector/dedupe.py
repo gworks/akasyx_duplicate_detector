@@ -38,6 +38,7 @@ def _pending_items(session, config):
         session.query(IngestItem)
         .join(Ingest, IngestItem.ingest_id == Ingest.id)
         .filter(
+            Ingest.archive_id == config.archive_id,
             IngestItem.result == RESULT_DUPLICATE,
             IngestItem.resolution.is_(None),
             Ingest.dry_run == 0,
@@ -74,13 +75,14 @@ def check_item(session, config, item) -> tuple[str, str | None]:
         row = (
             session.query(ArchiveFile)
             .filter(
+                ArchiveFile.archive_id == config.archive_id,
                 ArchiveFile.filehash == item.filehash,
                 ArchiveFile.hash_algo == item.hash_algo,
                 ArchiveFile.status == STATUS_STORED,
             )
             .first()
         )
-    if row is None or row.status != STATUS_STORED:
+    if row is None or row.status != STATUS_STORED or row.archive_id != config.archive_id:
         return CHECK_ARCHIVE_MISSING, "保存フォルダ側の登録がありません"
 
     dst = from_posix(config.archive_root, row.stored_path_rel)

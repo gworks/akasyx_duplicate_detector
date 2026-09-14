@@ -15,11 +15,34 @@ const QUARANTINE_KINDS = [
 ];
 
 const DEFAULT_MIN_SIZE = 1; // config.py の既定値。同じ値なら引数に出さない
+const DEFAULT_FOLDER_LIMIT = 500; // config.py の DEFAULT_FOLDER_LIMIT
 
 class FormError extends Error {}
 
 function trimmed(value) {
   return typeof value === 'string' ? value.trim() : '';
+}
+
+/**
+ * パス欄の値を正規化します。ターミナルからコピーした形をそのまま貼っても通るように:
+ *   - 前後の空白を落とす
+ *   - 全体を囲む '…' / "…" を外す（`'/Users/a b/c'` → `/Users/a b/c`）
+ *   - シェルのバックスラッシュエスケープを解く（`/Users/a\ b` → `/Users/a b`）
+ *   - 先頭の `~/` をホームに展開する
+ * 正規化後の値がコマンドプレビューに出るので、何が渡るかは画面で確認できる。
+ */
+function normalizePath(value) {
+  let p = trimmed(value);
+  if (!p) return '';
+  const q = p[0];
+  if ((q === "'" || q === '"') && p.length >= 2 && p[p.length - 1] === q) {
+    p = p.slice(1, -1).trim();
+  }
+  p = p.replace(/\\(.)/g, '$1');
+  if (p === '~' || p.startsWith('~/')) {
+    p = require('node:os').homedir() + p.slice(1);
+  }
+  return p;
 }
 
 /** フォーム1件から CLI 引数配列を作ります。不備は FormError で返します。 */
@@ -29,7 +52,7 @@ function buildArgs(form) {
     throw new FormError(`不明なコマンドです: ${mode || '(未指定)'}`);
   }
 
-  const archiveRoot = trimmed(form.archiveRoot);
+  const archiveRoot = normalizePath(form.archiveRoot);
   if (!archiveRoot) {
     throw new FormError('保存用フォルダを指定してください');
   }
@@ -37,16 +60,22 @@ function buildArgs(form) {
   const args = [mode, archiveRoot];
 
   if (mode === 'add') {
-    const sourcePath = trimmed(form.sourcePath);
+    const sourcePath = normalizePath(form.sourcePath);
     if (!sourcePath) {
       throw new FormError('投入元（追加したいファイル / フォルダ）を指定してください');
     }
     args.push(sourcePath);
 
-    if (form.useDestSubdir) {
-      // '' は「保存フォルダ直下に展開」を意味する有効な指定なので、空でも渡す
-      args.push('--dest-subdir', trimmed(form.destSubdir));
+    // 1 フォルダの上限件数。既定値と同じなら引数に出さず detector の既定に任せる
+    const rawFolderLimit = trimmed(String(form.folderLimit ?? ''));
+    if (rawFolderLimit) {
+      const folderLimit = Number(rawFolderLimit);
+      if (!Number.isInteger(folderLimit) || folderLimit < 1) {
+        throw new FormError(`1 フォルダの上限件数は 1 以上の整数で指定してください: ${rawFolderLimit}`);
+      }
+      if (folderLimit !== DEFAULT_FOLDER_LIMIT) args.push('--folder-limit', String(folderLimit));
     }
+
     if (form.dryRun) args.push('--dry-run');
 
     // 空欄は「既定のまま」。既定値と同じなら引数を増やさない
@@ -73,7 +102,7 @@ function buildArgs(form) {
 
   if (mode === 'delete-duplicates') {
     pushIngestId(args, form.ingestId);
-    const trashDir = trimmed(form.trashDir);
+    const trashDir = normalizePath(form.trashDir);
     if (trashDir) args.push('--trash-dir', trashDir);
     if (form.pruneEmptyDirs) args.push('--prune-empty-dirs');
     if (form.yes) args.push('--yes');
@@ -85,11 +114,12 @@ function buildArgs(form) {
 
   // crawler 関連の上書き（未指定なら detector の既定に任せる）
   for (const [key, flag] of [
+    ['archiveDb', '--archive-db'],
     ['crawlerRepo', '--crawler-repo'],
     ['dbDir', '--db-dir'],
     ['logDir', '--log-dir'],
   ]) {
-    const value = trimmed(form[key]);
+    const value = normalizePath(form[key]);
     if (value) args.push(flag, value);
   }
 
@@ -115,4 +145,6 @@ function quoteArg(arg) {
   return /^[A-Za-z0-9_./:=+-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, "'\\''")}'`;
 }
 
-module.exports = { MODES, QUARANTINE_KINDS, FormError, buildArgs, formatCommand, quoteArg };
+module.exports = {
+  MODES, QUARANTINE_KINDS, FormError, buildArgs, formatCommand, quoteArg, normalizePath,
+};

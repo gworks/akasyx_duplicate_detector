@@ -1,5 +1,6 @@
 # test_verify.py - 整合性チェック（設計書 §9）
 import os
+from datetime import datetime
 
 import main
 import verify
@@ -26,7 +27,8 @@ def _seed_archive(make_config, archive, source, tmp_path, fake_crawler, files):
     fake_crawler(source, str(tmp_path / "seed.db"))
     config = make_config(archive_root=archive, source_path=source)
     assert main.run(config) == main.EXIT_OK
-    return os.path.basename(source)
+    # 保存先は <今月の YYYY-MM>/<投入元フォルダ名>/<相対パス>（作成直後のファイルなので今月）
+    return os.path.join(f"{datetime.now():%Y-%m}", os.path.basename(source))
 
 
 def _verify(make_config, archive, tmp_path, fake_crawler, name, flags=()):
@@ -195,12 +197,13 @@ def test_missing_result_constant_is_reported(
 def test_archive_stats(session, archive):
     session.add(
         ArchiveFile(
+            archive_id=1,
             filehash="a" * 64, hash_algo="sha256", size=100, name="a",
             stored_path_rel="a", status=STATUS_STORED,
         )
     )
     session.commit()
-    stats = verify.archive_stats(session)
+    stats = verify.archive_stats(session, 1)
     assert stats[STATUS_STORED] == {"count": 1, "size": 100}
 
 

@@ -23,7 +23,6 @@ const dom = {
   processed: el('progress-processed'), chips: el('progress-chips'),
   log: el('log'), openCsv: el('open-csv'), revealLog: el('reveal-log'),
   clearLog: el('clear-log'), recent: el('recent-archives'),
-  destSubdir: el('destSubdir'), useDestSubdir: el('useDestSubdir'),
 };
 
 let context = { repoRoot: '', version: '', detectorFound: true };
@@ -305,9 +304,7 @@ function wireDropTargets() {
       e.preventDefault();
       e.stopPropagation();
       highlight(false);
-      const file = e.dataTransfer.files[0];
-      if (!file) return;
-      const path = api.pathForFile(file);
+      const path = droppedPath(e.dataTransfer);
       if (path) {
         input.value = path;
         refreshPreview();
@@ -315,6 +312,32 @@ function wireDropTargets() {
       }
     });
   }
+}
+
+/**
+ * ドロップされたものからローカルパスを取り出します。
+ * 通常のファイル / フォルダは File として来るが、Finder のサイドバーや「場所」から
+ * ネットワークボリューム（/Volumes/xxx）を落とすと File が空で URL だけが来ることがある。
+ * その場合は file:// URL をデコードしてパスにする。
+ */
+function droppedPath(dt) {
+  const file = dt.files && dt.files[0];
+  if (file) {
+    const p = api.pathForFile(file);
+    if (p) return p;
+  }
+  const raw = dt.getData('text/uri-list') || dt.getData('text/plain') || '';
+  const line = raw.split(/\r?\n/).find((l) => l && !l.startsWith('#')) || '';
+  if (line.startsWith('file://')) {
+    try {
+      let p = decodeURIComponent(new URL(line).pathname);
+      if (p.length > 1 && p.endsWith('/')) p = p.slice(0, -1);
+      return p;
+    } catch {
+      return '';
+    }
+  }
+  return line.startsWith('/') ? line.trim() : '';
 }
 
 function wireForm() {
@@ -325,16 +348,12 @@ function wireForm() {
       persist();
     });
   }
-  dom.useDestSubdir.addEventListener('change', syncDestSubdir);
   dom.tabs.addEventListener('click', (e) => {
     const tab = e.target.closest('.tab');
     if (tab && !tab.disabled) setMode(tab.dataset.mode);
   });
 }
 
-function syncDestSubdir() {
-  dom.destSubdir.disabled = !dom.useDestSubdir.checked;
-}
 
 function wireRunControls() {
   dom.run.addEventListener('click', start);
@@ -401,7 +420,6 @@ async function init() {
   wireDropTargets();
   wireForm();
   wireRunControls();
-  syncDestSubdir();
   setMode(mode);
   if (context.run) resumeRun(context.run);
 }

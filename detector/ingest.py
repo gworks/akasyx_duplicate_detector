@@ -5,6 +5,7 @@ from datetime import datetime
 
 import crawler_client
 import mover
+from config import OS_JUNK_FILES
 from models import (
     OWNING_STATUSES,
     RESULT_DUPLICATE,
@@ -22,11 +23,12 @@ logger = logging.getLogger(__name__)
 COMMIT_INTERVAL = 100
 
 
-def find_owning(session, filehash: str, hash_algo: str) -> ArchiveFile | None:
-    """同一内容を保持している行を返します（同一 hash_algo 同士でのみ照合）。"""
+def find_owning(session, archive_id: int, filehash: str, hash_algo: str) -> ArchiveFile | None:
+    """同一内容を保持している行を返します（同じ保存フォルダ・同一 hash_algo 同士でのみ照合）。"""
     return (
         session.query(ArchiveFile)
         .filter(
+            ArchiveFile.archive_id == archive_id,
             ArchiveFile.filehash == filehash,
             ArchiveFile.hash_algo == hash_algo,
             ArchiveFile.status.in_(OWNING_STATUSES),
@@ -60,7 +62,7 @@ def judge(
         # dry-run で、同じ実行内の先行ファイルが取り込み対象になっている
         return RESULT_DUPLICATE, None, "同じ実行内の先行ファイルと内容が同じです"
 
-    existing = find_owning(session, *key)
+    existing = find_owning(session, config.archive_id, *key)
     if existing is not None:
         if existing.size != scanned.size:
             return (
@@ -77,7 +79,8 @@ def _collect_files(config):
     """投入元を走査して ScannedFile のイテレータと crawler スキャン情報を返します。"""
     source = config.source_path
     if os.path.isdir(source):
-        scan = crawler_client.run_crawler(source, config)
+        # .DS_Store 等の OS メタデータは保存する価値が無く、取り込むと保存フォルダが汚れる
+        scan = crawler_client.run_crawler(source, config, extra_excludes=OS_JUNK_FILES)
         crawler_client.ensure_completed(scan)
         return crawler_client.read_files(scan.db_path, scan.scan_id), scan
     # 単一ファイルは crawler を使わず直接読む（設計書 §6.4）
@@ -85,9 +88,10 @@ def _collect_files(config):
 
 
 def resolve_dest_subdir(config) -> str | None:
-    """保存先の第1階層名を決めます。
+    """年月フォルダの下に置く階層名を決めます（設計書 §7.2）。
 
-    --dest-subdir 未指定（None）なら投入元フォルダ名、`''` を渡されたら保存フォルダ直下。
+    --dest-subdir が明示されていればそれ（`''` は「付けない」）。
+    未指定なら投入元フォルダ名。投入元が単一ファイルなら付けない。
     """
     if config.dest_subdir is not None:
         return config.dest_subdir or None
@@ -104,7 +108,7 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
         ingest.crawler_scan_id = scan.scan_id
         session.commit()
 
-    dest_subdir = resolve_dest_subdir(config)
+    planner = mover.DestPlanner(session, config, resolve_dest_subdir(config))
     counters: dict[str, int] = {}
     reserved: set[str] = set()       # dry-run 用: 予約済みの保存先（casefold）
     virtual_hashes: set = set()      # dry-run 用: 取り込み予定の内容
@@ -118,7 +122,7 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
         for scanned in files:
             processed += 1
             result, stored_rel, message = _process_one(
-                session, config, ingest, scanned, dest_subdir, reserved, virtual_hashes
+                session, config, ingest, scanned, planner, reserved, virtual_hashes
             )
             counters[result] = counters.get(result, 0) + 1
             csv_update(
@@ -152,7 +156,7 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
 
 
 def _process_one(
-    session, config, ingest, scanned, dest_subdir, reserved, virtual_hashes
+    session, config, ingest, scanned, planner, reserved, virtual_hashes
 ) -> tuple[str, str | None, str | None]:
     """1ファイルを判定し、必要なら移動して記録します。
 
@@ -173,26 +177,22 @@ def _process_one(
     if result == RESULT_MOVED:
         if config.dry_run:
             try:
-                stored_rel = mover.resolve_dest(
-                    session,
-                    config.archive_root,
-                    dest_subdir,
-                    scanned.path_rel,
-                    extra_taken=reserved,
-                )
+                stored_rel = planner.resolve(scanned, extra_taken=reserved)
                 reserved.add(stored_rel.casefold())
                 virtual_hashes.add((scanned.filehash, scanned.hash_algo))
             except Exception as e:
                 result, message = RESULT_FAILED, str(e)
         else:
-            move = mover.plan_and_move(session, config, ingest.id, scanned, dest_subdir)
+            move = mover.plan_and_move(session, config, ingest.id, scanned, planner)
             if move.ok:
                 stored_rel = move.stored_path_rel
                 archive_file_id = move.archive_file.id
             elif move.conflict:
                 # 予約が UNIQUE で弾かれた = 直前に同一内容が登録された
                 result = RESULT_DUPLICATE
-                owner = find_owning(session, scanned.filehash, scanned.hash_algo)
+                owner = find_owning(
+                    session, config.archive_id, scanned.filehash, scanned.hash_algo
+                )
                 archive_file_id = owner.id if owner is not None else None
                 message = "同一内容が直前に登録されました"
             else:
