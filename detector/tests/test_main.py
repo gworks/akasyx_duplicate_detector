@@ -1,15 +1,20 @@
 # test_main.py - 事前チェック・終了コード・end-to-end（設計書 §11 / §12）
 import os
+from datetime import datetime
 
 import main
 import pytest
-from conftest import build_crawler_db, write_file
+from conftest import archive_db_path, build_crawler_db, write_file
 from crawler_client import CrawlerScan
 from errors import PreflightError
 from models import STATUS_STORED, ArchiveFile, Ingest, IngestItem
 
 
+_OPEN_DB_PATH = [None]
+
+
 def _run(config):
+    _OPEN_DB_PATH[0] = config.archive_db
     return main.run(config)
 
 
@@ -84,6 +89,7 @@ def test_rejects_incomplete_crawler_scan(
             "add", archive, source,
             "--db-dir", str(tmp_path / "db"),
             "--log-dir", str(tmp_path / "log"),
+            "--archive-db", archive_db_path(tmp_path),
         ]
     )
     assert code == main.EXIT_REJECTED
@@ -105,10 +111,11 @@ def test_add_moves_new_and_keeps_duplicates(
     config = make_config(archive_root=archive, source_path=source)
     assert _run(config) == main.EXIT_OK
 
-    # 新規2件が保存フォルダへ、重複と0バイトは投入元に残る
+    # 新規2件が保存フォルダ（今月の年月フォルダ / 投入元名 / 相対パス）へ、重複と0バイトは投入元に残る
+    month = f"{datetime.now():%Y-%m}"
     name = os.path.basename(source)
-    assert os.path.exists(os.path.join(archive, name, "a.txt"))
-    assert os.path.exists(os.path.join(archive, name, "sub", "b.txt"))
+    assert os.path.exists(os.path.join(archive, month, name, "a.txt"))
+    assert os.path.exists(os.path.join(archive, month, name, "sub", "b.txt"))
     assert os.path.exists(os.path.join(source, "sub", "copy_of_a.txt"))
     assert os.path.exists(os.path.join(source, "empty.txt"))
 
@@ -164,7 +171,45 @@ def test_single_file_source_needs_no_crawler(make_config, archive, tmp_path):
     path = write_file(str(tmp_path / "solo" / "x.txt"), b"solo")
     config = make_config(archive_root=archive, source_path=path)
     assert _run(config) == main.EXIT_OK
-    assert os.path.exists(os.path.join(archive, "x.txt"))
+    # 単一ファイルは投入元フォルダ名を付けず、年月フォルダ直下
+    assert os.path.exists(os.path.join(archive, f"{datetime.now():%Y-%m}", "x.txt"))
+
+
+def test_add_keeps_source_structure_under_month(
+    make_config, archive, source, tmp_path, fake_crawler
+):
+    """保存先は <YYYY-MM>/<投入元名>/<相対パス>。投入元の階層は年月フォルダの中に再現される。"""
+    write_file(os.path.join(source, "a.txt"), b"AAA")
+    write_file(os.path.join(source, "deep", "nested", "b.txt"), b"BBB")
+    fake_crawler(source, str(tmp_path / "crawler.db"))
+    config = make_config(archive_root=archive, source_path=source)
+    assert _run(config) == main.EXIT_OK
+
+    month = f"{datetime.now():%Y-%m}"
+    name = os.path.basename(source)
+    assert os.path.exists(os.path.join(archive, month, name, "a.txt"))
+    assert os.path.exists(os.path.join(archive, month, name, "deep", "nested", "b.txt"))
+
+
+def test_add_ignores_os_junk_and_prunes_it(
+    make_config, archive, source, tmp_path, fake_crawler
+):
+    """.DS_Store は取り込まず、--prune-empty-dirs で .DS_Store だけ残ったフォルダも消える。"""
+    write_file(os.path.join(source, "sub", "a.txt"), b"AAA")
+    write_file(os.path.join(source, "sub", ".DS_Store"), b"junk")
+    write_file(os.path.join(source, ".DS_Store"), b"junk")
+    fake_crawler(source, str(tmp_path / "crawler.db"))
+    config = make_config(archive_root=archive, source_path=source, prune_empty_dirs=True)
+    assert _run(config) == main.EXIT_OK
+
+    sess, engine = _open(archive)
+    try:
+        assert {r.name for r in sess.query(ArchiveFile).all()} == {"a.txt"}
+    finally:
+        sess.close()
+        engine.dispose()
+    assert not os.path.exists(os.path.join(source, "sub"))   # .DS_Store だけになった sub は消える
+    assert os.path.isdir(source)                              # 投入元そのものは残す
 
 
 def test_failed_item_returns_exit_code_2(
@@ -201,15 +246,17 @@ def test_cli_smoke(archive, source, tmp_path, monkeypatch, fake_crawler):
             "add", archive, source,
             "--db-dir", str(tmp_path / "db"),
             "--log-dir", str(tmp_path / "log"),
+            "--archive-db", archive_db_path(tmp_path),
         ]
     )
     assert code == main.EXIT_OK
 
 
-def _open(archive):
+def _open(_archive_root_unused):
+    """正本 DB を開く（引数は旧 API 互換のため残す。DB は保存フォルダの外にある）。"""
     from database import get_session
 
-    return get_session(archive)
+    return get_session(_OPEN_DB_PATH[0])
 
 
 def test_build_crawler_db_roundtrip(source, tmp_path):

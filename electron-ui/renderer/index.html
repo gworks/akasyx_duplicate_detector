@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:;" />
+  <title>重複判定アーカイバ</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      重複判定アーカイバ
+      <span class="version" id="version"></span>
+    </div>
+    <nav class="tabs" id="tabs">
+      <button type="button" class="tab" data-mode="add">取り込み</button>
+      <button type="button" class="tab" data-mode="verify">整合性チェック</button>
+      <button type="button" class="tab" data-mode="delete-duplicates">重複の後始末</button>
+      <button type="button" class="tab" data-mode="report">状態・履歴</button>
+    </nav>
+  </header>
+
+  <p class="banner banner-error" id="env-warning" hidden></p>
+
+  <main class="layout">
+    <!-- ============================ 入力 ============================ -->
+    <section class="pane pane-form">
+      <div class="field">
+        <label class="label" for="archiveRoot">保存用フォルダ<span class="req">必須</span></label>
+        <div class="path-row">
+          <input class="input drop" type="text" id="archiveRoot" data-field="archiveRoot"
+                 list="recent-archives" placeholder="ドラッグ＆ドロップ、または右の「参照」" spellcheck="false" />
+          <button type="button" class="btn" data-pick="archiveRoot" data-pick-title="保存用フォルダを選択">参照</button>
+        </div>
+        <datalist id="recent-archives"></datalist>
+        <p class="hint">重複のないファイル集合を作る先。<code>.akasyx/archive.db</code> がここに置かれます。</p>
+      </div>
+
+      <!-- ---- add ---- -->
+      <div class="mode-panel" data-panel="add">
+        <div class="field">
+          <label class="label" for="sourcePath">投入元（追加したいファイル / フォルダ）<span class="req">必須</span></label>
+          <div class="path-row">
+            <input class="input drop" type="text" id="sourcePath" data-field="sourcePath"
+                   placeholder="ドラッグ＆ドロップ、または右の「参照」" spellcheck="false" />
+            <button type="button" class="btn" data-pick="sourcePath" data-pick-files="1"
+                    data-pick-title="投入元のファイルまたはフォルダを選択">参照</button>
+          </div>
+          <p class="hint">重複しなかったものだけが保存用フォルダへ<strong>移動</strong>されます（重複はここに残ります）。</p>
+        </div>
+
+        <label class="check big">
+          <input type="checkbox" id="dryRun" data-field="dryRun" />
+          <span><strong>dry-run</strong>（判定だけ行い、移動も DB 更新もしない）</span>
+        </label>
+
+        <fieldset class="group">
+          <legend>保存先</legend>
+          <p class="hint block">
+            作成日の年月フォルダ（<code>YYYY-MM/</code>）の下に、投入元フォルダ名と投入元の階層をそのまま再現します。
+            ファイルが直接入るフォルダが上限件数に達すると <code>001/</code>, <code>002/</code>, … の枝に入ります。
+          </p>
+          <div class="field inline">
+            <label class="label small" for="folderLimit">1 フォルダに直接置く上限件数</label>
+            <input class="input narrow" type="number" id="folderLimit" data-field="folderLimit" min="1" step="1" value="500" />
+          </div>
+        </fieldset>
+
+        <fieldset class="group">
+          <legend>オプション</legend>
+          <div class="field inline">
+            <label class="label small" for="minSize">最小サイズ（バイト未満は移動しない）</label>
+            <input class="input narrow" type="number" id="minSize" data-field="minSize" min="0" step="1" value="1" />
+          </div>
+          <label class="check">
+            <input type="checkbox" id="withMeta" data-field="withMeta" />
+            <span>形式別メタデータも抽出する（crawler の <code>--extra meta</code> が必要）</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="followSymlinks" data-field="followSymlinks" />
+            <span>シンボリックリンクを追跡する</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="pruneEmptyDirs" data-field="pruneEmptyDirs" checked />
+            <span>処理後に空になった投入元ディレクトリを削除する（<code>.DS_Store</code> しか無いフォルダも空とみなす）</span>
+          </label>
+        </fieldset>
+      </div>
+
+      <!-- ---- verify ---- -->
+      <div class="mode-panel" data-panel="verify">
+        <p class="hint block">保存フォルダの実体と DB を突き合わせます。<strong>ファイルは一切動きません。</strong></p>
+        <fieldset class="group">
+          <legend>処置予定フラグ（disposition=quarantine）を立てる種別</legend>
+          <label class="check"><input type="checkbox" data-group="flagQuarantine" value="missing" /><span><code>missing</code> — DB にあるが実体が無い</span></label>
+          <label class="check"><input type="checkbox" data-group="flagQuarantine" value="unregistered" /><span><code>unregistered</code> — 実体はあるが DB に無い</span></label>
+          <label class="check"><input type="checkbox" data-group="flagQuarantine" value="archive_duplicate" /><span><code>archive_duplicate</code> — 保存フォルダ内での重複</span></label>
+          <label class="check"><input type="checkbox" data-group="flagQuarantine" value="hash_mismatch" /><span><code>hash_mismatch</code> — 実体のハッシュが DB と違う</span></label>
+        </fieldset>
+        <label class="check">
+          <input type="checkbox" id="verifyFollowSymlinks" data-field="followSymlinks" />
+          <span>シンボリックリンクを追跡する</span>
+        </label>
+      </div>
+
+      <!-- ---- delete-duplicates ---- -->
+      <div class="mode-panel" data-panel="delete-duplicates">
+        <p class="hint block"><code>add</code> で投入元に据え置いた重複を、2点検証のうえで削除（または退避）します。</p>
+        <div class="field">
+          <label class="label small" for="trashDir">退避先（指定すると削除せず移動する）</label>
+          <div class="path-row">
+            <input class="input drop" type="text" id="trashDir" data-field="trashDir"
+                   placeholder="未指定なら実削除" spellcheck="false" />
+            <button type="button" class="btn" data-pick="trashDir" data-pick-title="退避先フォルダを選択">参照</button>
+          </div>
+        </div>
+        <div class="field inline">
+          <label class="label small" for="ingestId">対象を実行 ID で絞る</label>
+          <input class="input narrow" type="number" id="ingestId" data-field="ingestId" min="1" step="1"
+                 placeholder="未処置すべて" />
+        </div>
+        <label class="check">
+          <input type="checkbox" id="delPruneEmptyDirs" data-field="pruneEmptyDirs" />
+          <span>処理後に空になった投入元ディレクトリを削除する</span>
+        </label>
+        <label class="check danger big">
+          <input type="checkbox" id="yes" data-field="yes" />
+          <span><strong>実際に削除する（--yes）</strong><br />外したままなら検証結果の一覧表示だけで終わります</span>
+        </label>
+      </div>
+
+      <!-- ---- report ---- -->
+      <div class="mode-panel" data-panel="report">
+        <p class="hint block">保存フォルダの状態と実行履歴を表示します。DB も実体も変更しません。</p>
+        <div class="field inline">
+          <label class="label small" for="reportIngestId">特定の実行の内訳を見る（実行 ID）</label>
+          <input class="input narrow" type="number" id="reportIngestId" data-field="ingestId"
+                 min="1" step="1" placeholder="直近10件" />
+        </div>
+      </div>
+
+      <details class="advanced">
+        <summary>詳細設定（既定のままで構いません）</summary>
+        <div class="field">
+          <label class="label small" for="archiveDb">正本 DB（全保存フォルダ共通・1 ファイル）</label>
+          <div class="path-row">
+            <input class="input drop" type="text" id="archiveDb" data-field="archiveDb"
+                   placeholder="既定: <リポジトリ>/dist/archive.db" spellcheck="false" />
+          </div>
+          <p class="hint">保存フォルダの外・ローカルディスクに置きます。保存フォルダはこの DB の中で ID 管理され、複数登録できます。</p>
+        </div>
+        <div class="field">
+          <label class="label small" for="crawlerRepo">akasyx_crawler のパス</label>
+          <div class="path-row">
+            <input class="input drop" type="text" id="crawlerRepo" data-field="crawlerRepo"
+                   placeholder="既定: ../akasyx_crawler" spellcheck="false" />
+            <button type="button" class="btn" data-pick="crawlerRepo" data-pick-title="crawler リポジトリを選択">参照</button>
+          </div>
+        </div>
+        <div class="field">
+          <label class="label small" for="dbDir">crawler の DB 出力先</label>
+          <div class="path-row">
+            <input class="input drop" type="text" id="dbDir" data-field="dbDir"
+                   placeholder="既定: dist/db" spellcheck="false" />
+            <button type="button" class="btn" data-pick="dbDir" data-pick-title="DB 出力先を選択">参照</button>
+          </div>
+        </div>
+        <div class="field">
+          <label class="label small" for="logDir">ログ・CSV 出力先</label>
+          <div class="path-row">
+            <input class="input drop" type="text" id="logDir" data-field="logDir"
+                   placeholder="既定: dist/log" spellcheck="false" />
+            <button type="button" class="btn" data-pick="logDir" data-pick-title="ログ出力先を選択">参照</button>
+          </div>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================ 実行 ============================ -->
+    <section class="pane pane-run">
+      <div class="command">
+        <div class="command-head">
+          <span class="label small">実行されるコマンド<span class="cwd">作業ディレクトリ: detector/</span></span>
+          <button type="button" class="btn ghost" id="copy-command">コピー</button>
+        </div>
+        <code class="command-text" id="command-text">—</code>
+      </div>
+
+      <div class="actions">
+        <button type="button" class="btn primary" id="run">実行 <span class="kbd">⌘↵</span></button>
+        <button type="button" class="btn stop" id="stop" disabled>中断</button>
+        <span class="spinner" id="spinner" hidden></span>
+        <span class="elapsed" id="elapsed"></span>
+      </div>
+
+      <p class="banner" id="status" hidden></p>
+
+      <div class="progress" id="progress" hidden>
+        <div class="progress-count"><strong id="progress-processed">0</strong> 件を判定</div>
+        <div class="chips" id="progress-chips"></div>
+      </div>
+
+      <div class="log-head">
+        <span class="label small">出力</span>
+        <div class="log-actions">
+          <button type="button" class="btn ghost" id="open-csv" hidden>CSV を開く</button>
+          <button type="button" class="btn ghost" id="reveal-log" hidden>ログの場所を開く</button>
+          <button type="button" class="btn ghost" id="clear-log">クリア</button>
+        </div>
+      </div>
+      <pre class="log" id="log"></pre>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

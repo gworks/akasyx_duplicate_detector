@@ -37,6 +37,8 @@ class ScannedFile:
     hash_algo: str | None
     mime_type: str | None = None
     modified_at: datetime | None = None
+    # 作成日時（crawler は macOS/BSD で st_birthtime、Windows で st_ctime、Linux は None）
+    created_at: datetime | None = None
 
 
 @dataclass
@@ -159,7 +161,7 @@ def read_files(db_path: str, scan_id: int) -> Iterator[ScannedFile]:
     """今回のスキャンで存在確認された active な行を読み出します（読み取り専用）。"""
     sql = (
         "SELECT name, path_abs, path_rel, size, filehash, hash_algo, mime_type,"
-        " modified_at FROM fs_files"
+        " modified_at, created_at FROM fs_files"
         " WHERE last_seen_scan_id = ? AND status = 'active' ORDER BY path_abs"
     )
     with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
@@ -173,6 +175,7 @@ def read_files(db_path: str, scan_id: int) -> Iterator[ScannedFile]:
                 hash_algo=row[5],
                 mime_type=row[6],
                 modified_at=_parse_dt(row[7]),
+                created_at=_parse_dt(row[8]),
             )
 
 
@@ -199,4 +202,18 @@ def scan_single_file(path: str) -> ScannedFile:
         hash_algo=algo,
         mime_type=mimetypes.guess_type(path)[0],
         modified_at=datetime.fromtimestamp(st.st_mtime, tz=timezone.utc),
+        created_at=birthtime_utc(st),
     )
+
+
+def birthtime_utc(st: os.stat_result) -> datetime | None:
+    """stat 結果から作成日時（UTC）を返します。crawler の utl/fileinfo.resolve_times と同じ規則。
+
+    macOS/BSD は st_birthtime、Windows は st_ctime（作成日時の意味）、Linux は取得不可で None。
+    """
+    birthtime = getattr(st, "st_birthtime", None)
+    if birthtime is not None:
+        return datetime.fromtimestamp(birthtime, tz=timezone.utc)
+    if os.name == "nt":
+        return datetime.fromtimestamp(st.st_ctime, tz=timezone.utc)
+    return None

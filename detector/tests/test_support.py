@@ -99,6 +99,7 @@ def test_format_size():
 
 def _row(session, filehash, rel, status=STATUS_STORED):
     row = ArchiveFile(
+        archive_id=1,
         filehash=filehash, hash_algo="sha256", size=1,
         name=os.path.basename(rel), stored_path_rel=rel, status=status,
     )
@@ -128,8 +129,32 @@ def test_unique_path_index(session):
     session.rollback()
 
 
-def test_pragmas_are_applied(archive):
-    sess, engine = get_session(archive)
+def test_missing_archive_db_is_created_on_startup(tmp_path, caplog):
+    """正本 DB が無ければ（親フォルダごと）作り、その旨をログに出す。"""
+    path = tmp_path / "nowhere" / "yet" / "archive.db"
+    assert not path.exists()
+    with caplog.at_level("WARNING"):
+        sess, engine = get_session(str(path))
+    try:
+        assert path.exists()
+        assert "新規作成します" in caplog.text
+        # テーブルまで揃っている（ar_archives が引ける）
+        from models import Archive
+        assert sess.query(Archive).count() == 0
+    finally:
+        sess.close()
+        engine.dispose()
+
+    # 2 回目は「接続」であって作成ではない
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        sess, engine = get_session(str(path))
+    sess.close(); engine.dispose()
+    assert "新規作成します" not in caplog.text
+
+
+def test_pragmas_are_applied(tmp_path):
+    sess, engine = get_session(str(tmp_path / "x" / "archive.db"))
     try:
         with engine.connect() as conn:
             from sqlalchemy import text
@@ -181,4 +206,4 @@ def test_report_unknown_ingest(make_config, archive, capsys):
 
 
 def test_recent_ingests_on_empty_db(session):
-    assert "（履歴なし）" in "\n".join(report._recent_ingests(session))
+    assert "（履歴なし）" in "\n".join(report._recent_ingests(session, 1))

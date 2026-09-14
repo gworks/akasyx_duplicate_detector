@@ -14,9 +14,11 @@ from verify import archive_stats
 def run_report(session, config, ingest) -> tuple[str, dict]:
     """保存フォルダの状態を表示します（DB も実体も変更しない）。"""
     lines: list[str] = []
-    stats = archive_stats(session)
+    aid = config.archive_id
+    stats = archive_stats(session, aid)
 
-    lines.append(f"保存用フォルダ: {config.archive_root}")
+    lines.append(f"保存用フォルダ: {config.archive_root}（#{aid}）")
+    lines.append(f"正本 DB      : {config.archive_db}")
     lines.append("")
     lines.append("■ 保存フォルダの状態")
     if not stats:
@@ -29,7 +31,7 @@ def run_report(session, config, ingest) -> tuple[str, dict]:
 
     dispositions = (
         session.query(ArchiveFile.disposition)
-        .filter(ArchiveFile.disposition.isnot(None))
+        .filter(ArchiveFile.archive_id == aid, ArchiveFile.disposition.isnot(None))
         .all()
     )
     if dispositions:
@@ -45,6 +47,7 @@ def run_report(session, config, ingest) -> tuple[str, dict]:
         session.query(IngestItem)
         .join(Ingest, IngestItem.ingest_id == Ingest.id)
         .filter(
+            Ingest.archive_id == aid,
             IngestItem.result == RESULT_DUPLICATE,
             IngestItem.resolution.is_(None),
             Ingest.dry_run == 0,
@@ -59,15 +62,17 @@ def run_report(session, config, ingest) -> tuple[str, dict]:
     if config.ingest_id is not None:
         lines.extend(_ingest_detail(session, config.ingest_id))
     else:
-        lines.extend(_recent_ingests(session, exclude_id=ingest.id))
+        lines.extend(_recent_ingests(session, aid, exclude_id=ingest.id))
 
     text = "\n".join(lines)
     print(text)
     return "completed", {"archive_statuses": len(stats), "unresolved": unresolved}
 
 
-def _recent_ingests(session, limit: int = 10, exclude_id: int | None = None) -> list[str]:
-    query = session.query(Ingest)
+def _recent_ingests(
+    session, archive_id: int, limit: int = 10, exclude_id: int | None = None
+) -> list[str]:
+    query = session.query(Ingest).filter(Ingest.archive_id == archive_id)
     if exclude_id is not None:
         query = query.filter(Ingest.id != exclude_id)  # 実行中の report 自身は出さない
     rows = query.order_by(Ingest.id.desc()).limit(limit).all()

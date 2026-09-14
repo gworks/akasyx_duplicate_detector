@@ -1,0 +1,13 @@
+{
+  "name": "akasyx-duplicate-detector-ui",
+  "private": true,
+  "description": "重複判定アーカイバ（detector）の入力を楽にする Electron UI",
+  "main": "main.js",
+  "scripts": {
+    "dev": "electron .",
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^44.0.0"
+  }
+}

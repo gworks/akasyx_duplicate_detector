@@ -4,6 +4,7 @@ import os
 import sys
 from datetime import datetime, timezone
 
+import archives
 import config as config_module
 import crawler_client
 import dedupe
@@ -16,6 +17,7 @@ from database import archive_lock, get_session
 from errors import DetectorError, PreflightError
 from models import (
     MODE_ADD,
+    MODE_ARCHIVES,
     MODE_DELETE_DUPLICATES,
     MODE_REPORT,
     MODE_VERIFY,
@@ -46,6 +48,8 @@ RUNNERS = {
 
 def preflight(config: DetectorConfig) -> None:
     """実行前チェック。1件も処理しないまま断るケースをここに集める（設計書 §12）。"""
+    if not config.archive_root:
+        raise PreflightError("保存用フォルダが指定されていません")
     if not os.path.isdir(config.archive_root):
         raise PreflightError(f"保存用フォルダがありません: {config.archive_root}")
     if not os.access(config.archive_root, os.W_OK):
@@ -102,17 +106,46 @@ def _apply_counters(record: Ingest, counters: dict) -> None:
     record.stats_json = json_dumps(counters)
 
 
+def run_archives(config: DetectorConfig) -> int:
+    """登録済みの保存フォルダ一覧（保存フォルダの指定もロックも要らない）。"""
+    session, _engine = get_session(config.archive_db)
+    try:
+        rows = archives.list_archives(session)
+        print(f"正本 DB: {config.archive_db}")
+        print("")
+        print(f"■ 登録済みの保存フォルダ: {len(rows)} 件")
+        for a, count, size in rows:
+            exists = "" if os.path.isdir(a.root_abs) else "  ※ 現在このパスに見つかりません"
+            print(f"  #{a.id:<4} {a.root_abs}{exists}")
+            used = a.last_used_at
+            if used is not None:
+                if used.tzinfo is None:
+                    used = used.replace(tzinfo=timezone.utc)
+                used = f"{used.astimezone():%Y-%m-%d %H:%M}"
+            print(f"        stored {count} 件 / {size} バイト / uid {a.uid} / 最終使用 {used or '-'}")
+        return EXIT_OK
+    finally:
+        session.close()
+
+
 def run(config: DetectorConfig) -> int:
     """1回の実行。戻り値はプロセス終了コード。"""
+    if config.mode == MODE_ARCHIVES:
+        return run_archives(config)
+
     preflight(config)
 
     with archive_lock(config.archive_root):
-        session, _engine = get_session(config.archive_root)
+        session, _engine = get_session(config.archive_db)
         try:
+            archive = archives.resolve_archive(session, config.archive_root)
+            config.archive_id = archive.id
+
             # 前回の中断分を先に片付ける（どのサブコマンドでも実施 — 設計書 §7.4）
             mover.recover_pending(session, config)
 
             record = Ingest(
+                archive_id=archive.id,
                 mode=config.mode,
                 source_root=config.source_path,
                 archive_root=config.archive_root,
@@ -170,7 +203,9 @@ def main(argv: list[str] | None = None) -> int:
     config = config_module.parse_arguments(argv)
     config_module.setup_directories(config)
     config_module.setup_logging(config)
-    logger.info(f"{config.mode} 開始: 保存用フォルダ={config.archive_root}")
+    logger.info(
+        f"{config.mode} 開始: 保存用フォルダ={config.archive_root or '-'} / 正本 DB={config.archive_db}"
+    )
 
     try:
         return run(config)
