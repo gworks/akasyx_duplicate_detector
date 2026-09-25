@@ -5,9 +5,55 @@
   "main": "main.js",
   "scripts": {
     "dev": "electron .",
-    "start": "electron ."
+    "start": "electron .",
+    "dist:mac": "electron-builder --mac dir --arm64"
   },
   "devDependencies": {
-    "electron": "^44.0.0"
+    "electron": "^44.0.0",
+    "electron-builder": "^26.15.3"
+  },
+  "productName": "akasyx Duplicate Detector",
+  "build": {
+    "appId": "net.at-first.akasyx-duplicate-detector",
+    "productName": "akasyx Duplicate Detector",
+    "copyright": "at-first OÜ",
+    "directories": {
+      "output": "../build/electron",
+      "buildResources": "../packaging"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "commands.js",
+      "renderer/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../build/stage",
+        "to": ".",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "asar": true,
+    "mac": {
+      "category": "public.app-category.utilities",
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "../packaging/entitlements.mac.plist",
+      "entitlementsInherit": "../packaging/entitlements.mac.plist",
+      "notarize": false,
+      "minimumSystemVersion": "13.0"
+    }
   }
 }

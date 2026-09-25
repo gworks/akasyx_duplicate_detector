@@ -89,8 +89,12 @@ uv run main.py --help
 
 ### 正本 DB の場所（v0.2.0 で変更）
 
-正本の SQLite は**保存フォルダの外**、既定で `<リポジトリルート>/dist/archive.db` に 1 つだけ置く
-（`--archive-db` で変更可。UI では「詳細設定」）。保存フォルダはこの DB の `ar_archives` に
+正本の SQLite は**保存フォルダの外**、既定で `<データフォルダ>/archive.db` に 1 つだけ置く
+（`--archive-db` で変更可。UI では「詳細設定」）。データフォルダは開発時（`uv run`）は
+`<リポジトリルート>/dist/`、配布版（.app）は `~/Library/Application Support/akasyx-duplicate-detector/`
+（Windows は `%LOCALAPPDATA%\akasyx-duplicate-detector\`）。今の場所は `main.py --help` の末尾と、
+UI の「詳細設定 → データの保存場所」（「Finder で表示」で開ける）に出る。
+配布版のアプリを削除してもデータフォルダは残る。完全に消すときはこのフォルダも削除する。保存フォルダはこの DB の `ar_archives` に
 1 行ずつ登録され、ファイル行は保存フォルダ ID を持つ。**重複判定は保存フォルダ単位**で、
 別の保存フォルダにある同じ内容は重複扱いにならない。
 
@@ -106,10 +110,10 @@ uv run main.py --help
 - `dist/` は git 管理外。**正本 DB のバックアップは自分で取る**（保存フォルダのバックアップだけでは
   何が保存済みかの記録は復元できない。`verify` で実体から `unregistered` として拾い直すことはできる）
 
-出力先（既定・リポジトリルート直下）:
+出力先（既定・データフォルダの下）:
 
-- 作業用 DB: `dist/db/file_inventory.db`（crawler の出力。消しても正本には影響しない）
-- ログ・CSV レポート: `dist/log/`
+- 作業用 DB: `db/file_inventory.db`（crawler の出力。消しても正本には影響しない）
+- ログ・CSV レポート: `log/`
 
 ### 安全側の設計
 
@@ -197,10 +201,41 @@ Python 側の前提は CLI と同じです（`detector/` で `uv sync` 済み、
 
 ### 配布について
 
-現状は**開発起動のみ**（`npm run dev`）です。`.app` へのパッケージングは、
-まず使ってみて要件が固まってから electron-builder を入れる想定です。
+配布物（署名・公証済みの `.app` と zip）は Apple Silicon の Mac で次の 1 本で作ります:
+
+```bash
+# 公証の認証情報は名前だけを環境変数で渡す（どちらか）。無ければ公証せず zip 名に -UNNOTARIZED が付く
+#   AKASYX_NOTARY_PROFILE=<notarytool store-credentials のプロファイル名>
+#   APPLE_API_KEY=<.p8 のパス> APPLE_API_KEY_ID=<Key ID> APPLE_API_ISSUER=<Issuer ID>
+packaging/build_mac.sh
+# → build/release/（akasyx Duplicate Detector.app・README.txt・THIRD_PARTY_LICENSES.txt）
+#   build/akasyx-duplicate-detector-<版>-mac-arm64.zip
+```
+
+- 流れ: ① `packaging/build_python.sh` で detector と crawler を PyInstaller の onedir に
+  （利用者の Mac に uv・Python が無くても動かすため）② `packaging/build_licenses.sh` でライセンス表記
+  ③ electron-builder で `.app` にして Developer ID で署名（hardened runtime）④ 公証 → staple → `spctl` で検証
+- 同梱物の欠け・版の不一致・署名の不正・GPL 系ライブラリの混入があれば途中で失敗する
+- 利用者向けの説明（データの場所・完全な削除の手順）は `packaging/README.dist.txt`。配布版は UI の設定も
+  データフォルダの `ui/` に置くので、完全に消すときはデータフォルダ 1 つを消せば済む
+
+同梱する実行形式だけを作る場合:
+
+```bash
+packaging/build_python.sh    # → build/pyi/dist/akasyx-{detector,crawler}/（PyInstaller onedir）
+```
+
+- 兄弟リポジトリ `../akasyx_crawler` が要る。crawler の GPL 系依存（mutagen・pillow-heif）は同梱しない
+  （音声・HEIC のメタデータが取れないだけで走査は続く）。混入していればスクリプトが失敗する
+- 実行形式は起動しただけで配布版の扱いになり、データフォルダは Application Support 側を使う
+- 開発中の UI から実行形式を試す: `AKASYX_BIN_DIR=../build/pyi/dist npm run dev`（`electron-ui/` で）。
+  実データを汚したくなければ `AKASYX_DETECTOR_HOME=<一時フォルダ>` も付ける
+- 配布版の UI は `Contents/Resources/bin/akasyx-detector/akasyx-detector` を起動し、
+  detector には `AKASYX_SIBLINGS_BIN` で同梱の crawler の場所を渡す
+
 `electron-ui/package.json` に version を持たせていないのは、
-バージョンの正本を `version.txt` 1 本に保つためです（UI はこれを読んで表示します）。
+バージョンの正本を `version.txt` 1 本に保つためです（開発時の UI はこれを読んで表示します）。
+配布版の UI は `app.getVersion()` を表示するので、`build_mac.sh` が `version.txt` の値を焼き込みます（`-c.extraMetadata.version`）。
 
 ## リリース運用（レベルB・全自動）
 

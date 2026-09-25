@@ -2,11 +2,13 @@
 import os
 
 import config as config_module
+import crawler_client
 import main
 import pytest
 import report
 from conftest import write_file
 from database import get_session
+from errors import PreflightError
 from models import (
     MODE_ADD,
     MODE_REPORT,
@@ -56,6 +58,44 @@ def test_parse_rejects_unknown_quarantine_kind(tmp_path):
 def test_version_matches_version_txt():
     with open(os.path.join(config_module.repo_root(), "version.txt")) as f:
         assert config_module.app_version() == f.read().strip()
+
+
+def test_data_root_is_repo_dist_in_development():
+    assert config_module.data_root() == os.path.join(config_module.repo_root(), "dist")
+
+
+def test_data_root_is_app_home_when_packaged(tmp_path, monkeypatch):
+    monkeypatch.setenv("AKASYX_PACKAGED", "1")
+    monkeypatch.setenv("AKASYX_DETECTOR_HOME", str(tmp_path / "home"))
+    assert config_module.data_root() == str(tmp_path / "home")
+    assert config_module._default_db_dir() == str(tmp_path / "home" / "db")
+    assert config_module._default_log_dir() == str(tmp_path / "home" / "log")
+
+
+def test_app_home_is_separate_from_akasyx_search(monkeypatch):
+    """akasyx_search の akasyx/ と分ける（search のデータ移動・削除手順に巻き込まれないように）。"""
+    monkeypatch.setattr(config_module.sys, "platform", "darwin")
+    assert config_module.app_home() == os.path.expanduser(
+        "~/Library/Application Support/akasyx-duplicate-detector"
+    )
+    monkeypatch.setattr(config_module.sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", "C:/Users/me/AppData/Local")
+    assert config_module.app_home() == os.path.join(
+        "C:/Users/me/AppData/Local", "akasyx-duplicate-detector"
+    )
+
+
+def test_version_reads_bundled_copy_when_frozen(tmp_path, monkeypatch):
+    (tmp_path / "version.txt").write_text("9.8.7\n")
+    monkeypatch.setattr(config_module.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(config_module.sys, "_MEIPASS", str(tmp_path), raising=False)
+    assert config_module.app_version() == "9.8.7"
+
+
+def test_siblings_bin_comes_from_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("AKASYX_SIBLINGS_BIN", "/App/Resources/bin")
+    cfg = config_module.parse_arguments(["report", str(tmp_path)])
+    assert cfg.siblings_bin == "/App/Resources/bin"
 
 
 def test_config_snapshot_is_serializable(tmp_path):
@@ -207,3 +247,38 @@ def test_report_unknown_ingest(make_config, archive, capsys):
 
 def test_recent_ingests_on_empty_db(session):
     assert "（履歴なし）" in "\n".join(report._recent_ingests(session, 1))
+
+
+# --- crawler の起動（開発時 uv run / 配布版は同梱の実行形式） --------------------
+
+
+def test_crawler_command_uses_bundled_executable(make_config, tmp_path):
+    cfg = make_config(siblings_bin=str(tmp_path / "bin"))
+    base, cwd = crawler_client.crawler_command(cfg)
+    exe = str(tmp_path / "bin" / "akasyx-crawler" / "akasyx-crawler")
+    assert base == [exe]
+    assert cwd == os.path.dirname(exe)
+
+
+def test_crawler_command_uses_uv_in_development(make_config, tmp_path, monkeypatch):
+    repo = tmp_path / "akasyx_crawler"
+    write_file(str(repo / "crawler" / "main.py"), b"")
+    monkeypatch.setattr(crawler_client.shutil, "which", lambda name: "/usr/bin/uv")
+    cfg = make_config(crawler_repo=str(repo))
+    base, cwd = crawler_client.crawler_command(cfg)
+    assert base == ["uv", "run", "main.py"]
+    assert cwd == str(repo / "crawler")
+
+
+def test_check_crawler_rejects_missing_bundled_executable(make_config, tmp_path):
+    cfg = make_config(siblings_bin=str(tmp_path / "bin"))
+    with pytest.raises(PreflightError, match="同梱の crawler"):
+        crawler_client.check_crawler(cfg)
+
+
+def test_check_crawler_accepts_bundled_executable(make_config, tmp_path):
+    exe = tmp_path / "bin" / "akasyx-crawler" / "akasyx-crawler"
+    write_file(str(exe), b"#!/bin/sh\n")
+    exe.chmod(0o755)
+    cfg = make_config(siblings_bin=str(tmp_path / "bin"))
+    crawler_client.check_crawler(cfg)  # 例外にならない

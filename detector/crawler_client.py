@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 CRAWLER_DB_FILENAME = "file_inventory.db"
 CRAWLER_PKG_DIRNAME = "crawler"
+# 配布版で同梱する crawler の実行形式の名前（akasyx_search の packaging/build_python.sh と同じ）
+CRAWLER_BIN_NAME = "akasyx-crawler"
 # 走査が中途半端な状態で移動を始めると、投入元の一部だけが移った状態になる（設計書 §3）
 COMPLETED_STATUS = "completed"
 
@@ -62,6 +64,41 @@ def resolve_crawler_repo(path: str) -> str:
     return path
 
 
+def crawler_executable(siblings_bin: str) -> str:
+    """同梱した crawler の実行形式のパス（PyInstaller onedir: <bin>/akasyx-crawler/akasyx-crawler）。"""
+    exe = CRAWLER_BIN_NAME + (".exe" if os.name == "nt" else "")
+    return os.path.join(siblings_bin, CRAWLER_BIN_NAME, exe)
+
+
+def check_crawler(config) -> None:
+    """crawler を起動できるか確かめます（事前チェック用）。できなければ PreflightError。"""
+    if config.siblings_bin:
+        exe = crawler_executable(config.siblings_bin)
+        if not os.access(exe, os.X_OK):
+            raise PreflightError(
+                f"同梱の crawler が見つかりません: {exe}\n"
+                "アプリを入れ直してください"
+            )
+        return
+    resolve_crawler_repo(config.crawler_repo)
+
+
+def crawler_command(config) -> tuple[list[str], str]:
+    """crawler の起動コマンドの先頭部分と cwd。
+
+    開発時は `uv run main.py`（crawler リポジトリの crawler/ で）、配布版は同梱した実行形式。
+    """
+    if config.siblings_bin:
+        exe = crawler_executable(config.siblings_bin)
+        return [exe], os.path.dirname(exe)
+    repo = resolve_crawler_repo(config.crawler_repo)
+    if shutil.which("uv") is None:
+        raise PreflightError(
+            "uv が見つかりません。crawler の実行に必要です（https://docs.astral.sh/uv/）"
+        )
+    return ["uv", "run", "main.py"], os.path.join(repo, CRAWLER_PKG_DIRNAME)
+
+
 def _max_scan_id(db_path: str) -> int:
     """crawler DB の fs_scans の最大 id を返します（DB もテーブルも無ければ 0）。"""
     if not os.path.exists(db_path):
@@ -92,17 +129,11 @@ def run_crawler(target: str, config, extra_excludes: tuple[str, ...] = ()) -> Cr
     ハッシュ関連のオプション（--no-hash / --hash-max-size）は渡さない。
     ハッシュが無いと重複判定ができないため。
     """
-    repo = resolve_crawler_repo(config.crawler_repo)
-    cwd = os.path.join(repo, CRAWLER_PKG_DIRNAME)
+    base, cwd = crawler_command(config)
     db_path = os.path.join(config.db_dir, CRAWLER_DB_FILENAME)
 
-    if shutil.which("uv") is None:
-        raise PreflightError(
-            "uv が見つかりません。crawler の実行に必要です（https://docs.astral.sh/uv/）"
-        )
-
     cmd = [
-        "uv", "run", "main.py", target,
+        *base, target,
         "--db-dir", config.db_dir,
         "--log-dir", config.log_dir,
         # crawler の既定は nested。投入元の .gitignore で対象が勝手に減るのを防ぐ

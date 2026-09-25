@@ -23,9 +23,10 @@ const dom = {
   processed: el('progress-processed'), chips: el('progress-chips'),
   log: el('log'), openCsv: el('open-csv'), revealLog: el('reveal-log'),
   clearLog: el('clear-log'), recent: el('recent-archives'),
+  dataDir: el('data-dir'), openDataDir: el('open-data-dir'), runCwd: el('run-cwd'),
 };
 
-let context = { repoRoot: '', version: '', detectorFound: true };
+let context = { repoRoot: '', dataDir: '', version: '', detectorFound: true };
 let mode = 'add';
 let running = false;
 let recent = [];
@@ -267,7 +268,7 @@ async function start() {
 
 function logDir() {
   const custom = el('logDir').value.trim();
-  return custom || `${context.repoRoot}/dist/log`;
+  return custom || `${context.dataDir}/log`;
 }
 
 // ------------------------------------------------------------ 初期化・配線
@@ -374,6 +375,7 @@ function wireRunControls() {
   });
   dom.openCsv.addEventListener('click', () => lastCsvPath && api.reveal(lastCsvPath));
   dom.revealLog.addEventListener('click', () => api.open(logDir()));
+  dom.openDataDir.addEventListener('click', () => api.openDataDir());
   document.addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
       e.preventDefault();
@@ -406,14 +408,17 @@ async function init() {
   wireRunEvents();
   context = await api.getContext();
   dom.version.textContent = `v${context.version}`;
+  if (context.bundled) dom.runCwd.textContent = `作業ディレクトリ: ${context.detectorDir}`;
   if (!context.detectorFound) {
-    dom.envWarning.textContent =
-      `detector/main.py が見つかりません（${context.detectorDir}）。`
-      + 'electron-ui はリポジトリルート直下に置いてください。';
+    dom.envWarning.textContent = context.bundled
+      ? `同梱の detector が見つかりません（${context.detectorDir}）。アプリを入れ直してください。`
+      : `detector/main.py が見つかりません（${context.detectorDir}）。`
+        + 'electron-ui はリポジトリルート直下に置いてください。';
     dom.envWarning.hidden = false;
   }
 
   dom.revealLog.hidden = false;
+  dom.dataDir.textContent = context.dataDir;
 
   restore(await api.loadSettings());
   wirePickers();

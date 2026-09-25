@@ -34,7 +34,7 @@
           <button type="button" class="btn" data-pick="archiveRoot" data-pick-title="保存用フォルダを選択">参照</button>
         </div>
         <datalist id="recent-archives"></datalist>
-        <p class="hint">重複のないファイル集合を作る先。<code>.akasyx/archive.db</code> がここに置かれます。</p>
+        <p class="hint">重複のないファイル集合を作る先。識別用の <code>.akasyx/archive.id</code> だけがここに置かれます（DB は下の「データの保存場所」）。</p>
       </div>
 
       <!-- ---- add ---- -->
@@ -143,10 +143,18 @@
       <details class="advanced">
         <summary>詳細設定（既定のままで構いません）</summary>
         <div class="field">
+          <span class="label small">データの保存場所（正本 DB・作業用 DB・ログ）</span>
+          <div class="path-row">
+            <code class="data-dir" id="data-dir"></code>
+            <button type="button" class="btn" id="open-data-dir">Finder で表示</button>
+          </div>
+          <p class="hint">アプリを削除してもこのフォルダは残ります（正本 DB は保存フォルダの中身の記録なので、バックアップ対象です）。完全に削除するときはこのフォルダも消してください。</p>
+        </div>
+        <div class="field">
           <label class="label small" for="archiveDb">正本 DB（全保存フォルダ共通・1 ファイル）</label>
           <div class="path-row">
             <input class="input drop" type="text" id="archiveDb" data-field="archiveDb"
-                   placeholder="既定: <リポジトリ>/dist/archive.db" spellcheck="false" />
+                   placeholder="既定: <データの保存場所>/archive.db" spellcheck="false" />
           </div>
           <p class="hint">保存フォルダの外・ローカルディスクに置きます。保存フォルダはこの DB の中で ID 管理され、複数登録できます。</p>
         </div>
@@ -162,7 +170,7 @@
           <label class="label small" for="dbDir">crawler の DB 出力先</label>
           <div class="path-row">
             <input class="input drop" type="text" id="dbDir" data-field="dbDir"
-                   placeholder="既定: dist/db" spellcheck="false" />
+                   placeholder="既定: <データの保存場所>/db" spellcheck="false" />
             <button type="button" class="btn" data-pick="dbDir" data-pick-title="DB 出力先を選択">参照</button>
           </div>
         </div>
@@ -170,7 +178,7 @@
           <label class="label small" for="logDir">ログ・CSV 出力先</label>
           <div class="path-row">
             <input class="input drop" type="text" id="logDir" data-field="logDir"
-                   placeholder="既定: dist/log" spellcheck="false" />
+                   placeholder="既定: <データの保存場所>/log" spellcheck="false" />
             <button type="button" class="btn" data-pick="logDir" data-pick-title="ログ出力先を選択">参照</button>
           </div>
         </div>
@@ -181,7 +189,7 @@
     <section class="pane pane-run">
       <div class="command">
         <div class="command-head">
-          <span class="label small">実行されるコマンド<span class="cwd">作業ディレクトリ: detector/</span></span>
+          <span class="label small">実行されるコマンド<span class="cwd" id="run-cwd">作業ディレクトリ: detector/</span></span>
           <button type="button" class="btn ghost" id="copy-command">コピー</button>
         </div>
         <code class="command-text" id="command-text">—</code>

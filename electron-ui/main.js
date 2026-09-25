@@ -11,6 +11,18 @@ const { buildArgs, formatCommand, quoteArg, FormError } = require('./commands');
 const REPO_ROOT = path.dirname(__dirname);
 const DETECTOR_DIR = path.join(REPO_ROOT, 'detector');
 
+// 同梱した detector / crawler の実行形式（packaging/build_python.sh の PyInstaller onedir）の置き場。
+// 配布版は Contents/Resources/bin。開発時も AKASYX_BIN_DIR=<repo>/build/pyi/dist で実行形式を試せる。
+// 無ければ開発時の扱いで、detector を `uv run main.py` で起動する
+const BIN_DIR = app.isPackaged
+  ? path.join(process.resourcesPath, 'bin')
+  : (process.env.AKASYX_BIN_DIR ? path.resolve(process.env.AKASYX_BIN_DIR) : null);
+const DETECTOR_EXE = BIN_DIR
+  ? path.join(BIN_DIR, 'akasyx-detector', `akasyx-detector${process.platform === 'win32' ? '.exe' : ''}`)
+  : null;
+// 子プロセスの cwd。相対で指定・出力されたパスはここ基準で解決する（resolveDetectorPath）
+const RUN_DIR = DETECTOR_EXE ? path.dirname(DETECTOR_EXE) : DETECTOR_DIR;
+
 // GUI から起動された Electron は PATH が最小限になるため、uv の在処を自力で探す
 const UV_CANDIDATES = [
   path.join(os.homedir(), '.local', 'bin', 'uv'),
@@ -66,6 +78,35 @@ function saveSettings(settings) {
   }
 }
 
+// --- データフォルダ（detector/config.py の data_root() と同じ規則） -------------
+
+// akasyx_search の ~/Library/Application Support/akasyx/ とは分ける
+// （search のデータ移動は akasyx/ の中身を丸ごと移し、削除手順も akasyx/ ごと消すため）
+const APP_DATA_NAME = 'akasyx-duplicate-detector';
+
+/** 配布版のデータフォルダ。.app の中は書き込めないので OS ごとの利用者データの場所に置く。 */
+function appHome() {
+  if (process.env.AKASYX_DETECTOR_HOME) return path.resolve(process.env.AKASYX_DETECTOR_HOME);
+  if (process.platform === 'darwin') {
+    return path.join(os.homedir(), 'Library', 'Application Support', APP_DATA_NAME);
+  }
+  if (process.platform === 'win32') {
+    return path.join(process.env.LOCALAPPDATA || os.homedir(), APP_DATA_NAME);
+  }
+  return path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), APP_DATA_NAME);
+}
+
+/** 正本 DB・作業用 DB・ログの既定の置き場。開発時（uv run）は <リポジトリ>/dist/。
+ * 固めた実行形式は sys.frozen で配布版の置き場を使うので、実行形式を起動するときはそちらに合わせる。 */
+function dataDir() {
+  return DETECTOR_EXE ? appHome() : path.join(REPO_ROOT, 'dist');
+}
+
+// 配布版では UI の設定（settings.json）と Electron のキャッシュもデータフォルダの下に置く。
+// 既定の ~/Library/Application Support/<productName>/ だと利用者のデータが 2 か所に分かれ、
+// 完全に削除するときに消し忘れるため（README.dist.txt の削除手順は 1 フォルダで済むようにする）
+if (app.isPackaged) app.setPath('userData', path.join(appHome(), 'ui'));
+
 // --- 実行環境 ---------------------------------------------------------------
 
 function resolveUv() {
@@ -76,11 +117,18 @@ function resolveUv() {
 }
 
 function appVersion() {
+  // 配布版では version.txt を同梱しない。electron-builder が package.json の version を焼き込む
+  if (app.isPackaged) return app.getVersion();
   try {
     return fs.readFileSync(path.join(REPO_ROOT, 'version.txt'), 'utf-8').trim();
   } catch {
     return '0.0.0';
   }
+}
+
+/** detector の起動コマンドの先頭部分（表示・コピー用）。実行形式があればそれ、無ければ `uv run main.py`。 */
+function commandBase() {
+  return DETECTOR_EXE ? [DETECTOR_EXE] : ['uv', 'run', 'main.py'];
 }
 
 function childEnv() {
@@ -91,6 +139,8 @@ function childEnv() {
     PYTHONUNBUFFERED: '1',
     PYTHONIOENCODING: 'utf-8',
     PATH: `${process.env.PATH || ''}${path.delimiter}${extra}`,
+    // 実行形式では detector が同梱の crawler を起動する（uv と crawler のソースが要らない）
+    ...(BIN_DIR ? { AKASYX_SIBLINGS_BIN: BIN_DIR } : {}),
   };
 }
 
@@ -219,12 +269,14 @@ function createStreamPump(send) {
 
 ipcMain.handle('app:context', () => ({
   repoRoot: REPO_ROOT,
-  detectorDir: DETECTOR_DIR,
+  detectorDir: RUN_DIR,
   // 「コピー」で `cd` に貼る用。スペース等を含むチェックアウト先でもそのまま貼れるようにする
-  detectorDirQuoted: quoteArg(DETECTOR_DIR),
+  detectorDirQuoted: quoteArg(RUN_DIR),
   version: appVersion(),
+  dataDir: dataDir(),
   uvPath: resolveUv(),
-  detectorFound: fs.existsSync(path.join(DETECTOR_DIR, 'main.py')),
+  detectorFound: fs.existsSync(DETECTOR_EXE || path.join(DETECTOR_DIR, 'main.py')),
+  bundled: !!DETECTOR_EXE,
   // macOS でウィンドウを閉じても子プロセスは走り続けるので、開き直した画面に状態を返す
   run: activeRun
     ? { command: activeRun.command, startedAt: activeRun.startedAt, ...activeRun.pump.snapshot() }
@@ -248,7 +300,7 @@ ipcMain.handle('dialog:pick', async (_event, options = {}) => {
 
 ipcMain.handle('command:preview', (_event, form) => {
   try {
-    return { command: formatCommand(buildArgs(form)), error: null };
+    return { command: formatCommand(buildArgs(form), commandBase()), error: null };
   } catch (e) {
     if (e instanceof FormError) return { command: null, error: e.message };
     throw e;
@@ -257,11 +309,11 @@ ipcMain.handle('command:preview', (_event, form) => {
 
 /**
  * detector が出力したパス（CSV レポート、--log-dir 等）を絶対パスにします。
- * 子プロセスは cwd=DETECTOR_DIR で動くので、相対で指定・出力されたものはそこ基準で解決する。
+ * 子プロセスは cwd=RUN_DIR で動くので、相対で指定・出力されたものはそこ基準で解決する。
  * Electron 自身の cwd（npm run dev なら electron-ui/）基準にすると別の場所を指してしまう。
  */
 function resolveDetectorPath(target) {
-  return target ? path.resolve(DETECTOR_DIR, String(target)) : null;
+  return target ? path.resolve(RUN_DIR, String(target)) : null;
 }
 
 ipcMain.handle('shell:reveal', (_event, target) => {
@@ -275,6 +327,18 @@ ipcMain.handle('shell:open', (_event, target) => {
   const resolved = resolveDetectorPath(target);
   if (!resolved || !fs.existsSync(resolved)) return false;
   shell.openPath(resolved);
+  return true;
+});
+
+// データフォルダは初回の実行まで無いので、作ってから開く（空でも場所が分かるように）
+ipcMain.handle('data:open', () => {
+  const target = dataDir();
+  try {
+    fs.mkdirSync(target, { recursive: true });
+  } catch {
+    return false;
+  }
+  shell.openPath(target);
   return true;
 });
 
@@ -314,7 +378,7 @@ async function startRun(form) {
       detail:
         '検証を通ったものだけが対象ですが、投入元のファイルは失われます。\n'
         + '退避先（--trash-dir）を指定しておけば削除ではなく移動になります。\n\n'
-        + formatCommand(args),
+        + formatCommand(args, commandBase()),
     });
     if (response !== 1) return { started: false, error: null, canceled: true };
   }
@@ -322,12 +386,13 @@ async function startRun(form) {
   // 起動時のウィンドウではなく「今のウィンドウ」へ送る。閉じて開き直しても制御を失わないようにする
   const send = sendToWindow;
   const pump = createStreamPump(send);
-  const uv = resolveUv();
-  const command = formatCommand(args);
+  // uv は PATH が最小限でも見つかるよう絶対パスで起動する（表示は `uv` のまま）
+  const [program, ...baseArgs] = DETECTOR_EXE ? commandBase() : [resolveUv(), 'run', 'main.py'];
+  const command = formatCommand(args, commandBase());
   stoppedByUser = false;
 
-  child = spawn(uv, ['run', 'main.py', ...args], {
-    cwd: DETECTOR_DIR,
+  child = spawn(program, [...baseArgs, ...args], {
+    cwd: RUN_DIR,
     env: childEnv(),
     detached: true, // 中断をプロセスグループごと送るため（uv の下の python にも届く）
   });
@@ -346,9 +411,12 @@ async function startRun(form) {
   child.stderr.on('data', pump.onStderr);
 
   child.on('error', (e) => {
-    const detail = e.code === 'ENOENT'
-      ? `uv が見つかりません（${uv}）。uv をインストールし PATH を通してから再実行してください`
-      : e.message;
+    let detail = e.message;
+    if (e.code === 'ENOENT') {
+      detail = DETECTOR_EXE
+        ? `同梱の detector が見つかりません（${program}）。アプリを入れ直してください`
+        : `uv が見つかりません（${program}）。uv をインストールし PATH を通してから再実行してください`;
+    }
     send('run:log', [{ stream: 'err', text: `起動できませんでした: ${detail}` }]);
     // spawn 自体が失敗した場合は close が来ないことがあるので、ここで打ち切る
     finish({

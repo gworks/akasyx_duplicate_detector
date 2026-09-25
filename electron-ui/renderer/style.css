@@ -123,6 +123,7 @@ code, .log, .command-text {
 }
 
 .path-row { display: flex; gap: 6px; }
+.data-dir { flex: 1; min-width: 0; align-self: center; font-size: 11.5px; background: var(--chip); padding: 4px 6px; border-radius: 4px; overflow-wrap: anywhere; user-select: text; }
 .input {
   flex: 1;
   min-width: 0;

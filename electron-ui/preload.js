@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld('detector', {
   stop: () => ipcRenderer.invoke('run:stop'),
   reveal: (target) => ipcRenderer.invoke('shell:reveal', target),
   open: (target) => ipcRenderer.invoke('shell:open', target),
+  openDataDir: () => ipcRenderer.invoke('data:open'),
   copy: (text) => ipcRenderer.invoke('clipboard:write', text),
   // ドラッグ＆ドロップされた File から実パスを得る（file.path は廃止済み）
   pathForFile: (file) => {

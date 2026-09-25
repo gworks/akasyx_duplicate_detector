@@ -122,6 +122,10 @@ def _isolate_archive_db(tmp_path, monkeypatch):
     2026-09-14 に pytest の tmp パスが本番 DB の ar_archives に 4 件登録される事故が起きたため。
     """
     monkeypatch.setattr(config_module, "_default_archive_db", lambda: archive_db_path(tmp_path))
+    # 実行環境の変数で既定の置き場（開発時 dist/ か配布版の App Support か）が変わらないようにする
+    monkeypatch.delenv("AKASYX_PACKAGED", raising=False)
+    monkeypatch.delenv("AKASYX_DETECTOR_HOME", raising=False)
+    monkeypatch.delenv("AKASYX_SIBLINGS_BIN", raising=False)
 
 
 @pytest.fixture

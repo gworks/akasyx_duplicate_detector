@@ -68,10 +68,10 @@ def preflight(config: DetectorConfig) -> None:
                 f"  投入元        : {config.source_path}"
             )
         if os.path.isdir(config.source_path):
-            crawler_client.resolve_crawler_repo(config.crawler_repo)
+            crawler_client.check_crawler(config)
 
     if config.mode == MODE_VERIFY:
-        crawler_client.resolve_crawler_repo(config.crawler_repo)
+        crawler_client.check_crawler(config)
 
     if config.mode == MODE_DELETE_DUPLICATES and config.trash_dir:
         if is_nested(config.archive_root, config.trash_dir):

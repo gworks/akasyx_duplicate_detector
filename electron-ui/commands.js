@@ -137,8 +137,9 @@ function pushIngestId(args, raw) {
 }
 
 /** 画面表示・コピー用のコマンド文字列（実際に spawn する内容と同じ引数から作る）。 */
-function formatCommand(args) {
-  return ['uv', 'run', 'main.py', ...args].map(quoteArg).join(' ');
+/** 表示・コピー用のコマンド文字列。base は起動コマンドの先頭部分（既定は開発時の `uv run main.py`）。 */
+function formatCommand(args, base = ['uv', 'run', 'main.py']) {
+  return [...base, ...args].map(quoteArg).join(' ');
 }
 
 function quoteArg(arg) {

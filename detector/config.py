@@ -39,6 +39,14 @@ def repo_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _version_file() -> str:
+    """version.txt の場所。PyInstaller で固めた実行形式では同梱した写し（--add-data）を読む。"""
+    bundle = getattr(sys, "_MEIPASS", None)
+    if getattr(sys, "frozen", False) and bundle:
+        return os.path.join(bundle, "version.txt")
+    return os.path.join(repo_root(), "version.txt")
+
+
 def app_version() -> str:
     """バージョンの正本 <リポジトリルート>/version.txt を返します。
 
@@ -47,27 +55,70 @@ def app_version() -> str:
     読めない場合は起動を止めず "0.0.0" を返す（表示が 0.0.0 なら配置漏れを疑う）。
     """
     try:
-        with open(os.path.join(repo_root(), "version.txt"), encoding="utf-8") as f:
+        with open(_version_file(), encoding="utf-8") as f:
             return f.read().strip()
     except OSError:
         return "0.0.0"
 
 
+# 配布版のデータフォルダ名。akasyx_search の ~/Library/Application Support/akasyx/ とは分ける
+# （search のデータ移動は akasyx/ の中身を丸ごと移し、削除手順も akasyx/ ごと消すため）
+APP_DATA_NAME = "akasyx-duplicate-detector"
+
+
+def is_packaged() -> bool:
+    """配布版（PyInstaller で固めた実行形式。開発中に試すときは AKASYX_PACKAGED=1）か。"""
+    return bool(getattr(sys, "frozen", False)) or os.environ.get("AKASYX_PACKAGED") == "1"
+
+
+def app_home() -> str:
+    """配布版のデータフォルダ。AKASYX_DETECTOR_HOME で差し替えられる（テスト用）。
+
+    macOS: ~/Library/Application Support/akasyx-duplicate-detector/
+    Windows: %LOCALAPPDATA%/akasyx-duplicate-detector/
+    その他: $XDG_DATA_HOME/akasyx-duplicate-detector/（既定 ~/.local/share）
+    """
+    if os.environ.get("AKASYX_DETECTOR_HOME"):
+        return os.path.abspath(os.environ["AKASYX_DETECTOR_HOME"])
+    if sys.platform == "darwin":
+        return os.path.expanduser(f"~/Library/Application Support/{APP_DATA_NAME}")
+    if sys.platform == "win32":
+        return os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_DATA_NAME)
+    return os.path.join(
+        os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), APP_DATA_NAME
+    )
+
+
+def data_root() -> str:
+    """正本 DB・作業用 DB・ログを置くフォルダ。
+
+    配布版は app_home()（.app の中は書き込めないため）、開発時は <リポジトリルート>/dist/。
+    """
+    return app_home() if is_packaged() else os.path.join(repo_root(), "dist")
+
+
 def _default_db_dir() -> str:
-    return os.path.join(repo_root(), "dist", "db")
+    return os.path.join(data_root(), "db")
 
 
 def _default_log_dir() -> str:
-    return os.path.join(repo_root(), "dist", "log")
+    return os.path.join(data_root(), "log")
 
 
 def _default_archive_db() -> str:
-    """正本 DB の既定 <リポジトリルート>/dist/archive.db（v0.2.0）。
+    """正本 DB の既定 <データフォルダ>/archive.db。
 
-    保存フォルダの外・ローカルディスクに置く。将来 Electron を実行形式にしたときは
-    実行ファイルと同階層に置く方針（設計書 §4 / §15）。
+    保存フォルダの外・ローカルディスクに置く（設計書 §4 / §15）。データフォルダは data_root() を参照。
     """
-    return os.path.join(repo_root(), "dist", "archive.db")
+    return os.path.join(data_root(), "archive.db")
+
+
+def _default_siblings_bin() -> str:
+    """同梱した兄弟の実行形式の置き場（配布版で UI が AKASYX_SIBLINGS_BIN に渡す）。
+
+    空なら開発時の扱いで、crawler は --crawler-repo のソースを `uv run` で起動する。
+    """
+    return os.environ.get("AKASYX_SIBLINGS_BIN", "")
 
 
 def _default_crawler_repo() -> str:
@@ -88,6 +139,8 @@ class DetectorConfig:
     archive_id: int | None = None
     dest_subdir: str | None = None
     crawler_repo: str = field(default_factory=_default_crawler_repo)
+    # 配布版: <siblings_bin>/akasyx-crawler/akasyx-crawler（PyInstaller onedir）を起動する
+    siblings_bin: str = field(default_factory=_default_siblings_bin)
     db_dir: str = field(default_factory=_default_db_dir)
     log_dir: str = field(default_factory=_default_log_dir)
     dry_run: bool = False
@@ -109,7 +162,7 @@ class DetectorConfig:
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--archive-db", default=None, metavar="PATH",
-        help="正本 DB のパス（既定: <リポジトリルート>/dist/archive.db）",
+        help="正本 DB のパス（既定: <データフォルダ>/archive.db）",
     )
     parser.add_argument(
         "--crawler-repo", default=None, metavar="PATH",
@@ -117,11 +170,11 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--db-dir", default=None,
-        help="crawler の DB 出力先（既定: <リポジトリルート>/dist/db）",
+        help="crawler の DB 出力先（既定: <データフォルダ>/db）",
     )
     parser.add_argument(
         "--log-dir", default=None,
-        help="ログ・CSV 出力先（既定: <リポジトリルート>/dist/log）",
+        help="ログ・CSV 出力先（既定: <データフォルダ>/log）",
     )
 
 
@@ -130,6 +183,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="akasyx_duplicate_detector",
         description="重複判定アーカイバ: 保存用フォルダに内容重複のないファイル集合を"
         "構築します（設計書 v0.1.0）",
+        epilog=f"データフォルダ（正本 DB・作業用 DB・ログの既定の置き場）: {data_root()}",
     )
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {app_version()}"
@@ -249,6 +303,7 @@ def parse_arguments(argv: list[str] | None = None) -> DetectorConfig:
         ),
         dest_subdir=getattr(args, "dest_subdir", None),
         crawler_repo=os.path.abspath(args.crawler_repo or _default_crawler_repo()),
+        siblings_bin=_default_siblings_bin(),
         db_dir=args.db_dir or _default_db_dir(),
         log_dir=args.log_dir or _default_log_dir(),
         dry_run=getattr(args, "dry_run", False),
