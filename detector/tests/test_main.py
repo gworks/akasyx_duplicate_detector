@@ -27,7 +27,7 @@ def test_rejects_archive_inside_source(make_config, tmp_path):
     config = make_config(
         archive_root=str(source / "archive"), source_path=str(source)
     )
-    with pytest.raises(PreflightError, match="入れ子"):
+    with pytest.raises(PreflightError, match="nested"):
         main.preflight(config)
 
 
@@ -35,25 +35,25 @@ def test_rejects_source_inside_archive(make_config, archive):
     inner = os.path.join(archive, "inbox")
     os.makedirs(inner)
     config = make_config(archive_root=archive, source_path=inner)
-    with pytest.raises(PreflightError, match="入れ子"):
+    with pytest.raises(PreflightError, match="nested"):
         main.preflight(config)
 
 
 def test_rejects_same_path(make_config, archive):
     config = make_config(archive_root=archive, source_path=archive)
-    with pytest.raises(PreflightError, match="入れ子"):
+    with pytest.raises(PreflightError, match="nested"):
         main.preflight(config)
 
 
 def test_rejects_missing_archive(make_config, tmp_path):
     config = make_config(archive_root=str(tmp_path / "nope"))
-    with pytest.raises(PreflightError, match="保存用フォルダがありません"):
+    with pytest.raises(PreflightError, match="Archive folder not found"):
         main.preflight(config)
 
 
 def test_rejects_missing_source(make_config, archive, tmp_path):
     config = make_config(archive_root=archive, source_path=str(tmp_path / "nope"))
-    with pytest.raises(PreflightError, match="投入元がありません"):
+    with pytest.raises(PreflightError, match="Source not found"):
         main.preflight(config)
 
 
@@ -65,7 +65,7 @@ def test_rejects_missing_crawler_repo(make_config, archive, source, tmp_path):
         source_path=source,
         crawler_repo=str(tmp_path / "absent"),
     )
-    with pytest.raises(PreflightError, match="akasyx_crawler が見つかりません"):
+    with pytest.raises(PreflightError, match="akasyx_crawler not found"):
         main.preflight(config)
 
 
@@ -232,7 +232,7 @@ def test_lock_prevents_concurrent_run(make_config, archive, source):
 
     config = make_config(archive_root=archive, source_path=source)
     with archive_lock(archive):
-        with pytest.raises(PreflightError, match="使用中"):
+        with pytest.raises(PreflightError, match="in use by another process"):
             with archive_lock(archive):
                 pass  # pragma: no cover
 

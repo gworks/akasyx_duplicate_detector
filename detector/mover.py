@@ -98,7 +98,7 @@ def pick_free_name(
         return candidate
 
     raise DetectorError(
-        f"保存先の空きが見つかりません（{MAX_COLLISION_SUFFIX} 件まで試行）: {rel}"
+        f"No free destination name found (tried {MAX_COLLISION_SUFFIX}): {rel}"
     )
 
 
@@ -254,7 +254,7 @@ def safe_move(src: str, dst: str, expected_hash: str | None, tmp_root: str) -> N
             actual = hashing.file_hash(part)
             if actual != expected_hash:
                 raise DetectorError(
-                    f"コピー後のハッシュが一致しません（期待 {expected_hash} / 実際 {actual}）"
+                    f"Hash mismatch after copy (expected {expected_hash} / actual {actual})"
                 )
         os.replace(part, dst)
     except BaseException:
@@ -276,10 +276,10 @@ def _abandon_reservation(session, record: ArchiveFile, dst: str, message: str) -
     """
     if os.path.lexists(dst):
         record.status = STATUS_FAILED
-        logger.error(f"移動に失敗したが保存先に実体があります: {dst}: {message}")
+        logger.error(f"Move failed but the file exists at the destination: {dst}: {message}")
     else:
         session.delete(record)
-        logger.warning(f"移動に失敗（未実施として予約を取り消し）: {message}")
+        logger.warning(f"Move failed (not performed; reservation cancelled): {message}")
     session.commit()
 
 
@@ -343,7 +343,7 @@ def plan_and_move(
         session.commit()
         return MoveResult(
             ok=False,
-            message=f"移動後のサイズが一致しません（期待 {scanned.size} / 実際 {actual_size}）",
+            message=f"Size mismatch after move (expected {scanned.size} / actual {actual_size})",
         )
 
     record.status = STATUS_STORED
@@ -371,7 +371,7 @@ def cleanup_tmp(archive_root: str) -> int:
             os.unlink(os.path.join(root, name))
             removed += 1
     if removed:
-        logger.warning(f"作りかけのコピー {removed} 件を削除しました")
+        logger.warning(f"Removed {removed} partial copies")
     return removed
 
 
@@ -391,7 +391,7 @@ def recover_pending(session, config) -> dict:
         cleanup_tmp(archive_root)
         return counts
 
-    logger.warning(f"未完了の移動が {len(rows)} 件あります。復旧を試みます")
+    logger.warning(f"Found {len(rows)} incomplete moves; attempting recovery")
     for row in rows:
         dst = from_posix(archive_root, row.stored_path_rel)
         src = row.origin_path_abs
@@ -402,7 +402,7 @@ def recover_pending(session, config) -> dict:
             except OSError as e:
                 row.status = STATUS_FAILED
                 counts["failed"] += 1
-                logger.error(f"復旧: 保存先を読めません {dst}: {e}")
+                logger.error(f"Recovery: cannot read destination {dst}: {e}")
                 continue
 
             if dst_hash == row.filehash:
@@ -415,7 +415,7 @@ def recover_pending(session, config) -> dict:
             else:
                 row.status = STATUS_FAILED
                 counts["failed"] += 1
-                logger.error(f"復旧: 保存先の内容が予約と違います（自動では消しません）: {dst}")
+                logger.error(f"Recovery: destination content differs from the reservation (not deleted automatically): {dst}")
             continue
 
         # 保存先に実体が無い
@@ -426,14 +426,14 @@ def recover_pending(session, config) -> dict:
             row.status = STATUS_FAILED
             counts["failed"] += 1
             logger.error(
-                f"復旧: 保存先にも元にも実体がありません: {row.stored_path_rel} / {src}"
+                f"Recovery: file missing at both destination and source: {row.stored_path_rel} / {src}"
             )
 
     session.commit()
     cleanup_tmp(archive_root)
     logger.warning(
-        f"復旧結果 — 完了扱い: {counts['stored']}件, "
-        f"取り消し: {counts['reverted']}件, 要確認: {counts['failed']}件"
+        f"Recovery result - completed: {counts['stored']}, "
+        f"reverted: {counts['reverted']}, needs review: {counts['failed']}"
     )
     return counts
 
@@ -444,9 +444,9 @@ def _remove_source_if_same(src: str, expected_hash: str) -> None:
         if hashing.file_hash(src) == expected_hash:
             os.unlink(src)
         else:
-            logger.warning(f"復旧: 元ファイルの内容が違うため残します: {src}")
+            logger.warning(f"Recovery: keeping source file because its content differs: {src}")
     except OSError as e:
-        logger.warning(f"復旧: 元ファイルを削除できません: {src}: {e}")
+        logger.warning(f"Recovery: cannot delete source file: {src}: {e}")
 
 
 # --- 後始末 -------------------------------------------------------------------

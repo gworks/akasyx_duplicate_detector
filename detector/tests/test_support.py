@@ -177,7 +177,7 @@ def test_missing_archive_db_is_created_on_startup(tmp_path, caplog):
         sess, engine = get_session(str(path))
     try:
         assert path.exists()
-        assert "新規作成します" in caplog.text
+        assert "creating a new one" in caplog.text
         # テーブルまで揃っている（ar_archives が引ける）
         from models import Archive
         assert sess.query(Archive).count() == 0
@@ -190,7 +190,7 @@ def test_missing_archive_db_is_created_on_startup(tmp_path, caplog):
     with caplog.at_level("WARNING"):
         sess, engine = get_session(str(path))
     sess.close(); engine.dispose()
-    assert "新規作成します" not in caplog.text
+    assert "creating a new one" not in caplog.text
 
 
 def test_pragmas_are_applied(tmp_path):
@@ -212,7 +212,7 @@ def test_pragmas_are_applied(tmp_path):
 
 def test_report_runs_on_empty_archive(make_config, archive, capsys):
     assert main.run(make_config(mode=MODE_REPORT, archive_root=archive)) == main.EXIT_OK
-    assert "保存フォルダの状態" in capsys.readouterr().out
+    assert "Archive folder status" in capsys.readouterr().out
 
 
 def test_report_shows_stored_and_unresolved(
@@ -227,7 +227,7 @@ def test_report_shows_stored_and_unresolved(
     main.run(make_config(mode=MODE_REPORT, archive_root=archive))
     out = capsys.readouterr().out
     assert "stored" in out
-    assert "未処置の重複（投入元に残っている）: 1 件" in out
+    assert "Unresolved duplicates (still in the source): 1" in out
 
 
 def test_report_ingest_detail(make_config, archive, source, tmp_path, fake_crawler, capsys):
@@ -237,16 +237,16 @@ def test_report_ingest_detail(make_config, archive, source, tmp_path, fake_crawl
     capsys.readouterr()
 
     main.run(make_config(mode=MODE_REPORT, archive_root=archive, ingest_id=1))
-    assert "実行 #1" in capsys.readouterr().out
+    assert "Run #1" in capsys.readouterr().out
 
 
 def test_report_unknown_ingest(make_config, archive, capsys):
     main.run(make_config(mode=MODE_REPORT, archive_root=archive, ingest_id=999))
-    assert "見つかりません" in capsys.readouterr().out
+    assert "not found" in capsys.readouterr().out
 
 
 def test_recent_ingests_on_empty_db(session):
-    assert "（履歴なし）" in "\n".join(report._recent_ingests(session, 1))
+    assert "(no history)" in "\n".join(report._recent_ingests(session, 1))
 
 
 # --- crawler の起動（開発時 uv run / 配布版は同梱の実行形式） --------------------
@@ -272,7 +272,7 @@ def test_crawler_command_uses_uv_in_development(make_config, tmp_path, monkeypat
 
 def test_check_crawler_rejects_missing_bundled_executable(make_config, tmp_path):
     cfg = make_config(siblings_bin=str(tmp_path / "bin"))
-    with pytest.raises(PreflightError, match="同梱の crawler"):
+    with pytest.raises(PreflightError, match="Bundled crawler"):
         crawler_client.check_crawler(cfg)
 
 

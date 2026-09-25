@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "electron .",
     "start": "electron .",
-    "dist:mac": "electron-builder --mac dir --arm64"
+    "dist:mac": "electron-builder --mac dir --arm64",
+    "test": "node --test"
   },
   "devDependencies": {
     "electron": "^44.0.0",
@@ -25,6 +26,8 @@
       "main.js",
       "preload.js",
       "commands.js",
+      "i18n.js",
+      "locales/**/*",
       "renderer/**/*",
       "package.json"
     ],

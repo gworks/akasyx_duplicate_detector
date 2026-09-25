@@ -17,7 +17,14 @@ const QUARANTINE_KINDS = [
 const DEFAULT_MIN_SIZE = 1; // config.py の既定値。同じ値なら引数に出さない
 const DEFAULT_FOLDER_LIMIT = 500; // config.py の DEFAULT_FOLDER_LIMIT
 
-class FormError extends Error {}
+/** 入力の不備。文言は辞書のキー（key）と差し込み（vars）で持ち、main が今の言語に訳す。 */
+class FormError extends Error {
+  constructor(key, vars = {}) {
+    super(key);
+    this.key = key;
+    this.vars = vars;
+  }
+}
 
 function trimmed(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -49,12 +56,12 @@ function normalizePath(value) {
 function buildArgs(form) {
   const mode = trimmed(form && form.mode);
   if (!MODES.includes(mode)) {
-    throw new FormError(`不明なコマンドです: ${mode || '(未指定)'}`);
+    throw new FormError('err_unknown_command', { mode: mode || '-' });
   }
 
   const archiveRoot = normalizePath(form.archiveRoot);
   if (!archiveRoot) {
-    throw new FormError('保存用フォルダを指定してください');
+    throw new FormError('err_archive_root_required');
   }
 
   const args = [mode, archiveRoot];
@@ -62,7 +69,7 @@ function buildArgs(form) {
   if (mode === 'add') {
     const sourcePath = normalizePath(form.sourcePath);
     if (!sourcePath) {
-      throw new FormError('投入元（追加したいファイル / フォルダ）を指定してください');
+      throw new FormError('err_source_required');
     }
     args.push(sourcePath);
 
@@ -71,7 +78,7 @@ function buildArgs(form) {
     if (rawFolderLimit) {
       const folderLimit = Number(rawFolderLimit);
       if (!Number.isInteger(folderLimit) || folderLimit < 1) {
-        throw new FormError(`1 フォルダの上限件数は 1 以上の整数で指定してください: ${rawFolderLimit}`);
+        throw new FormError('err_folder_limit', { value: rawFolderLimit });
       }
       if (folderLimit !== DEFAULT_FOLDER_LIMIT) args.push('--folder-limit', String(folderLimit));
     }
@@ -83,7 +90,7 @@ function buildArgs(form) {
     if (rawMinSize) {
       const minSize = Number(rawMinSize);
       if (!Number.isInteger(minSize) || minSize < 0) {
-        throw new FormError(`最小サイズは 0 以上の整数で指定してください: ${rawMinSize}`);
+        throw new FormError('err_min_size', { value: rawMinSize });
       }
       if (minSize !== DEFAULT_MIN_SIZE) args.push('--min-size', String(minSize));
     }
@@ -131,13 +138,13 @@ function pushIngestId(args, raw) {
   if (!value) return;
   const id = Number(value);
   if (!Number.isInteger(id) || id <= 0) {
-    throw new FormError(`実行 ID は正の整数で指定してください: ${value}`);
+    throw new FormError('err_ingest_id', { value });
   }
   args.push('--ingest-id', String(id));
 }
 
-/** 画面表示・コピー用のコマンド文字列（実際に spawn する内容と同じ引数から作る）。 */
-/** 表示・コピー用のコマンド文字列。base は起動コマンドの先頭部分（既定は開発時の `uv run main.py`）。 */
+/** 画面表示・コピー用のコマンド文字列（実際に spawn する内容と同じ引数から作る）。
+ * base は起動コマンドの先頭部分（既定は開発時の `uv run main.py`）。 */
 function formatCommand(args, base = ['uv', 'run', 'main.py']) {
   return [...base, ...args].map(quoteArg).join(' ');
 }

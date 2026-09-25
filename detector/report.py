@@ -17,16 +17,16 @@ def run_report(session, config, ingest) -> tuple[str, dict]:
     aid = config.archive_id
     stats = archive_stats(session, aid)
 
-    lines.append(f"保存用フォルダ: {config.archive_root}（#{aid}）")
-    lines.append(f"正本 DB      : {config.archive_db}")
+    lines.append(f"Archive folder: {config.archive_root} (#{aid})")
+    lines.append(f"Master DB     : {config.archive_db}")
     lines.append("")
-    lines.append("■ 保存フォルダの状態")
+    lines.append("■ Archive folder status")
     if not stats:
-        lines.append("  （登録なし）")
+        lines.append("  (none registered)")
     for status in sorted(stats):
         bucket = stats[status]
         lines.append(
-            f"  {status:<13} {bucket['count']:>6} 件  {format_size(bucket['size'])}"
+            f"  {status:<13} {bucket['count']:>6} files  {format_size(bucket['size'])}"
         )
 
     dispositions = (
@@ -39,9 +39,9 @@ def run_report(session, config, ingest) -> tuple[str, dict]:
         for (d,) in dispositions:
             counts[d] = counts.get(d, 0) + 1
         lines.append("")
-        lines.append("■ 処置予定フラグ（disposition）")
+        lines.append("■ Disposition flags")
         for name in sorted(counts):
-            lines.append(f"  {name:<13} {counts[name]:>6} 件")
+            lines.append(f"  {name:<13} {counts[name]:>6} files")
 
     unresolved = (
         session.query(IngestItem)
@@ -55,9 +55,9 @@ def run_report(session, config, ingest) -> tuple[str, dict]:
         .count()
     )
     lines.append("")
-    lines.append(f"■ 未処置の重複（投入元に残っている）: {unresolved} 件")
+    lines.append(f"■ Unresolved duplicates (still in the source): {unresolved}")
     if unresolved:
-        lines.append("  delete-duplicates で検証付きの削除ができます")
+        lines.append("  Use delete-duplicates to delete them with verification")
 
     if config.ingest_id is not None:
         lines.extend(_ingest_detail(session, config.ingest_id))
@@ -76,14 +76,14 @@ def _recent_ingests(
     if exclude_id is not None:
         query = query.filter(Ingest.id != exclude_id)  # 実行中の report 自身は出さない
     rows = query.order_by(Ingest.id.desc()).limit(limit).all()
-    lines = ["", f"■ 直近の実行（最大 {limit} 件）"]
+    lines = ["", f"■ Recent runs (up to {limit})"]
     if not rows:
-        lines.append("  （履歴なし）")
+        lines.append("  (no history)")
     for r in rows:
         dry = "[dry-run] " if r.dry_run else ""
         lines.append(
             f"  #{r.id:<4} {r.mode:<18} {dry}{r.status:<12} "
-            f"移動 {r.moved} / 重複 {r.duplicated} / スキップ {r.skipped} / 失敗 {r.failed}"
+            f"moved {r.moved} / duplicates {r.duplicated} / skipped {r.skipped} / failed {r.failed}"
         )
     return lines
 
@@ -91,15 +91,15 @@ def _recent_ingests(
 def _ingest_detail(session, ingest_id: int) -> list[str]:
     row = session.get(Ingest, ingest_id)
     if row is None:
-        return ["", f"■ 実行 #{ingest_id} は見つかりません"]
+        return ["", f"■ Run #{ingest_id} not found"]
 
-    lines = ["", f"■ 実行 #{row.id}（{row.mode}）"]
-    lines.append(f"  投入元      : {row.source_root or '-'}")
-    lines.append(f"  開始 / 終了 : {row.started_at} / {row.finished_at}")
-    lines.append(f"  ステータス  : {row.status}{' [dry-run]' if row.dry_run else ''}")
-    lines.append(f"  バージョン  : {row.app_version or '-'}")
+    lines = ["", f"■ Run #{row.id} ({row.mode})"]
+    lines.append(f"  Source      : {row.source_root or '-'}")
+    lines.append(f"  Start / end : {row.started_at} / {row.finished_at}")
+    lines.append(f"  Status      : {row.status}{' [dry-run]' if row.dry_run else ''}")
+    lines.append(f"  Version     : {row.app_version or '-'}")
     if row.stats_json:
-        lines.append("  内訳        :")
+        lines.append("  Breakdown   :")
         for key, value in json.loads(row.stats_json).items():
             lines.append(f"    {key:<18} {value}")
     return lines

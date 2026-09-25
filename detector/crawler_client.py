@@ -58,8 +58,8 @@ def resolve_crawler_repo(path: str) -> str:
     pkg = os.path.join(path, CRAWLER_PKG_DIRNAME, "main.py")
     if not os.path.isfile(pkg):
         raise PreflightError(
-            f"akasyx_crawler が見つかりません: {pkg}\n"
-            "--crawler-repo でリポジトリのパスを指定してください"
+            f"akasyx_crawler not found: {pkg}\n"
+            "Specify the repository path with --crawler-repo"
         )
     return path
 
@@ -76,8 +76,8 @@ def check_crawler(config) -> None:
         exe = crawler_executable(config.siblings_bin)
         if not os.access(exe, os.X_OK):
             raise PreflightError(
-                f"同梱の crawler が見つかりません: {exe}\n"
-                "アプリを入れ直してください"
+                f"Bundled crawler not found: {exe}\n"
+                "Please reinstall the app"
             )
         return
     resolve_crawler_repo(config.crawler_repo)
@@ -94,7 +94,7 @@ def crawler_command(config) -> tuple[list[str], str]:
     repo = resolve_crawler_repo(config.crawler_repo)
     if shutil.which("uv") is None:
         raise PreflightError(
-            "uv が見つかりません。crawler の実行に必要です（https://docs.astral.sh/uv/）"
+            "uv not found; it is required to run the crawler (https://docs.astral.sh/uv/)"
         )
     return ["uv", "run", "main.py"], os.path.join(repo, CRAWLER_PKG_DIRNAME)
 
@@ -147,16 +147,16 @@ def run_crawler(target: str, config, extra_excludes: tuple[str, ...] = ()) -> Cr
         cmd += ["--exclude", pattern]
 
     before = _max_scan_id(db_path)
-    logger.info(f"crawler 実行: {' '.join(cmd)} (cwd={cwd})")
+    logger.info(f"Running crawler: {' '.join(cmd)} (cwd={cwd})")
     # detector 側の VIRTUAL_ENV を持ち込むと uv が「プロジェクトの環境と違う」と警告する。
     # crawler は crawler 自身の .venv で動かすべきなので落としておく
     env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
     proc = subprocess.run(cmd, cwd=cwd, check=False, env=env)
     if proc.returncode != 0:
-        logger.warning(f"crawler が非ゼロ終了しました（コード {proc.returncode}）")
+        logger.warning(f"Crawler exited with non-zero status (code {proc.returncode})")
 
     if not os.path.exists(db_path):
-        raise PreflightError(f"crawler が DB を生成しませんでした: {db_path}")
+        raise PreflightError(f"Crawler did not produce a DB: {db_path}")
 
     scan_id, status = _read_scan(db_path, before)
     return CrawlerScan(
@@ -168,12 +168,12 @@ def ensure_completed(scan: CrawlerScan) -> None:
     """スキャンが完走していなければ PreflightError で止めます（設計書 §3）。"""
     if scan.scan_id is None:
         raise PreflightError(
-            "crawler のスキャン結果が見つかりません（crawler の実行に失敗した可能性があります）"
+            "Crawler scan result not found (the crawler may have failed to run)"
         )
     if scan.status != COMPLETED_STATUS:
         raise PreflightError(
-            f"crawler のスキャンが完走していません（status={scan.status}）。"
-            "不完全な走査では取り込みを行いません"
+            f"Crawler scan did not complete (status={scan.status}). "
+            "Import is not performed on an incomplete scan"
         )
 
 
@@ -222,7 +222,7 @@ def scan_single_file(path: str) -> ScannedFile:
         algo = hashing.HASH_ALGO
     except OSError as e:
         # 読み取れなければハッシュ無しとして返す（判定側が skipped_nohash にする）
-        logger.warning(f"ハッシュ計算に失敗: {path}: {e}")
+        logger.warning(f"Failed to compute hash: {path}: {e}")
         filehash, algo = None, None
     return ScannedFile(
         name=name,

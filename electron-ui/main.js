@@ -6,6 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { buildArgs, formatCommand, quoteArg, FormError } = require('./commands');
+const i18n = require('./i18n');
 
 // electron-ui/ はリポジトリルート直下に置く（設計書 §16）
 const REPO_ROOT = path.dirname(__dirname);
@@ -31,15 +32,17 @@ const UV_CANDIDATES = [
 ];
 const EXTRA_PATH_DIRS = UV_CANDIDATES.map((p) => path.dirname(p));
 
-const PROGRESS_LINE = /^判定中: (\d+)件 \((.+)\)$/;
-const CSV_LINE = /CSV レポート: (.+)$/;
+// detector の出力（英語固定）のうち、UI が拾う 2 種類。detector/ingest.py・dedupe.py・verify.py と揃える
+const PROGRESS_LINE = /^Progress: (\d+) files \((.+)\)$/;
+const CSV_LINE = /CSV report: (.+)$/;
 const FLUSH_INTERVAL_MS = 80;
 
+// 終了コードの意味。文言は辞書のキーで renderer に渡し、renderer が今の言語で出す
 const EXIT_MEANINGS = {
-  0: { level: 'ok', text: '正常終了しました' },
-  1: { level: 'error', text: '致命的エラーで停止しました' },
-  2: { level: 'warn', text: '完走しましたが失敗が 1 件以上あります（内容の確認が必要です）' },
-  3: { level: 'error', text: '事前チェックで拒否されました（入れ子・crawler 不在など）' },
+  0: { level: 'ok', key: 'exit_0' },
+  1: { level: 'error', key: 'exit_1' },
+  2: { level: 'warn', key: 'exit_2' },
+  3: { level: 'error', key: 'exit_3' },
 };
 
 let mainWindow = null;
@@ -47,6 +50,20 @@ let child = null;          // 同時実行は 1 本だけ
 let starting = false;      // buildArgs〜spawn の間（削除確認ダイアログ待ちを含む）も「実行中」扱いにする
 let activeRun = null;      // { command, startedAt, pump } ウィンドウを閉じて開き直したときの復元用
 let stoppedByUser = false;
+
+// --- 言語（i18n.js。前回選んだ言語 → OS の言語 → en） -------------------------
+
+let lang = null;
+
+function currentLang() {
+  if (!lang) lang = i18n.resolveLang(loadSettings().lang, app.getLocale());
+  return lang;
+}
+
+/** メインプロセスの文言（ダイアログ・起動エラー）を今の言語で。 */
+function tr(key, vars) {
+  return i18n.translator(currentLang())(key, vars);
+}
 
 /** 今開いているウィンドウへ送る。閉じられていれば捨てる（子プロセス自体は走り続ける）。 */
 function sendToWindow(channel, payload) {
@@ -73,7 +90,7 @@ function saveSettings(settings) {
     fs.writeFileSync(settingsPath(), JSON.stringify(settings, null, 2), 'utf-8');
     return true;
   } catch (e) {
-    console.error('設定の保存に失敗:', e);
+    console.error('Failed to save settings:', e);
     return false;
   }
 }
@@ -152,7 +169,7 @@ function createWindow() {
     height: 820,
     minWidth: 900,
     minHeight: 620,
-    title: `重複判定アーカイバ  v${appVersion()}`,
+    title: `akasyx Duplicate Detector  v${appVersion()}`, // 読み込み後は renderer の document.title（訳した名前）
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -283,6 +300,13 @@ ipcMain.handle('app:context', () => ({
     : null,
 }));
 
+ipcMain.handle('i18n:get', () => ({ lang: currentLang(), dict: i18n.dictionary(currentLang()) }));
+ipcMain.handle('i18n:set', (_event, next) => {
+  // 保存は renderer の settings:save（snapshot に lang を含む）に任せる
+  lang = i18n.normalizeLang(next) || currentLang();
+  return { lang, dict: i18n.dictionary(lang) };
+});
+
 ipcMain.handle('settings:load', () => loadSettings());
 ipcMain.handle('settings:save', (_event, settings) => saveSettings(settings));
 
@@ -291,7 +315,7 @@ ipcMain.handle('dialog:pick', async (_event, options = {}) => {
     ? ['openFile', 'openDirectory']   // macOS はファイルとフォルダを同時に許可できる
     : ['openDirectory'];
   const result = await dialog.showOpenDialog(mainWindow, {
-    title: options.title || '選択',
+    title: options.title || tr('pick_default_title'),
     defaultPath: options.defaultPath || undefined,
     properties: [...properties, 'createDirectory'],
   });
@@ -302,7 +326,7 @@ ipcMain.handle('command:preview', (_event, form) => {
   try {
     return { command: formatCommand(buildArgs(form), commandBase()), error: null };
   } catch (e) {
-    if (e instanceof FormError) return { command: null, error: e.message };
+    if (e instanceof FormError) return { command: null, error: tr(e.key, e.vars) };
     throw e;
   }
 });
@@ -349,7 +373,7 @@ ipcMain.handle('clipboard:write', (_event, text) => {
 
 ipcMain.handle('run:start', async (_event, form) => {
   // 確認ダイアログを待っている間も含めて 1 本に絞る（child は spawn 後にしか立たない）
-  if (child || starting) return { started: false, error: '実行中です。終わるまで待つか中断してください' };
+  if (child || starting) return { started: false, error: tr('busy') };
   starting = true;
   try {
     return await startRun(form);
@@ -363,7 +387,7 @@ async function startRun(form) {
   try {
     args = buildArgs(form);
   } catch (e) {
-    if (e instanceof FormError) return { started: false, error: e.message };
+    if (e instanceof FormError) return { started: false, error: tr(e.key, e.vars) };
     throw e;
   }
 
@@ -371,14 +395,11 @@ async function startRun(form) {
   if (form.mode === 'delete-duplicates' && form.yes) {
     const { response } = await dialog.showMessageBox(mainWindow, {
       type: 'warning',
-      buttons: ['キャンセル', '削除を実行する'],
+      buttons: [tr('delete_confirm_cancel'), tr('delete_confirm_ok')],
       defaultId: 0,
       cancelId: 0,
-      message: '据え置いた重複ファイルを実際に削除します',
-      detail:
-        '検証を通ったものだけが対象ですが、投入元のファイルは失われます。\n'
-        + '退避先（--trash-dir）を指定しておけば削除ではなく移動になります。\n\n'
-        + formatCommand(args, commandBase()),
+      message: tr('delete_confirm_message'),
+      detail: `${tr('delete_confirm_detail')}\n\n${formatCommand(args, commandBase())}`,
     });
     if (response !== 1) return { started: false, error: null, canceled: true };
   }
@@ -413,17 +434,15 @@ async function startRun(form) {
   child.on('error', (e) => {
     let detail = e.message;
     if (e.code === 'ENOENT') {
-      detail = DETECTOR_EXE
-        ? `同梱の detector が見つかりません（${program}）。アプリを入れ直してください`
-        : `uv が見つかりません（${program}）。uv をインストールし PATH を通してから再実行してください`;
+      detail = tr(DETECTOR_EXE ? 'bundled_detector_missing' : 'uv_missing', { program });
     }
-    send('run:log', [{ stream: 'err', text: `起動できませんでした: ${detail}` }]);
+    send('run:log', [{ stream: 'err', text: tr('launch_failed_detail', { detail }) }]);
     // spawn 自体が失敗した場合は close が来ないことがあるので、ここで打ち切る
     finish({
       code: null,
       signal: null,
       stoppedByUser: false,
-      meaning: { level: 'error', text: '起動できませんでした' },
+      meaning: { level: 'error', key: 'launch_failed' },
     });
   });
 
@@ -432,10 +451,9 @@ async function startRun(form) {
       code,
       signal,
       stoppedByUser,
-      meaning: EXIT_MEANINGS[code] || {
-        level: 'error',
-        text: signal ? `シグナル ${signal} で終了しました` : `終了コード ${code}`,
-      },
+      meaning: EXIT_MEANINGS[code] || (signal
+        ? { level: 'error', key: 'exit_signal', vars: { signal } }
+        : { level: 'error', key: 'exit_code', vars: { code } }),
     });
   });
 

@@ -84,7 +84,7 @@ def test_archives_subcommand_lists_registered(make_config, archive, tmp_path, ca
     assert main.run(cfg) == main.EXIT_OK
     out = capsys.readouterr().out
     assert archive in out
-    assert "登録済みの保存フォルダ: 1 件" in out
+    assert "Registered archive folders: 1" in out
 
 
 def _make_legacy_db(path: str, root: str) -> None:

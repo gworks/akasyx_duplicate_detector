@@ -188,6 +188,17 @@ Python 側の前提は CLI と同じです（`detector/` で `uv sync` 済み、
 - **進捗の集計表示** — `add` の1ファイル1行の出力はログに流さず、件数と判定内訳に集計します
 - **CSV / ログへの導線** — 実行後に出力された CSV を Finder で開けます
 
+### 多言語対応
+
+- 画面（メニューと説明）は **ja / en / fr / de / it / et** の 6 言語。右上のセレクトで切り替え、選んだ言語は次回も使う。
+  初回は OS の言語（対応外なら英語）
+- 文言は `electron-ui/locales/<lang>.json`。main プロセスが読んで renderer に渡す（renderer の CSP が `fetch` を許さないため）。
+  辞書に無いキーは英語の値で埋める。HTML を含む値はキー名を `*_html` にする（`data-i18n-html` で innerHTML に入る）
+- 文言を足したら 6 言語すべてに同じキーを入れる。`cd electron-ui && npm test` が、JSON として読めること・キーと
+  `{差し込み名}` の一致・`index.html` と入力エラーが参照するキーの存在を検査する
+- detector 本体のログ・コンソール出力は**英語のみ**。UI は `Progress: <n> files (<result>)` と `CSV report: <path>` の
+  2 種類の行を読む（変えるときは `electron-ui/main.js` の正規表現も直す）
+
 ### 安全側の作り
 
 - 引数の組み立ては `electron-ui/commands.js` の 1 箇所だけで行い、画面に出す

@@ -5,7 +5,7 @@ import os
 
 logger = logging.getLogger(__name__)
 
-RESULT_CSV_HEADERS = ["ファイル名", "元パス", "判定", "サイズ", "保存先", "備考"]
+RESULT_CSV_HEADERS = ["File name", "Source path", "Result", "Size", "Destination", "Note"]
 
 
 def create_csv(log_dir: str, csv_name: str, ts_start: str) -> str:
@@ -28,4 +28,4 @@ def csv_update(csv_file: str, row: list) -> None:
         with open(csv_file, "a", newline="", encoding="utf-8-sig") as f:
             csv.writer(f).writerow(row)
     except (OSError, csv.Error, UnicodeError) as e:
-        logger.warning(f"CSV 書き込みに失敗: {csv_file}: {e}")
+        logger.warning(f"Failed to write CSV: {csv_file}: {e}")

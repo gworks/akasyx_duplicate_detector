@@ -9,6 +9,9 @@ const listen = (channel) => (callback) => {
 
 contextBridge.exposeInMainWorld('detector', {
   getContext: () => ipcRenderer.invoke('app:context'),
+  // 画面の言語: { lang, dict }（dict は英語の値で穴埋め済みの辞書）
+  getLanguage: () => ipcRenderer.invoke('i18n:get'),
+  setLanguage: (lang) => ipcRenderer.invoke('i18n:set', lang),
   loadSettings: () => ipcRenderer.invoke('settings:load'),
   saveSettings: (settings) => ipcRenderer.invoke('settings:save', settings),
   pick: (options) => ipcRenderer.invoke('dialog:pick', options),

@@ -57,14 +57,14 @@ def check_item(session, config, item) -> tuple[str, str | None]:
     """
     src = item.source_path_abs
     if not src or not os.path.lexists(src):
-        return CHECK_GONE, "元ファイルが既にありません"
+        return CHECK_GONE, "Source file no longer exists"
 
     try:
         actual = hashing.file_hash(src)
     except OSError as e:
-        return CHECK_SOURCE_CHANGED, f"元ファイルを読めません: {e}"
+        return CHECK_SOURCE_CHANGED, f"Cannot read source file: {e}"
     if actual != item.filehash:
-        return CHECK_SOURCE_CHANGED, f"元ファイルの内容が変わっています（現在 {actual}）"
+        return CHECK_SOURCE_CHANGED, f"Source file content has changed (now {actual})"
 
     row = (
         session.get(ArchiveFile, item.archive_file_id)
@@ -83,16 +83,16 @@ def check_item(session, config, item) -> tuple[str, str | None]:
             .first()
         )
     if row is None or row.status != STATUS_STORED or row.archive_id != config.archive_id:
-        return CHECK_ARCHIVE_MISSING, "保存フォルダ側の登録がありません"
+        return CHECK_ARCHIVE_MISSING, "No matching record in the archive folder"
 
     dst = from_posix(config.archive_root, row.stored_path_rel)
     if not os.path.lexists(dst):
-        return CHECK_ARCHIVE_MISSING, f"保存フォルダ側の実体がありません: {row.stored_path_rel}"
+        return CHECK_ARCHIVE_MISSING, f"Archived file is missing: {row.stored_path_rel}"
     try:
         if hashing.file_hash(dst) != item.filehash:
-            return CHECK_ARCHIVE_MISSING, "保存フォルダ側の内容が一致しません"
+            return CHECK_ARCHIVE_MISSING, "Archived file content does not match"
     except OSError as e:
-        return CHECK_ARCHIVE_MISSING, f"保存フォルダ側を読めません: {e}"
+        return CHECK_ARCHIVE_MISSING, f"Cannot read archived file: {e}"
 
     return CHECK_OK, None
 
@@ -149,7 +149,7 @@ def run_delete_duplicates(session, config, ingest) -> tuple[str, dict]:
             session.commit()
     except KeyboardInterrupt:
         status = "interrupted"
-        logger.warning("ユーザー操作により中断されました")
+        logger.warning("Interrupted by user")
     finally:
         session.commit()
 
@@ -163,10 +163,10 @@ def run_delete_duplicates(session, config, ingest) -> tuple[str, dict]:
 
     if not config.assume_yes:
         print(
-            f"\n削除対象: {counters.get(CHECK_OK, 0)} 件 / 合計 "
-            f"{total_size} バイト（--yes を付けると実際に削除します）"
+            f"\nTo delete: {counters.get(CHECK_OK, 0)} files / {total_size} bytes total "
+            f"(add --yes to actually delete)"
         )
-    logger.info(f"CSV レポート: {csv_file}")
+    logger.info(f"CSV report: {csv_file}")
     return status, counters
 
 
@@ -180,9 +180,9 @@ def _dispose(config, item) -> tuple[bool, str | None]:
                 stem, ext = os.path.splitext(dst)
                 dst = f"{stem}.{item.id}{ext}"
             mover.safe_move(src, dst, item.filehash, tmp_dir(config.archive_root))
-            return True, f"退避: {dst}"
+            return True, f"Moved to trash: {dst}"
         os.unlink(src)
         return True, None
     except OSError as e:
-        logger.error(f"後始末に失敗: {src}: {e}")
+        logger.error(f"Failed to dispose of file: {src}: {e}")
         return False, str(e)

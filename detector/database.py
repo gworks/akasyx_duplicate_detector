@@ -50,7 +50,7 @@ def get_session(path: str) -> tuple[Session, object]:
     if is_new:
         # 起動時に正本 DB が無ければ作る（初回起動・dist/ を消した後・別マシンでの初回）。
         # 保存フォルダ側の .akasyx/archive.id が残っていれば、次の add / report で再登録される
-        logger.warning(f"正本 DB がありません。新規作成します: {path}")
+        logger.warning(f"Master DB not found; creating a new one: {path}")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     engine = create_engine(f"sqlite:///{path}")
 
@@ -67,9 +67,9 @@ def get_session(path: str) -> tuple[Session, object]:
 
     Base.metadata.create_all(engine)
     if is_new and not os.path.exists(path):  # pragma: no cover - SQLite が作れなかった異常系
-        raise PreflightError(f"正本 DB を作成できませんでした: {path}")
+        raise PreflightError(f"Could not create the master DB: {path}")
     session = sessionmaker(bind=engine)()
-    logger.info(f"DB {'作成' if is_new else '接続'}: {path}")
+    logger.info(f"DB {'created' if is_new else 'connected'}: {path}")
     return session, engine
 
 
@@ -108,16 +108,16 @@ def archive_lock(archive_root: str):
             except OSError:
                 pass
             if attempt == 0 and holder.isdigit() and not _pid_alive(int(holder)):
-                logger.warning(f"死んだプロセス（PID {holder}）のロックを引き継ぎます")
+                logger.warning(f"Taking over the lock from a dead process (PID {holder})")
                 with contextlib.suppress(OSError):
                     os.unlink(path)
                 continue
             raise PreflightError(
-                f"保存フォルダは他のプロセス（PID {holder or '不明'}）が使用中です: {path}\n"
-                "多重起動でなければ、このロックファイルを削除してください"
+                f"The archive folder is in use by another process (PID {holder or 'unknown'}): {path}\n"
+                "If no other instance is running, delete this lock file"
             )
     else:  # pragma: no cover - 上の for で必ず break か raise する
-        raise PreflightError(f"ロックを取得できません: {path}")
+        raise PreflightError(f"Could not acquire the lock: {path}")
 
     try:
         os.write(fd, str(os.getpid()).encode())

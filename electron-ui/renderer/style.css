@@ -72,6 +72,16 @@ code, .log, .command-text {
 .version { color: var(--ink-dim); font-weight: 400; margin-left: 6px; font-size: 12px; }
 
 .tabs { display: flex; gap: 4px; }
+.lang-select {
+  margin-left: auto;
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 6px;
+  color: var(--ink);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
 .tab {
   font: inherit;
   padding: 5px 13px;

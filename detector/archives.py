@@ -48,8 +48,8 @@ def resolve_archive(session, archive_root: str) -> Archive:
         row = session.query(Archive).filter(Archive.uid == uid).first()
         if row is None:
             logger.warning(
-                f"識別子 {uid} は DB に無いため、保存フォルダを新規に登録します"
-                "（別の DB で使っていたフォルダかもしれません）"
+                f"ID {uid} is not in the DB; registering the archive folder as new "
+                "(the folder may have been used with a different DB)"
             )
     if row is None:
         row = session.query(Archive).filter(Archive.root_abs == root).first()
@@ -61,10 +61,10 @@ def resolve_archive(session, archive_root: str) -> Archive:
         session.add(row)
         session.commit()
         _write_uid(root, row.uid)
-        logger.info(f"保存フォルダを登録しました: #{row.id} {root}")
+        logger.info(f"Registered archive folder: #{row.id} {root}")
     else:
         if row.root_abs != root:
-            logger.info(f"保存フォルダの場所が変わりました: {row.root_abs} → {root}")
+            logger.info(f"Archive folder location changed: {row.root_abs} -> {root}")
             row.root_abs = root
         if not uid:
             _write_uid(root, row.uid)
@@ -74,7 +74,7 @@ def resolve_archive(session, archive_root: str) -> Archive:
     # v0.1.x の DB が保存フォルダに残っていれば取り込む（登録済みかどうかに関係なく）
     migrated = import_legacy_db(session, row, legacy_db_path(root))
     if migrated:
-        logger.info(f"旧 DB から取り込み: {migrated}")
+        logger.info(f"Imported from legacy DB: {migrated}")
     return row
 
 
@@ -93,7 +93,7 @@ def import_legacy_db(session, archive: Archive, legacy_path: str) -> dict | None
     """
     if not os.path.isfile(legacy_path):
         return None
-    logger.warning(f"v0.1.x の DB を見つけました。正本 DB へ取り込みます: {legacy_path}")
+    logger.warning(f"Found a v0.1.x DB; importing it into the master DB: {legacy_path}")
 
     conn = sqlite3.connect(f"file:{legacy_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row

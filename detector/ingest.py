@@ -49,18 +49,18 @@ def judge(
         return (
             RESULT_SKIPPED_EMPTY,
             None,
-            f"サイズ {scanned.size} が min_size {config.min_size} 未満",
+            f"size {scanned.size} is below min_size {config.min_size}",
         )
 
     if not scanned.filehash or not scanned.hash_algo:
         # crawler は読み取りエラー時に filehash=NULL で登録を続行する。
         # これを新規と誤判定すると重複が保存フォルダに紛れ込む（設計書 §7.1 #2）
-        return RESULT_SKIPPED_NOHASH, None, "ハッシュが取得できず判定できません"
+        return RESULT_SKIPPED_NOHASH, None, "Cannot classify: hash unavailable"
 
     key = (scanned.filehash, scanned.hash_algo)
     if virtual_hashes is not None and key in virtual_hashes:
         # dry-run で、同じ実行内の先行ファイルが取り込み対象になっている
-        return RESULT_DUPLICATE, None, "同じ実行内の先行ファイルと内容が同じです"
+        return RESULT_DUPLICATE, None, "Same content as an earlier file in this run"
 
     existing = find_owning(session, config.archive_id, *key)
     if existing is not None:
@@ -68,7 +68,7 @@ def judge(
             return (
                 RESULT_FAILED,
                 existing,
-                f"ハッシュは一致するがサイズが違います（DB {existing.size} / 実体 {scanned.size}）",
+                f"Hash matches but size differs (DB {existing.size} / actual {scanned.size})",
             )
         return RESULT_DUPLICATE, existing, None
 
@@ -136,12 +136,12 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
                     message or "",
                 ],
             )
-            print(f"判定中: {processed}件 ({result})")
+            print(f"Progress: {processed} files ({result})")
             if not config.dry_run and processed % COMMIT_INTERVAL == 0:
                 session.commit()
     except KeyboardInterrupt:
         status = "interrupted"
-        logger.warning("ユーザー操作により中断されました")
+        logger.warning("Interrupted by user")
     finally:
         if not config.dry_run:
             session.commit()
@@ -149,9 +149,9 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
     if config.prune_empty_dirs and not config.dry_run and os.path.isdir(config.source_path):
         removed = mover.prune_empty_dirs(config.source_path)
         if removed:
-            logger.info(f"空になった投入元ディレクトリを {removed} 件削除しました")
+            logger.info(f"Removed {removed} empty source directories")
 
-    logger.info(f"CSV レポート: {csv_file}")
+    logger.info(f"CSV report: {csv_file}")
     return status, counters
 
 
@@ -168,7 +168,7 @@ def _process_one(
         )
     except Exception as e:  # 1件の失敗で実行全体を止めない（設計書 §12）
         session.rollback()
-        logger.exception(f"判定中に想定外のエラー: {scanned.path_abs}: {e}")
+        logger.exception(f"Unexpected error while classifying: {scanned.path_abs}: {e}")
         result, existing, message = RESULT_FAILED, None, str(e)
 
     archive_file_id = existing.id if existing is not None else None
@@ -194,7 +194,7 @@ def _process_one(
                     session, config.archive_id, scanned.filehash, scanned.hash_algo
                 )
                 archive_file_id = owner.id if owner is not None else None
-                message = "同一内容が直前に登録されました"
+                message = "Identical content was registered just before"
             else:
                 result = RESULT_FAILED
                 message = move.message

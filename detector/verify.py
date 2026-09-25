@@ -78,7 +78,7 @@ def run_verify(session, config, ingest) -> tuple[str, dict]:
                     RESULT_HASH_MISMATCH,
                     row,
                     found,
-                    f"DB {row.filehash} / 実体 {found.filehash}",
+                    f"DB {row.filehash} / actual {found.filehash}",
                 )
             )
 
@@ -115,7 +115,7 @@ def run_verify(session, config, ingest) -> tuple[str, dict]:
 
         revived = _revive_missing(session, aid, f, key, owning_hashes)
         if revived is not None:
-            findings.append((RESULT_RELOCATED, revived, f, "missing から復活"))
+            findings.append((RESULT_RELOCATED, revived, f, "revived from missing"))
             owning_hashes.add(key)
             continue
 
@@ -169,10 +169,10 @@ def run_verify(session, config, ingest) -> tuple[str, dict]:
     if flags:
         flagged = sum(counters.get(k, 0) for k in flags)
         logger.info(
-            f"処置予定フラグ（disposition=quarantine）を {flagged} 件に立てました。"
-            "このコマンドはファイルを動かしていません"
+            f"Set the disposition flag (disposition=quarantine) on {flagged} files. "
+            "This command did not move any files"
         )
-    logger.info(f"CSV レポート: {csv_file}")
+    logger.info(f"CSV report: {csv_file}")
     return "completed", counters
 
 

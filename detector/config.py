@@ -162,28 +162,28 @@ class DetectorConfig:
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--archive-db", default=None, metavar="PATH",
-        help="正本 DB のパス（既定: <データフォルダ>/archive.db）",
+        help="path to the master DB (default: <data folder>/archive.db)",
     )
     parser.add_argument(
         "--crawler-repo", default=None, metavar="PATH",
-        help="akasyx_crawler リポジトリのパス（既定: ../akasyx_crawler）",
+        help="path to the akasyx_crawler repository (default: ../akasyx_crawler)",
     )
     parser.add_argument(
         "--db-dir", default=None,
-        help="crawler の DB 出力先（既定: <データフォルダ>/db）",
+        help="output directory for crawler DBs (default: <data folder>/db)",
     )
     parser.add_argument(
         "--log-dir", default=None,
-        help="ログ・CSV 出力先（既定: <データフォルダ>/log）",
+        help="output directory for logs and CSV reports (default: <data folder>/log)",
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="akasyx_duplicate_detector",
-        description="重複判定アーカイバ: 保存用フォルダに内容重複のないファイル集合を"
-        "構築します（設計書 v0.1.0）",
-        epilog=f"データフォルダ（正本 DB・作業用 DB・ログの既定の置き場）: {data_root()}",
+        description="Duplicate-detecting archiver: builds a set of files with no "
+        "duplicate content in an archive folder (design spec v0.1.0)",
+        epilog=f"Data folder (default location for the master DB, working DBs and logs): {data_root()}",
     )
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {app_version()}"
@@ -191,90 +191,91 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="mode", required=True)
 
     # --- add -----------------------------------------------------------------
-    p_add = sub.add_parser(MODE_ADD, help="投入元を探索して保存フォルダへ取り込む")
-    p_add.add_argument("archive_root", help="保存用フォルダ")
-    p_add.add_argument("source_path", help="投入元のファイルまたはフォルダ")
+    p_add = sub.add_parser(MODE_ADD, help="scan a source and import its files into the archive folder")
+    p_add.add_argument("archive_root", help="archive folder")
+    p_add.add_argument("source_path", help="source file or folder")
     p_add.add_argument(
         "--folder-limit", type=int, default=DEFAULT_FOLDER_LIMIT, metavar="N",
-        help="1 フォルダに直接置くファイル数の上限。超えたら 001, 002, … の枝フォルダに入れる"
-        f"（既定 {DEFAULT_FOLDER_LIMIT}）",
+        help="max number of files placed directly in one folder; overflow goes into "
+        f"001, 002, ... subfolders (default: {DEFAULT_FOLDER_LIMIT})",
     )
     p_add.add_argument(
         "--dest-subdir", default=None, metavar="NAME",
-        help="年月フォルダの下に置く階層名（既定: 投入元フォルダ名 / '' で付けない）。"
-        "保存先は <YYYY-MM>/<NAME>/<投入元の相対パス>/ になる",
+        help="subfolder name under the year-month folder (default: source folder name; "
+        "'' for none). Files go to <YYYY-MM>/<NAME>/<path relative to source>/",
     )
     p_add.add_argument(
         "--dry-run", action="store_true",
-        help="判定だけ行い、移動も DB 更新もしない",
+        help="classify only; do not move files or update the DB",
     )
     p_add.add_argument(
         "--min-size", type=int, default=1, metavar="BYTES",
-        help="このサイズ未満は移動しない（既定 1 = 0 バイトを除外）",
+        help="do not move files smaller than this (default: 1 = skip empty files)",
     )
     p_add.add_argument(
         "--with-meta", action="store_true",
-        help="crawler に形式別メタデータも抽出させる（crawler 側の --extra meta が必要）",
+        help="have the crawler also extract format-specific metadata "
+        "(requires the crawler's --extra meta)",
     )
     p_add.add_argument(
-        "--follow-symlinks", action="store_true", help="シンボリックリンクを追跡する"
+        "--follow-symlinks", action="store_true", help="follow symbolic links"
     )
     p_add.add_argument(
         "--prune-empty-dirs", action="store_true",
-        help="移動後に空になった投入元ディレクトリを削除する"
-        "（.DS_Store 等の OS メタデータしか無いフォルダも空とみなす）",
+        help="remove source directories left empty after moving "
+        "(folders containing only OS metadata such as .DS_Store count as empty)",
     )
     _add_common_args(p_add)
 
     # --- verify --------------------------------------------------------------
-    p_ver = sub.add_parser(MODE_VERIFY, help="保存フォルダと DB の整合性を検査する")
-    p_ver.add_argument("archive_root", help="保存用フォルダ")
+    p_ver = sub.add_parser(MODE_VERIFY, help="check consistency between the archive folder and the DB")
+    p_ver.add_argument("archive_root", help="archive folder")
     p_ver.add_argument(
         "--flag-quarantine", nargs="+", default=[], choices=QUARANTINE_KINDS,
         metavar="KIND",
-        help="検出結果に処置予定フラグ（disposition=quarantine）を立てる。"
-        f"指定できる種別: {' / '.join(QUARANTINE_KINDS)}。"
-        "このコマンドはファイルを一切動かさない",
+        help="flag findings for later action (disposition=quarantine). "
+        f"Kinds: {' / '.join(QUARANTINE_KINDS)}. "
+        "This command never moves any files",
     )
     p_ver.add_argument(
-        "--follow-symlinks", action="store_true", help="シンボリックリンクを追跡する"
+        "--follow-symlinks", action="store_true", help="follow symbolic links"
     )
     _add_common_args(p_ver)
 
     # --- delete-duplicates ---------------------------------------------------
     p_del = sub.add_parser(
-        MODE_DELETE_DUPLICATES, help="add で投入元に据え置いた重複を検証付きで削除する"
+        MODE_DELETE_DUPLICATES, help="delete (with verification) duplicates that add left in the source"
     )
-    p_del.add_argument("archive_root", help="保存用フォルダ")
+    p_del.add_argument("archive_root", help="archive folder")
     p_del.add_argument(
         "--ingest-id", type=int, default=None,
-        help="対象を特定の取り込み実行に絞る（既定: 未処置のすべて）",
+        help="limit to a specific ingest run (default: all pending)",
     )
     p_del.add_argument(
         "--trash-dir", default=None, metavar="DIR",
-        help="削除せず DIR へ退避する（投入元の相対パス構造を再現）",
+        help="move to DIR instead of deleting (preserving paths relative to the source)",
     )
     p_del.add_argument(
         "--prune-empty-dirs", action="store_true",
-        help="削除後に空になった投入元ディレクトリを削除する",
+        help="remove source directories left empty after deletion",
     )
     p_del.add_argument(
         "--yes", action="store_true",
-        help="実際に削除する（未指定なら検証結果の一覧表示のみ）",
+        help="actually delete (without this, only list verification results)",
     )
     _add_common_args(p_del)
 
     # --- report --------------------------------------------------------------
-    p_rep = sub.add_parser(MODE_REPORT, help="保存フォルダの状態と実行履歴を表示する")
-    p_rep.add_argument("archive_root", help="保存用フォルダ")
+    p_rep = sub.add_parser(MODE_REPORT, help="show archive folder status and run history")
+    p_rep.add_argument("archive_root", help="archive folder")
     p_rep.add_argument(
-        "--ingest-id", type=int, default=None, help="特定の実行の内訳を表示する"
+        "--ingest-id", type=int, default=None, help="show the breakdown of a specific run"
     )
     _add_common_args(p_rep)
 
     # --- archives ------------------------------------------------------------
     p_arc = sub.add_parser(
-        MODE_ARCHIVES, help="正本 DB に登録されている保存フォルダの一覧を表示する"
+        MODE_ARCHIVES, help="list archive folders registered in the master DB"
     )
     _add_common_args(p_arc)
 
@@ -286,7 +287,7 @@ def parse_arguments(argv: list[str] | None = None) -> DetectorConfig:
     parser = build_parser()
     args = parser.parse_args(argv)
     if getattr(args, "folder_limit", DEFAULT_FOLDER_LIMIT) < 1:
-        parser.error("--folder-limit は 1 以上を指定してください")
+        parser.error("--folder-limit must be 1 or greater")
 
     return DetectorConfig(
         mode=args.mode,

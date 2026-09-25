@@ -89,7 +89,7 @@ def test_hash_match_with_size_mismatch_is_failed(session, make_config):
     _store(session, "h" * 64, size=999)
     result, _existing, message = ingest.judge(session, _scanned(size=10), config)
     assert result == RESULT_FAILED
-    assert "サイズが違います" in message
+    assert "size differs" in message
 
 
 def test_missing_row_does_not_block_reregistration(session, make_config):
