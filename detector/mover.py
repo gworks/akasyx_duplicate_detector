@@ -456,12 +456,15 @@ def _remove_source_if_same(src: str, expected_hash: str) -> None:
 JUNK_FILES = frozenset(OS_JUNK_FILES)
 
 
-def prune_empty_dirs(root: str) -> int:
+def prune_empty_dirs(root: str, keep=None) -> int:
     """root 配下の空ディレクトリを削除します（root 自体は消さない）。
 
     `.DS_Store` 等の OS メタデータ（JUNK_FILES）しか残っていないフォルダも空として扱い、
     メタデータを消してからフォルダを消す。macOS では Finder で開いただけで .DS_Store が
     できるため、これを無視しないと「空になった投入元」がほぼ永久に残る。
+
+    keep(path) が真のディレクトリ（とその配下）は消さない。detector 自身のデータフォルダ
+    （配布版の UI が起動時に作って使う ui/blob_storage 等の空フォルダ）を消さないため。
     """
     if not os.path.isdir(root):
         return 0
@@ -469,6 +472,8 @@ def prune_empty_dirs(root: str) -> int:
     root_real = os.path.realpath(root)
     for dirpath, _dirnames, _filenames in os.walk(root, topdown=False):
         if os.path.realpath(dirpath) == root_real:
+            continue
+        if keep is not None and keep(dirpath):
             continue
         try:
             entries = os.listdir(dirpath)

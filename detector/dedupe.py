@@ -7,6 +7,7 @@ import os
 from datetime import datetime
 
 import mover
+from ingest import own_data_matcher
 from database import tmp_dir
 from models import (
     RESOLUTION_DELETED,
@@ -159,7 +160,8 @@ def run_delete_duplicates(session, config, ingest) -> tuple[str, dict]:
         roots = session.query(Ingest.source_root).filter(Ingest.id.in_(ingest_ids)).all()
         for (root,) in roots:
             if root:
-                mover.prune_empty_dirs(root)
+                # 投入元の中にある detector 自身のデータフォルダ（ui/ 等）の空フォルダは消さない
+                mover.prune_empty_dirs(root, keep=own_data_matcher(config, root))
 
     if not config.assume_yes:
         print(

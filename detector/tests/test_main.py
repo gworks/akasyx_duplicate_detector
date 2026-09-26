@@ -223,6 +223,49 @@ def test_add_skips_own_data_inside_source(make_config, archive, source, tmp_path
     assert stored == ["a.txt"]
 
 
+def _packaged_home_in(source, monkeypatch):
+    """配布版として、データフォルダを投入元の中に置く（UI の空フォルダ付き）。"""
+    home = os.path.join(source, "Library", "akasyx-duplicate-detector")
+    monkeypatch.setenv("AKASYX_PACKAGED", "1")
+    monkeypatch.setenv("AKASYX_DETECTOR_HOME", home)
+    write_file(os.path.join(home, "ui", "settings.json"), b"{}")
+    empties = [os.path.join(home, "ui", "blob_storage", "uuid1"), os.path.join(home, "ui", "Crashpad", "pending")]
+    for d in empties:
+        os.makedirs(d)
+    return empties
+
+
+def test_prune_keeps_empty_dirs_of_own_data(
+    make_config, archive, source, tmp_path, fake_crawler, monkeypatch
+):
+    """--prune-empty-dirs でも、自データフォルダ（UI が使う ui/ の空フォルダ）は消さない。"""
+    empties = _packaged_home_in(source, monkeypatch)
+    write_file(os.path.join(source, "sub", "a.txt"), b"AAA")
+    fake_crawler(source, str(tmp_path / "crawler.db"))
+    assert _run(make_config(archive_root=archive, source_path=source, prune_empty_dirs=True)) == main.EXIT_OK
+
+    assert all(os.path.isdir(d) for d in empties)
+    assert not os.path.exists(os.path.join(source, "sub"))  # 通常の空フォルダは従来どおり消える
+
+
+def test_dedupe_prune_keeps_empty_dirs_of_own_data(
+    make_config, archive, source, tmp_path, fake_crawler, monkeypatch
+):
+    """delete-duplicates --prune-empty-dirs でも同じく消さない。"""
+    empties = _packaged_home_in(source, monkeypatch)
+    write_file(os.path.join(source, "a.txt"), b"AAA")
+    write_file(os.path.join(source, "dup", "copy.txt"), b"AAA")
+    fake_crawler(source, str(tmp_path / "crawler.db"))
+    assert _run(make_config(archive_root=archive, source_path=source)) == main.EXIT_OK
+
+    config = make_config(
+        mode=MODE_DELETE_DUPLICATES, archive_root=archive, assume_yes=True, prune_empty_dirs=True
+    )
+    assert _run(config) == main.EXIT_OK
+    assert not os.path.exists(os.path.join(source, "dup"))  # 重複を消して空になったフォルダは消える
+    assert all(os.path.isdir(d) for d in empties)
+
+
 def test_add_skips_whole_data_folder_inside_source(
     make_config, archive, source, tmp_path, fake_crawler, monkeypatch
 ):
@@ -336,7 +379,7 @@ def test_own_data_behind_symlink_inside_source_is_skipped_with_follow_symlinks(
         archive_root=archive, source_path=source, archive_db=str(data / "archive.db"),
         db_dir=str(data / "db"), log_dir=str(data / "log"), follow_symlinks=True,
     )
-    is_own = ingest_module._own_data_matcher(config)
+    is_own = ingest_module.own_data_matcher(config)
     assert is_own(os.path.join(source, "dd", "log", "old.log"))
     assert is_own(os.path.join(source, "dd", "archive.db-wal"))
     assert not is_own(os.path.join(source, "a.txt"))

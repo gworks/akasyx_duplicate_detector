@@ -80,7 +80,7 @@ def judge(
 _SQLITE_SIDECARS = ("", "-wal", "-shm", "-journal")
 
 
-def _own_data_matcher(config):
+def own_data_matcher(config, source: str | None = None):
     """detector 自身のデータ（データフォルダ全体・正本 DB・作業用 DB・ログ）かを判定する関数を返します。
 
     ホームフォルダを投入元にすると、配布版の既定データフォルダも投入元の中に入る。
@@ -91,7 +91,7 @@ def _own_data_matcher(config):
     代わりに自データ側を「そのままの表記」「実体の位置」「投入元の表記に写した位置」の
     キーにしておき、ファイル側は文字列の比較だけで判定する。
     """
-    source = config.source_path
+    source = source if source is not None else config.source_path
     src_abs, src_real = os.path.abspath(source), os.path.realpath(source)
 
     def keys(path):
@@ -160,7 +160,7 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
     ts_start = f"{datetime.now():%Y%m%d_%H%M%S}"
     csv_file = create_csv(config.log_dir, "add_result", ts_start)
     processed = 0
-    is_own = _own_data_matcher(config)
+    is_own = own_data_matcher(config)
 
     try:
         for scanned in files:
@@ -198,7 +198,7 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
             session.commit()
 
     if config.prune_empty_dirs and not config.dry_run and os.path.isdir(config.source_path):
-        removed = mover.prune_empty_dirs(config.source_path)
+        removed = mover.prune_empty_dirs(config.source_path, keep=is_own)
         if removed:
             logger.info(f"Removed {removed} empty source directories")
 
