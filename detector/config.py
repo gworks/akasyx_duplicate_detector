@@ -331,8 +331,10 @@ def parse_arguments(argv: list[str] | None = None) -> DetectorConfig:
         dest_subdir=getattr(args, "dest_subdir", None),
         crawler_repo=os.path.abspath(args.crawler_repo or _default_crawler_repo()),
         siblings_bin=_default_siblings_bin(),
-        db_dir=args.db_dir or _default_db_dir(),
-        log_dir=args.log_dir or _default_log_dir(),
+        # crawler は別の作業フォルダ（crawler リポジトリ）で起動するので、相対パスのまま渡すと
+        # detector と crawler が別々の場所を見る。他のパスと同じく起動時の作業フォルダ基準で絶対パスにする
+        db_dir=os.path.abspath(args.db_dir or _default_db_dir()),
+        log_dir=os.path.abspath(args.log_dir or _default_log_dir()),
         dry_run=getattr(args, "dry_run", False),
         folder_limit=getattr(args, "folder_limit", DEFAULT_FOLDER_LIMIT),
         min_size=getattr(args, "min_size", 1),

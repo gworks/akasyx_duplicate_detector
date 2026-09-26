@@ -125,6 +125,19 @@ def test_rejected_placement_writes_nothing_into_archive(archive, source, tmp_pat
     assert os.listdir(archive) == []  # 保存フォルダには何も作らない
 
 
+def test_relative_db_and_log_dirs_are_made_absolute(tmp_path, monkeypatch):
+    """相対パスの --db-dir / --log-dir は起動時の作業フォルダ基準で絶対パスにする
+    （crawler は別の作業フォルダで起動するので、相対のまま渡すと別の場所を見る）。"""
+    import config as config_module
+
+    monkeypatch.chdir(tmp_path)
+    config = config_module.parse_arguments(
+        ["report", str(tmp_path / "archive"), "--db-dir", "db", "--log-dir", "logs"]
+    )
+    assert config.db_dir == str(tmp_path / "db")
+    assert config.log_dir == str(tmp_path / "logs")
+
+
 # --- end-to-end（add）--------------------------------------------------------
 
 
