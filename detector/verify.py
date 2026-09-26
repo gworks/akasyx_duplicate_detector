@@ -6,6 +6,7 @@ import logging
 from datetime import datetime
 
 import crawler_client
+from config import OS_JUNK_FILES
 from database import META_DIRNAME
 from models import (
     DISPOSITION_QUARANTINE,
@@ -32,7 +33,7 @@ VERIFY_OK = "ok"
 def run_verify(session, config, ingest) -> tuple[str, dict]:
     """保存フォルダを再スキャンして DB と突き合わせます。戻り値は (ステータス, 内訳)。"""
     scan = crawler_client.run_crawler(
-        config.archive_root, config, extra_excludes=(f"{META_DIRNAME}/",)
+        config.archive_root, config, extra_excludes=(f"{META_DIRNAME}/", *OS_JUNK_FILES)
     )
     crawler_client.ensure_completed(scan)
     ingest.crawler_db_path = scan.db_path
@@ -50,9 +51,10 @@ def run_verify(session, config, ingest) -> tuple[str, dict]:
     findings: list[tuple[str, ArchiveFile, object, str | None]] = []
     claimed: set[str] = set()
 
+    aid = config.archive_id
     owning = (
         session.query(ArchiveFile)
-        .filter(ArchiveFile.status.in_(OWNING_STATUSES))
+        .filter(ArchiveFile.archive_id == aid, ArchiveFile.status.in_(OWNING_STATUSES))
         .order_by(ArchiveFile.id)
         .all()
     )
@@ -76,7 +78,7 @@ def run_verify(session, config, ingest) -> tuple[str, dict]:
                     RESULT_HASH_MISMATCH,
                     row,
                     found,
-                    f"DB {row.filehash} / 実体 {found.filehash}",
+                    f"DB {row.filehash} / actual {found.filehash}",
                 )
             )
 
@@ -102,7 +104,7 @@ def run_verify(session, config, ingest) -> tuple[str, dict]:
     owning_hashes = {
         (r.filehash, r.hash_algo)
         for r in session.query(ArchiveFile)
-        .filter(ArchiveFile.status.in_(OWNING_STATUSES))
+        .filter(ArchiveFile.archive_id == aid, ArchiveFile.status.in_(OWNING_STATUSES))
         .all()
     }
     seen_unowned: set[tuple] = set()
@@ -111,9 +113,9 @@ def run_verify(session, config, ingest) -> tuple[str, dict]:
             continue
         key = (f.filehash, f.hash_algo)
 
-        revived = _revive_missing(session, f, key, owning_hashes)
+        revived = _revive_missing(session, aid, f, key, owning_hashes)
         if revived is not None:
-            findings.append((RESULT_RELOCATED, revived, f, "missing から復活"))
+            findings.append((RESULT_RELOCATED, revived, f, "revived from missing"))
             owning_hashes.add(key)
             continue
 
@@ -167,14 +169,14 @@ def run_verify(session, config, ingest) -> tuple[str, dict]:
     if flags:
         flagged = sum(counters.get(k, 0) for k in flags)
         logger.info(
-            f"処置予定フラグ（disposition=quarantine）を {flagged} 件に立てました。"
-            "このコマンドはファイルを動かしていません"
+            f"Set the disposition flag (disposition=quarantine) on {flagged} files. "
+            "This command did not move any files"
         )
-    logger.info(f"CSV レポート: {csv_file}")
+    logger.info(f"CSV report: {csv_file}")
     return "completed", counters
 
 
-def _revive_missing(session, found, key, owning_hashes) -> ArchiveFile | None:
+def _revive_missing(session, archive_id, found, key, owning_hashes) -> ArchiveFile | None:
     """missing 行と同一内容の実体が見つかったら復活させます。
 
     同じ内容を保持している owning 行が既にあるときは復活させない
@@ -185,6 +187,7 @@ def _revive_missing(session, found, key, owning_hashes) -> ArchiveFile | None:
     row = (
         session.query(ArchiveFile)
         .filter(
+            ArchiveFile.archive_id == archive_id,
             ArchiveFile.filehash == found.filehash,
             ArchiveFile.hash_algo == found.hash_algo,
             ArchiveFile.status == STATUS_MISSING,
@@ -210,6 +213,7 @@ def _register_unregistered(session, found, ingest) -> ArchiveFile:
     row = (
         session.query(ArchiveFile)
         .filter(
+            ArchiveFile.archive_id == ingest.archive_id,
             ArchiveFile.stored_path_rel == found.path_rel,
             ArchiveFile.status == STATUS_UNREGISTERED,
         )
@@ -217,6 +221,7 @@ def _register_unregistered(session, found, ingest) -> ArchiveFile:
     )
     if row is None:
         row = ArchiveFile(
+            archive_id=ingest.archive_id,
             filehash=found.filehash or "",
             hash_algo=found.hash_algo or "",
             size=found.size,
@@ -236,9 +241,13 @@ def _register_unregistered(session, found, ingest) -> ArchiveFile:
     return row
 
 
-def archive_stats(session) -> dict:
+def archive_stats(session, archive_id: int) -> dict:
     """保存フォルダの状態サマリ（report 用）。"""
-    rows = session.query(ArchiveFile.status, ArchiveFile.size).all()
+    rows = (
+        session.query(ArchiveFile.status, ArchiveFile.size)
+        .filter(ArchiveFile.archive_id == archive_id)
+        .all()
+    )
     stats: dict[str, dict] = {}
     for status, size in rows:
         bucket = stats.setdefault(status, {"count": 0, "size": 0})

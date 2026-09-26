@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 CRAWLER_DB_FILENAME = "file_inventory.db"
 CRAWLER_PKG_DIRNAME = "crawler"
+# 配布版で同梱する crawler の実行形式の名前（akasyx_search の packaging/build_python.sh と同じ）
+CRAWLER_BIN_NAME = "akasyx-crawler"
 # 走査が中途半端な状態で移動を始めると、投入元の一部だけが移った状態になる（設計書 §3）
 COMPLETED_STATUS = "completed"
 
@@ -37,6 +39,8 @@ class ScannedFile:
     hash_algo: str | None
     mime_type: str | None = None
     modified_at: datetime | None = None
+    # 作成日時（crawler は macOS/BSD で st_birthtime、Windows で st_ctime、Linux は None）
+    created_at: datetime | None = None
 
 
 @dataclass
@@ -54,10 +58,45 @@ def resolve_crawler_repo(path: str) -> str:
     pkg = os.path.join(path, CRAWLER_PKG_DIRNAME, "main.py")
     if not os.path.isfile(pkg):
         raise PreflightError(
-            f"akasyx_crawler が見つかりません: {pkg}\n"
-            "--crawler-repo でリポジトリのパスを指定してください"
+            f"akasyx_crawler not found: {pkg}\n"
+            "Specify the repository path with --crawler-repo"
         )
     return path
+
+
+def crawler_executable(siblings_bin: str) -> str:
+    """同梱した crawler の実行形式のパス（PyInstaller onedir: <bin>/akasyx-crawler/akasyx-crawler）。"""
+    exe = CRAWLER_BIN_NAME + (".exe" if os.name == "nt" else "")
+    return os.path.join(siblings_bin, CRAWLER_BIN_NAME, exe)
+
+
+def check_crawler(config) -> None:
+    """crawler を起動できるか確かめます（事前チェック用）。できなければ PreflightError。"""
+    if config.siblings_bin:
+        exe = crawler_executable(config.siblings_bin)
+        if not os.access(exe, os.X_OK):
+            raise PreflightError(
+                f"Bundled crawler not found: {exe}\n"
+                "Please reinstall the app"
+            )
+        return
+    resolve_crawler_repo(config.crawler_repo)
+
+
+def crawler_command(config) -> tuple[list[str], str]:
+    """crawler の起動コマンドの先頭部分と cwd。
+
+    開発時は `uv run main.py`（crawler リポジトリの crawler/ で）、配布版は同梱した実行形式。
+    """
+    if config.siblings_bin:
+        exe = crawler_executable(config.siblings_bin)
+        return [exe], os.path.dirname(exe)
+    repo = resolve_crawler_repo(config.crawler_repo)
+    if shutil.which("uv") is None:
+        raise PreflightError(
+            "uv not found; it is required to run the crawler (https://docs.astral.sh/uv/)"
+        )
+    return ["uv", "run", "main.py"], os.path.join(repo, CRAWLER_PKG_DIRNAME)
 
 
 def _max_scan_id(db_path: str) -> int:
@@ -90,17 +129,11 @@ def run_crawler(target: str, config, extra_excludes: tuple[str, ...] = ()) -> Cr
     ハッシュ関連のオプション（--no-hash / --hash-max-size）は渡さない。
     ハッシュが無いと重複判定ができないため。
     """
-    repo = resolve_crawler_repo(config.crawler_repo)
-    cwd = os.path.join(repo, CRAWLER_PKG_DIRNAME)
+    base, cwd = crawler_command(config)
     db_path = os.path.join(config.db_dir, CRAWLER_DB_FILENAME)
 
-    if shutil.which("uv") is None:
-        raise PreflightError(
-            "uv が見つかりません。crawler の実行に必要です（https://docs.astral.sh/uv/）"
-        )
-
     cmd = [
-        "uv", "run", "main.py", target,
+        *base, target,
         "--db-dir", config.db_dir,
         "--log-dir", config.log_dir,
         # crawler の既定は nested。投入元の .gitignore で対象が勝手に減るのを防ぐ
@@ -114,16 +147,16 @@ def run_crawler(target: str, config, extra_excludes: tuple[str, ...] = ()) -> Cr
         cmd += ["--exclude", pattern]
 
     before = _max_scan_id(db_path)
-    logger.info(f"crawler 実行: {' '.join(cmd)} (cwd={cwd})")
+    logger.info(f"Running crawler: {' '.join(cmd)} (cwd={cwd})")
     # detector 側の VIRTUAL_ENV を持ち込むと uv が「プロジェクトの環境と違う」と警告する。
     # crawler は crawler 自身の .venv で動かすべきなので落としておく
     env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
     proc = subprocess.run(cmd, cwd=cwd, check=False, env=env)
     if proc.returncode != 0:
-        logger.warning(f"crawler が非ゼロ終了しました（コード {proc.returncode}）")
+        logger.warning(f"Crawler exited with non-zero status (code {proc.returncode})")
 
     if not os.path.exists(db_path):
-        raise PreflightError(f"crawler が DB を生成しませんでした: {db_path}")
+        raise PreflightError(f"Crawler did not produce a DB: {db_path}")
 
     scan_id, status = _read_scan(db_path, before)
     return CrawlerScan(
@@ -135,12 +168,12 @@ def ensure_completed(scan: CrawlerScan) -> None:
     """スキャンが完走していなければ PreflightError で止めます（設計書 §3）。"""
     if scan.scan_id is None:
         raise PreflightError(
-            "crawler のスキャン結果が見つかりません（crawler の実行に失敗した可能性があります）"
+            "Crawler scan result not found (the crawler may have failed to run)"
         )
     if scan.status != COMPLETED_STATUS:
         raise PreflightError(
-            f"crawler のスキャンが完走していません（status={scan.status}）。"
-            "不完全な走査では取り込みを行いません"
+            f"Crawler scan did not complete (status={scan.status}). "
+            "Import is not performed on an incomplete scan"
         )
 
 
@@ -159,7 +192,7 @@ def read_files(db_path: str, scan_id: int) -> Iterator[ScannedFile]:
     """今回のスキャンで存在確認された active な行を読み出します（読み取り専用）。"""
     sql = (
         "SELECT name, path_abs, path_rel, size, filehash, hash_algo, mime_type,"
-        " modified_at FROM fs_files"
+        " modified_at, created_at FROM fs_files"
         " WHERE last_seen_scan_id = ? AND status = 'active' ORDER BY path_abs"
     )
     with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
@@ -173,6 +206,7 @@ def read_files(db_path: str, scan_id: int) -> Iterator[ScannedFile]:
                 hash_algo=row[5],
                 mime_type=row[6],
                 modified_at=_parse_dt(row[7]),
+                created_at=_parse_dt(row[8]),
             )
 
 
@@ -188,7 +222,7 @@ def scan_single_file(path: str) -> ScannedFile:
         algo = hashing.HASH_ALGO
     except OSError as e:
         # 読み取れなければハッシュ無しとして返す（判定側が skipped_nohash にする）
-        logger.warning(f"ハッシュ計算に失敗: {path}: {e}")
+        logger.warning(f"Failed to compute hash: {path}: {e}")
         filehash, algo = None, None
     return ScannedFile(
         name=name,
@@ -199,4 +233,18 @@ def scan_single_file(path: str) -> ScannedFile:
         hash_algo=algo,
         mime_type=mimetypes.guess_type(path)[0],
         modified_at=datetime.fromtimestamp(st.st_mtime, tz=timezone.utc),
+        created_at=birthtime_utc(st),
     )
+
+
+def birthtime_utc(st: os.stat_result) -> datetime | None:
+    """stat 結果から作成日時（UTC）を返します。crawler の utl/fileinfo.resolve_times と同じ規則。
+
+    macOS/BSD は st_birthtime、Windows は st_ctime（作成日時の意味）、Linux は取得不可で None。
+    """
+    birthtime = getattr(st, "st_birthtime", None)
+    if birthtime is not None:
+        return datetime.fromtimestamp(birthtime, tz=timezone.utc)
+    if os.name == "nt":
+        return datetime.fromtimestamp(st.st_ctime, tz=timezone.utc)
+    return None
