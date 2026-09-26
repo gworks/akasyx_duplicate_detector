@@ -9,6 +9,7 @@ from datetime import datetime
 
 from models import (
     MODE_ADD,
+    MODE_ARCHIVES,
     MODE_DELETE_DUPLICATES,
     MODE_REPORT,
     MODE_VERIFY,
@@ -17,6 +18,13 @@ from models import (
     RESULT_MISSING,
     RESULT_UNREGISTERED,
 )
+
+# 保存先レイアウト（設計書 §7.2）: <YYYY-MM>/<投入元フォルダ名>/<投入元の相対パス>/[001/…]/<ファイル名>
+# 1 フォルダに直接置くファイル数の上限。超えたら 001, 002, … の枝に入れる
+DEFAULT_FOLDER_LIMIT = 500
+# OS / Finder が勝手に作るメタデータ。crawler の走査から除外し（gitignore 記法・名前一致）、
+# --prune-empty-dirs ではこれしか無いフォルダを空とみなす
+OS_JUNK_FILES = (".DS_Store", "Thumbs.db", "desktop.ini")
 
 QUARANTINE_KINDS = (
     RESULT_MISSING,
@@ -31,6 +39,14 @@ def repo_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _version_file() -> str:
+    """version.txt の場所。PyInstaller で固めた実行形式では同梱した写し（--add-data）を読む。"""
+    bundle = getattr(sys, "_MEIPASS", None)
+    if getattr(sys, "frozen", False) and bundle:
+        return os.path.join(bundle, "version.txt")
+    return os.path.join(repo_root(), "version.txt")
+
+
 def app_version() -> str:
     """バージョンの正本 <リポジトリルート>/version.txt を返します。
 
@@ -39,18 +55,96 @@ def app_version() -> str:
     読めない場合は起動を止めず "0.0.0" を返す（表示が 0.0.0 なら配置漏れを疑う）。
     """
     try:
-        with open(os.path.join(repo_root(), "version.txt"), encoding="utf-8") as f:
+        with open(_version_file(), encoding="utf-8") as f:
             return f.read().strip()
     except OSError:
         return "0.0.0"
 
 
+# 配布版のデータフォルダ名。akasyx_search の ~/Library/Application Support/akasyx/ とは分ける
+# （search のデータ移動は akasyx/ の中身を丸ごと移し、削除手順も akasyx/ ごと消すため）
+APP_DATA_NAME = "akasyx-duplicate-detector"
+
+
+def is_packaged() -> bool:
+    """配布版（PyInstaller で固めた実行形式。開発中に試すときは AKASYX_PACKAGED=1）か。"""
+    return bool(getattr(sys, "frozen", False)) or os.environ.get("AKASYX_PACKAGED") == "1"
+
+
+def app_home() -> str:
+    """配布版のデータフォルダ。AKASYX_DETECTOR_HOME で差し替えられる（テスト用）。
+
+    macOS: ~/Library/Application Support/akasyx-duplicate-detector/
+    Windows: %LOCALAPPDATA%/akasyx-duplicate-detector/
+    その他: $XDG_DATA_HOME/akasyx-duplicate-detector/（既定 ~/.local/share）
+    """
+    if os.environ.get("AKASYX_DETECTOR_HOME"):
+        return os.path.abspath(os.environ["AKASYX_DETECTOR_HOME"])
+    if sys.platform == "darwin":
+        return os.path.expanduser(f"~/Library/Application Support/{APP_DATA_NAME}")
+    if sys.platform == "win32":
+        return os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_DATA_NAME)
+    return os.path.join(
+        os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), APP_DATA_NAME
+    )
+
+
+def data_root() -> str:
+    """正本 DB・作業用 DB・ログを置くフォルダ。
+
+    配布版は app_home()（.app の中は書き込めないため）、開発時は <リポジトリルート>/dist/。
+    """
+    return app_home() if is_packaged() else os.path.join(repo_root(), "dist")
+
+
+OWN_DATA_DIR = "dir"   # own_data_locations の種類: フォルダ
+OWN_DATA_DB = "db"     # own_data_locations の種類: 正本 DB（ファイル。-wal / -shm と合わせて扱う）
+
+
+def own_data_locations(config) -> list[tuple[str, str, str, bool]]:
+    """detector 自身のデータの置き場 (種類, 表示名, パス, オプションで移せるか) の一覧。定義はここだけ。
+
+    投入元からは取り込まない（ingest）。保存フォルダについては（main.preflight）、データフォルダは
+    重ねない（含む・中にある・同じのどれも不可）、それ以外は保存フォルダの中に置かない。
+    - データフォルダ: アプリが持つフォルダ（配布版は UI の設定・Electron のプロファイル `ui/` も入る。
+      アプリを完全に消すときはこのフォルダごと消す）。開発時は <repo>/dist（正本 DB 等の既定の置き場）
+    - 正本 DB（-wal / -shm と合わせて扱う）・作業用 DB・ログ: 既定はデータフォルダの中
+    """
+    return [
+        (OWN_DATA_DIR, "data folder", data_root(), False),
+        (OWN_DATA_DB, "master DB", config.archive_db, True),
+        (OWN_DATA_DIR, "work DB dir", config.db_dir, True),
+        (OWN_DATA_DIR, "log dir", config.log_dir, True),
+    ]
+
+
+def own_data_dirs(config) -> list[str]:
+    """自データのフォルダ（正本 DB 以外）。正本 DB はファイルとして別に扱う。"""
+    return [path for kind, _label, path, _ in own_data_locations(config) if kind == OWN_DATA_DIR]
+
+
 def _default_db_dir() -> str:
-    return os.path.join(repo_root(), "dist", "db")
+    return os.path.join(data_root(), "db")
 
 
 def _default_log_dir() -> str:
-    return os.path.join(repo_root(), "dist", "log")
+    return os.path.join(data_root(), "log")
+
+
+def _default_archive_db() -> str:
+    """正本 DB の既定 <データフォルダ>/archive.db。
+
+    保存フォルダの外・ローカルディスクに置く（設計書 §4 / §15）。データフォルダは data_root() を参照。
+    """
+    return os.path.join(data_root(), "archive.db")
+
+
+def _default_siblings_bin() -> str:
+    """同梱した兄弟の実行形式の置き場（配布版で UI が AKASYX_SIBLINGS_BIN に渡す）。
+
+    空なら開発時の扱いで、crawler は --crawler-repo のソースを `uv run` で起動する。
+    """
+    return os.environ.get("AKASYX_SIBLINGS_BIN", "")
 
 
 def _default_crawler_repo() -> str:
@@ -63,13 +157,21 @@ class DetectorConfig:
     """実行時設定（設計書 §6.2）。"""
 
     mode: str
-    archive_root: str
+    archive_root: str | None
     source_path: str | None = None
+    # 正本 DB のパス（全保存フォルダ共通・1 ファイル）
+    archive_db: str = field(default_factory=_default_archive_db)
+    # 実行時に resolve_archive() が埋める。ar_archives.id
+    archive_id: int | None = None
     dest_subdir: str | None = None
     crawler_repo: str = field(default_factory=_default_crawler_repo)
+    # 配布版: <siblings_bin>/akasyx-crawler/akasyx-crawler（PyInstaller onedir）を起動する
+    siblings_bin: str = field(default_factory=_default_siblings_bin)
     db_dir: str = field(default_factory=_default_db_dir)
     log_dir: str = field(default_factory=_default_log_dir)
     dry_run: bool = False
+    # 1 フォルダに直接置くファイル数の上限。超えたら 001, 002, … の枝に入れる（設計書 §7.2）
+    folder_limit: int = DEFAULT_FOLDER_LIMIT
     # 既定 1 = 0 バイトファイルを移動対象から外す（設計書 §7.1 #1）
     min_size: int = 1
     with_meta: bool = False
@@ -83,26 +185,31 @@ class DetectorConfig:
     assume_yes: bool = False
 
 
-def _add_crawler_args(parser: argparse.ArgumentParser) -> None:
+def _add_common_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--archive-db", default=None, metavar="PATH",
+        help="path to the master DB (default: <data folder>/archive.db)",
+    )
     parser.add_argument(
         "--crawler-repo", default=None, metavar="PATH",
-        help="akasyx_crawler リポジトリのパス（既定: ../akasyx_crawler）",
+        help="path to the akasyx_crawler repository (default: ../akasyx_crawler)",
     )
     parser.add_argument(
         "--db-dir", default=None,
-        help="crawler の DB 出力先（既定: <リポジトリルート>/dist/db）",
+        help="output directory for crawler DBs (default: <data folder>/db)",
     )
     parser.add_argument(
         "--log-dir", default=None,
-        help="ログ・CSV 出力先（既定: <リポジトリルート>/dist/log）",
+        help="output directory for logs and CSV reports (default: <data folder>/log)",
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="akasyx_duplicate_detector",
-        description="重複判定アーカイバ: 保存用フォルダに内容重複のないファイル集合を"
-        "構築します（設計書 v0.1.0）",
+        description="Duplicate-detecting archiver: builds a set of files with no "
+        "duplicate content in an archive folder (design spec v0.1.0)",
+        epilog=f"Data folder (default location for the master DB, working DBs and logs): {data_root()}",
     )
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {app_version()}"
@@ -110,90 +217,112 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="mode", required=True)
 
     # --- add -----------------------------------------------------------------
-    p_add = sub.add_parser(MODE_ADD, help="投入元を探索して保存フォルダへ取り込む")
-    p_add.add_argument("archive_root", help="保存用フォルダ")
-    p_add.add_argument("source_path", help="投入元のファイルまたはフォルダ")
+    p_add = sub.add_parser(MODE_ADD, help="scan a source and import its files into the archive folder")
+    p_add.add_argument("archive_root", help="archive folder")
+    p_add.add_argument("source_path", help="source file or folder")
+    p_add.add_argument(
+        "--folder-limit", type=int, default=DEFAULT_FOLDER_LIMIT, metavar="N",
+        help="max number of files placed directly in one folder; overflow goes into "
+        f"001, 002, ... subfolders (default: {DEFAULT_FOLDER_LIMIT})",
+    )
     p_add.add_argument(
         "--dest-subdir", default=None, metavar="NAME",
-        help="保存先の第1階層名（既定: 投入元フォルダ名 / '' で保存フォルダ直下に展開）",
+        help="subfolder name under the year-month folder (default: source folder name; "
+        "'' for none). Files go to <YYYY-MM>/<NAME>/<path relative to source>/",
     )
     p_add.add_argument(
         "--dry-run", action="store_true",
-        help="判定だけ行い、移動も DB 更新もしない",
+        help="classify only; do not move files or update the DB",
     )
     p_add.add_argument(
         "--min-size", type=int, default=1, metavar="BYTES",
-        help="このサイズ未満は移動しない（既定 1 = 0 バイトを除外）",
+        help="do not move files smaller than this (default: 1 = skip empty files)",
     )
     p_add.add_argument(
         "--with-meta", action="store_true",
-        help="crawler に形式別メタデータも抽出させる（crawler 側の --extra meta が必要）",
+        help="have the crawler also extract format-specific metadata "
+        "(requires the crawler's --extra meta)",
     )
     p_add.add_argument(
-        "--follow-symlinks", action="store_true", help="シンボリックリンクを追跡する"
+        "--follow-symlinks", action="store_true", help="follow symbolic links"
     )
     p_add.add_argument(
         "--prune-empty-dirs", action="store_true",
-        help="移動後に空になった投入元ディレクトリを削除する",
+        help="remove source directories left empty after moving "
+        "(folders containing only OS metadata such as .DS_Store count as empty)",
     )
-    _add_crawler_args(p_add)
+    _add_common_args(p_add)
 
     # --- verify --------------------------------------------------------------
-    p_ver = sub.add_parser(MODE_VERIFY, help="保存フォルダと DB の整合性を検査する")
-    p_ver.add_argument("archive_root", help="保存用フォルダ")
+    p_ver = sub.add_parser(MODE_VERIFY, help="check consistency between the archive folder and the DB")
+    p_ver.add_argument("archive_root", help="archive folder")
     p_ver.add_argument(
         "--flag-quarantine", nargs="+", default=[], choices=QUARANTINE_KINDS,
         metavar="KIND",
-        help="検出結果に処置予定フラグ（disposition=quarantine）を立てる。"
-        f"指定できる種別: {' / '.join(QUARANTINE_KINDS)}。"
-        "このコマンドはファイルを一切動かさない",
+        help="flag findings for later action (disposition=quarantine). "
+        f"Kinds: {' / '.join(QUARANTINE_KINDS)}. "
+        "This command never moves any files",
     )
     p_ver.add_argument(
-        "--follow-symlinks", action="store_true", help="シンボリックリンクを追跡する"
+        "--follow-symlinks", action="store_true", help="follow symbolic links"
     )
-    _add_crawler_args(p_ver)
+    _add_common_args(p_ver)
 
     # --- delete-duplicates ---------------------------------------------------
     p_del = sub.add_parser(
-        MODE_DELETE_DUPLICATES, help="add で投入元に据え置いた重複を検証付きで削除する"
+        MODE_DELETE_DUPLICATES, help="delete (with verification) duplicates that add left in the source"
     )
-    p_del.add_argument("archive_root", help="保存用フォルダ")
+    p_del.add_argument("archive_root", help="archive folder")
     p_del.add_argument(
         "--ingest-id", type=int, default=None,
-        help="対象を特定の取り込み実行に絞る（既定: 未処置のすべて）",
+        help="limit to a specific ingest run (default: all pending)",
     )
     p_del.add_argument(
         "--trash-dir", default=None, metavar="DIR",
-        help="削除せず DIR へ退避する（投入元の相対パス構造を再現）",
+        help="move to DIR instead of deleting (preserving paths relative to the source)",
     )
     p_del.add_argument(
         "--prune-empty-dirs", action="store_true",
-        help="削除後に空になった投入元ディレクトリを削除する",
+        help="remove source directories left empty after deletion",
     )
     p_del.add_argument(
         "--yes", action="store_true",
-        help="実際に削除する（未指定なら検証結果の一覧表示のみ）",
+        help="actually delete (without this, only list verification results)",
     )
-    _add_crawler_args(p_del)
+    _add_common_args(p_del)
 
     # --- report --------------------------------------------------------------
-    p_rep = sub.add_parser(MODE_REPORT, help="保存フォルダの状態と実行履歴を表示する")
-    p_rep.add_argument("archive_root", help="保存用フォルダ")
+    p_rep = sub.add_parser(MODE_REPORT, help="show archive folder status and run history")
+    p_rep.add_argument("archive_root", help="archive folder")
     p_rep.add_argument(
-        "--ingest-id", type=int, default=None, help="特定の実行の内訳を表示する"
+        "--ingest-id", type=int, default=None, help="show the breakdown of a specific run"
     )
-    _add_crawler_args(p_rep)
+    _add_common_args(p_rep)
+
+    # --- archives ------------------------------------------------------------
+    p_arc = sub.add_parser(
+        MODE_ARCHIVES, help="list archive folders registered in the master DB"
+    )
+    _add_common_args(p_arc)
 
     return parser
 
 
 def parse_arguments(argv: list[str] | None = None) -> DetectorConfig:
     """CLI 引数を解析して DetectorConfig を返します。"""
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if getattr(args, "folder_limit", DEFAULT_FOLDER_LIMIT) < 1:
+        parser.error("--folder-limit must be 1 or greater")
 
     return DetectorConfig(
         mode=args.mode,
-        archive_root=os.path.abspath(args.archive_root),
+        archive_root=(
+            os.path.abspath(args.archive_root)
+            if getattr(args, "archive_root", None)
+            else None
+        ),
+        archive_db=os.path.abspath(args.archive_db or _default_archive_db()),
         source_path=(
             os.path.abspath(args.source_path)
             if getattr(args, "source_path", None)
@@ -201,9 +330,13 @@ def parse_arguments(argv: list[str] | None = None) -> DetectorConfig:
         ),
         dest_subdir=getattr(args, "dest_subdir", None),
         crawler_repo=os.path.abspath(args.crawler_repo or _default_crawler_repo()),
-        db_dir=args.db_dir or _default_db_dir(),
-        log_dir=args.log_dir or _default_log_dir(),
+        siblings_bin=_default_siblings_bin(),
+        # crawler は別の作業フォルダ（crawler リポジトリ）で起動するので、相対パスのまま渡すと
+        # detector と crawler が別々の場所を見る。他のパスと同じく起動時の作業フォルダ基準で絶対パスにする
+        db_dir=os.path.abspath(args.db_dir or _default_db_dir()),
+        log_dir=os.path.abspath(args.log_dir or _default_log_dir()),
         dry_run=getattr(args, "dry_run", False),
+        folder_limit=getattr(args, "folder_limit", DEFAULT_FOLDER_LIMIT),
         min_size=getattr(args, "min_size", 1),
         with_meta=getattr(args, "with_meta", False),
         follow_symlinks=getattr(args, "follow_symlinks", False),

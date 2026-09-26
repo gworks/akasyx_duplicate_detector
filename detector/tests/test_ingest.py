@@ -31,6 +31,7 @@ def _scanned(**kwargs):
 
 def _store(session, filehash, size=10, rel="a.txt", status=STATUS_STORED):
     row = ArchiveFile(
+        archive_id=1,
         filehash=filehash,
         hash_algo="sha256",
         size=size,
@@ -88,7 +89,7 @@ def test_hash_match_with_size_mismatch_is_failed(session, make_config):
     _store(session, "h" * 64, size=999)
     result, _existing, message = ingest.judge(session, _scanned(size=10), config)
     assert result == RESULT_FAILED
-    assert "サイズが違います" in message
+    assert "size differs" in message
 
 
 def test_missing_row_does_not_block_reregistration(session, make_config):
@@ -109,8 +110,14 @@ def test_different_hash_algo_is_not_compared(session, make_config):
 
 
 def test_dest_subdir_defaults_to_source_folder_name(make_config, source):
+    """年月フォルダの下に投入元フォルダ名が入る（既定）。"""
     config = make_config(source_path=source)
     assert ingest.resolve_dest_subdir(config) == os.path.basename(source)
+
+
+def test_dest_subdir_explicit_overrides(make_config, source):
+    config = make_config(source_path=source, dest_subdir="photos")
+    assert ingest.resolve_dest_subdir(config) == "photos"
 
 
 def test_dest_subdir_empty_string_means_archive_root(make_config, source):

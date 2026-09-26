@@ -1,6 +1,7 @@
 # helpers.py - 共通ヘルパー
 import json
 import os
+import sys
 from datetime import datetime
 
 
@@ -26,18 +27,33 @@ def from_posix(archive_root: str, rel: str) -> str:
     return os.path.join(archive_root, *[p for p in rel.split("/") if p])
 
 
+# 既定のファイルシステムが大文字小文字を区別しない OS（macOS の APFS / Windows の NTFS）
+_CASE_INSENSITIVE = sys.platform in ("darwin", "win32")
+
+
+def path_key(path: str, real: bool = True) -> str:
+    """パスを突き合わせるための比較キー。
+
+    real=True はシンボリックリンクを解いた実体の位置（realpath）。macOS / Windows では
+    大文字小文字違いも同じパスとみなす（realpath はまだ無いパスや macOS では表記を実体に
+    合わせないため）。区別するボリュームでは取りこぼしより入れ子の見逃しが危険なので安全側。
+    """
+    p = os.path.realpath(path) if real else os.path.abspath(path)
+    p = os.path.normcase(p)
+    return p.casefold() if _CASE_INSENSITIVE else p
+
+
+def key_within(outer_key: str, inner_key: str) -> bool:
+    """比較キー同士で、inner が outer の配下（または同一）か。"""
+    return inner_key == outer_key or inner_key.startswith(outer_key.rstrip(os.sep) + os.sep)
+
+
 def is_nested(outer: str, inner: str) -> bool:
     """inner が outer の配下（または同一）かを判定します（設計書 §12）。
 
     シンボリックリンク経由の入れ子を見逃さないよう realpath で正規化する。
     """
-    outer = os.path.realpath(outer)
-    inner = os.path.realpath(inner)
-    try:
-        return os.path.commonpath([outer, inner]) == outer
-    except ValueError:
-        # 異なるドライブ（Windows）は commonpath が例外を投げる = 入れ子ではない
-        return False
+    return key_within(path_key(outer), path_key(inner))
 
 
 def format_size(num: int) -> str:

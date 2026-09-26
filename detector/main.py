@@ -4,6 +4,7 @@ import os
 import sys
 from datetime import datetime, timezone
 
+import archives
 import config as config_module
 import crawler_client
 import dedupe
@@ -16,6 +17,7 @@ from database import archive_lock, get_session
 from errors import DetectorError, PreflightError
 from models import (
     MODE_ADD,
+    MODE_ARCHIVES,
     MODE_DELETE_DUPLICATES,
     MODE_REPORT,
     MODE_VERIFY,
@@ -24,6 +26,7 @@ from models import (
     RESULT_MOVED,
     RESULT_SKIPPED_EMPTY,
     RESULT_SKIPPED_NOHASH,
+    RESULT_SKIPPED_OWN_DATA,
     Ingest,
 )
 from utl.helpers import is_nested, json_dumps
@@ -44,35 +47,71 @@ RUNNERS = {
 }
 
 
+def check_own_data_placement(config: DetectorConfig) -> None:
+    """detector 自身のデータを保存フォルダと重ねない（設計書 §12）。何も書き込まずに判定する。
+
+    main() はログのフォルダ作成・ログファイルの初期化より前にこれを呼ぶ（断る前に保存フォルダの中へ
+    ログを作ると、それ自体を verify が保存物として拾ってしまう）。
+    """
+    if not config.archive_root:
+        return
+    # 重なると verify が更新中の UI データ・DB・ログを保存物として記録し、
+    # 正本 DB が .akasyx/archive.db だと旧 DB として取り込んで改名してしまう
+    for _kind, label, path, movable in config_module.own_data_locations(config):
+        if movable:
+            if is_nested(config.archive_root, path):
+                raise PreflightError(
+                    f"The detector's {label} is inside the archive folder:\n"
+                    f"  archive folder: {config.archive_root}\n"
+                    f"  {label:<14}: {path}\n"
+                    "  Put it outside the archive folder (--archive-db / --db-dir / --log-dir)."
+                )
+        elif is_nested(config.archive_root, path) or is_nested(path, config.archive_root):
+            # データフォルダはオプションで移せないので、保存フォルダの選び直しを案内する。
+            # 先頭で見るのは、既定のままホームを選んだ場合に「オプションで外へ」という直らない案内を
+            # 出さないため。中に置くのも断る（データフォルダを消すと保存物まで消える）
+            raise PreflightError(
+                "The archive folder overlaps the detector's data folder "
+                "(contains it, is inside it, or is the same):\n"
+                f"  archive folder: {config.archive_root}\n"
+                f"  data folder   : {path}\n"
+                "  Choose a dedicated folder outside the data folder as the archive folder\n"
+                "  (not your home folder)."
+            )
+
+
 def preflight(config: DetectorConfig) -> None:
     """実行前チェック。1件も処理しないまま断るケースをここに集める（設計書 §12）。"""
+    if not config.archive_root:
+        raise PreflightError("No archive folder specified")
     if not os.path.isdir(config.archive_root):
-        raise PreflightError(f"保存用フォルダがありません: {config.archive_root}")
+        raise PreflightError(f"Archive folder not found: {config.archive_root}")
+    check_own_data_placement(config)
     if not os.access(config.archive_root, os.W_OK):
-        raise PreflightError(f"保存用フォルダに書き込めません: {config.archive_root}")
+        raise PreflightError(f"Archive folder is not writable: {config.archive_root}")
 
     if config.mode == MODE_ADD:
         if not os.path.exists(config.source_path):
-            raise PreflightError(f"投入元がありません: {config.source_path}")
+            raise PreflightError(f"Source not found: {config.source_path}")
         # 入れ子だと自分自身を取り込んでしまう。双方向に判定する
         if is_nested(config.archive_root, config.source_path) or is_nested(
             config.source_path, config.archive_root
         ):
             raise PreflightError(
-                "保存用フォルダと投入元が入れ子（または同一）です:\n"
-                f"  保存用フォルダ: {config.archive_root}\n"
-                f"  投入元        : {config.source_path}"
+                "The archive folder and the source are nested (or the same):\n"
+                f"  archive folder: {config.archive_root}\n"
+                f"  source        : {config.source_path}"
             )
         if os.path.isdir(config.source_path):
-            crawler_client.resolve_crawler_repo(config.crawler_repo)
+            crawler_client.check_crawler(config)
 
     if config.mode == MODE_VERIFY:
-        crawler_client.resolve_crawler_repo(config.crawler_repo)
+        crawler_client.check_crawler(config)
 
     if config.mode == MODE_DELETE_DUPLICATES and config.trash_dir:
         if is_nested(config.archive_root, config.trash_dir):
             raise PreflightError(
-                f"退避先が保存用フォルダの配下です: {config.trash_dir}"
+                f"The trash directory is inside the archive folder: {config.trash_dir}"
             )
         os.makedirs(config.trash_dir, exist_ok=True)
 
@@ -81,38 +120,74 @@ def _summarize(config: DetectorConfig, counters: dict) -> str:
     """crawler の [実行サマリ] 形式を踏襲した1行サマリ（設計書 §7.5）。"""
     if config.mode == MODE_ADD:
         return (
-            f"[実行サマリ] 移動: {counters.get(RESULT_MOVED, 0)}件, "
-            f"重複(据え置き): {counters.get(RESULT_DUPLICATE, 0)}件, "
-            f"空ファイル: {counters.get(RESULT_SKIPPED_EMPTY, 0)}件, "
-            f"ハッシュ不明: {counters.get(RESULT_SKIPPED_NOHASH, 0)}件, "
-            f"失敗: {counters.get(RESULT_FAILED, 0)}件"
+            f"[Summary] moved: {counters.get(RESULT_MOVED, 0)}, "
+            f"duplicates (left in place): {counters.get(RESULT_DUPLICATE, 0)}, "
+            f"empty files: {counters.get(RESULT_SKIPPED_EMPTY, 0)}, "
+            f"no hash: {counters.get(RESULT_SKIPPED_NOHASH, 0)}, "
+            f"failed: {counters.get(RESULT_FAILED, 0)}"
+            + (
+                f", own data skipped: {counters[RESULT_SKIPPED_OWN_DATA]}"
+                if counters.get(RESULT_SKIPPED_OWN_DATA)
+                else ""
+            )
         )
-    parts = ", ".join(f"{k}: {v}件" for k, v in sorted(counters.items()))
-    return f"[実行サマリ] {parts or '対象なし'}"
+    parts = ", ".join(f"{k}: {v}" for k, v in sorted(counters.items()))
+    return f"[Summary] {parts or 'nothing to process'}"
 
 
 def _apply_counters(record: Ingest, counters: dict) -> None:
     record.total = sum(counters.values())
     record.moved = counters.get(RESULT_MOVED, 0)
     record.duplicated = counters.get(RESULT_DUPLICATE, 0)
-    record.skipped = counters.get(RESULT_SKIPPED_EMPTY, 0) + counters.get(
-        RESULT_SKIPPED_NOHASH, 0
+    record.skipped = (
+        counters.get(RESULT_SKIPPED_EMPTY, 0)
+        + counters.get(RESULT_SKIPPED_NOHASH, 0)
+        + counters.get(RESULT_SKIPPED_OWN_DATA, 0)
     )
     record.failed = counters.get(RESULT_FAILED, 0) + counters.get("failed", 0)
     record.stats_json = json_dumps(counters)
 
 
+def run_archives(config: DetectorConfig) -> int:
+    """登録済みの保存フォルダ一覧（保存フォルダの指定もロックも要らない）。"""
+    session, _engine = get_session(config.archive_db)
+    try:
+        rows = archives.list_archives(session)
+        print(f"Master DB: {config.archive_db}")
+        print("")
+        print(f"■ Registered archive folders: {len(rows)}")
+        for a, count, size in rows:
+            exists = "" if os.path.isdir(a.root_abs) else "  * not found at this path"
+            print(f"  #{a.id:<4} {a.root_abs}{exists}")
+            used = a.last_used_at
+            if used is not None:
+                if used.tzinfo is None:
+                    used = used.replace(tzinfo=timezone.utc)
+                used = f"{used.astimezone():%Y-%m-%d %H:%M}"
+            print(f"        stored {count} files / {size} bytes / uid {a.uid} / last used {used or '-'}")
+        return EXIT_OK
+    finally:
+        session.close()
+
+
 def run(config: DetectorConfig) -> int:
     """1回の実行。戻り値はプロセス終了コード。"""
+    if config.mode == MODE_ARCHIVES:
+        return run_archives(config)
+
     preflight(config)
 
     with archive_lock(config.archive_root):
-        session, _engine = get_session(config.archive_root)
+        session, _engine = get_session(config.archive_db)
         try:
+            archive = archives.resolve_archive(session, config.archive_root)
+            config.archive_id = archive.id
+
             # 前回の中断分を先に片付ける（どのサブコマンドでも実施 — 設計書 §7.4）
             mover.recover_pending(session, config)
 
             record = Ingest(
+                archive_id=archive.id,
                 mode=config.mode,
                 source_root=config.source_path,
                 archive_root=config.archive_root,
@@ -133,7 +208,7 @@ def run(config: DetectorConfig) -> int:
                 session.commit()
                 raise
             except Exception:
-                logger.exception("処理中に致命的なエラーが発生しました")
+                logger.exception("A fatal error occurred during processing")
             finally:
                 if status == "failed":
                     # 例外で抜けた場合、未コミットの変更を捨ててから実行行を書き戻す
@@ -149,11 +224,11 @@ def run(config: DetectorConfig) -> int:
 
             summary = _summarize(config, counters)
             if status == "interrupted":
-                summary += " ※実行は中断されました（サマリは処理済みぶんのみ）"
+                summary += " * run was interrupted (summary covers processed files only)"
             elif status == "failed":
-                summary += " ※致命的なエラーにより停止しました"
+                summary += " * stopped due to a fatal error"
             if config.dry_run:
-                summary += " ※dry-run（何も変更していません）"
+                summary += " * dry-run (nothing was changed)"
             logger.info(summary)
             print(summary)
 
@@ -168,22 +243,30 @@ def run(config: DetectorConfig) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     config = config_module.parse_arguments(argv)
+    try:
+        # フォルダやログを作る前に判定する（断る前に保存フォルダの中へ書き込まない）
+        check_own_data_placement(config)
+    except PreflightError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return EXIT_REJECTED
     config_module.setup_directories(config)
     config_module.setup_logging(config)
-    logger.info(f"{config.mode} 開始: 保存用フォルダ={config.archive_root}")
+    logger.info(
+        f"{config.mode} started: archive folder={config.archive_root or '-'} / master DB={config.archive_db}"
+    )
 
     try:
         return run(config)
     except PreflightError as e:
         logger.error(str(e))
-        print(f"エラー: {e}", file=sys.stderr)
+        print(f"Error: {e}", file=sys.stderr)
         return EXIT_REJECTED
     except DetectorError as e:
         logger.error(str(e))
-        print(f"エラー: {e}", file=sys.stderr)
+        print(f"Error: {e}", file=sys.stderr)
         return EXIT_FATAL
     except KeyboardInterrupt:
-        logger.warning("ユーザー操作により中断されました")
+        logger.warning("Interrupted by user")
         return EXIT_FATAL
 
 

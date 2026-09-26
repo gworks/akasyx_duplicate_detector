@@ -26,6 +26,7 @@ MODE_ADD = "add"
 MODE_VERIFY = "verify"
 MODE_DELETE_DUPLICATES = "delete-duplicates"
 MODE_REPORT = "report"
+MODE_ARCHIVES = "archives"  # 登録済みの保存フォルダ一覧（DB 全体を見る。保存フォルダ指定なし）
 
 # --- ar_archive_files.status -------------------------------------------------
 STATUS_PENDING = "pending"            # 移動を予約したが未完了（§7.3 Phase 1〜2）
@@ -54,6 +55,7 @@ RESULT_MOVED = "moved"                        # add: 保存フォルダへ移動
 RESULT_DUPLICATE = "duplicate"                # add: 内容重複のため投入元に残した
 RESULT_SKIPPED_EMPTY = "skipped_empty"        # add: 0 バイト（min_size 未満）
 RESULT_SKIPPED_NOHASH = "skipped_nohash"      # add: ハッシュが無く判定不能
+RESULT_SKIPPED_OWN_DATA = "skipped_own_data"  # add: detector 自身のデータ（投入元の中にあった）
 RESULT_FAILED = "failed"                      # add / 復旧: 処理に失敗した
 RESULT_ARCHIVE_DUPLICATE = "archive_duplicate"  # verify: 保存フォルダ内の重複
 RESULT_HASH_MISMATCH = "hash_mismatch"        # verify: DB と実体のハッシュが違う
@@ -68,12 +70,36 @@ RESOLUTION_KEPT = "kept"
 RESOLUTION_GONE = "gone"  # 処置しようとしたら既に元ファイルが無かった
 
 
+class Archive(Base):
+    """ar_archives — 保存フォルダ（1 保存フォルダ = 1 行。v0.2.0）。
+
+    DB は保存フォルダの外（ローカルディスク）に 1 つだけ置き、複数の保存フォルダを
+    この表で区別する。識別子は uid（保存フォルダ内の `.akasyx/archive.id` にも書く）で、
+    root_abs は「現在の実体のパス」（realpath。移動を検出したら更新）。フォルダを移動しても uid が同じなら
+    同じ行に繋がる。
+    """
+
+    __tablename__ = "ar_archives"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    uid: Mapped[str] = mapped_column(String, unique=True)
+    root_abs: Mapped[str] = mapped_column(Text, index=True)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP, default=utcnow, onupdate=utcnow
+    )
+    last_used_at: Mapped[datetime | None] = mapped_column(TIMESTAMP, nullable=True)
+
+
 class Ingest(Base):
     """ar_ingests — 実行の記録（1回の実行 = 1行。crawler の fs_scans に相当）。"""
 
     __tablename__ = "ar_ingests"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    archive_id: Mapped[int | None] = mapped_column(
+        ForeignKey("ar_archives.id"), index=True, nullable=True
+    )
     mode: Mapped[str] = mapped_column(String)
     source_root: Mapped[str | None] = mapped_column(Text, nullable=True)
     archive_root: Mapped[str] = mapped_column(Text)
@@ -100,6 +126,8 @@ class ArchiveFile(Base):
     __tablename__ = "ar_archive_files"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # どの保存フォルダのものか（v0.2.0）。重複判定・パス占有はこの単位で閉じる
+    archive_id: Mapped[int] = mapped_column(ForeignKey("ar_archives.id"), index=True)
     # 重複判定の主キー。hash_algo が異なるもの同士は照合しない（crawler §14）
     filehash: Mapped[str] = mapped_column(Text, index=True)
     hash_algo: Mapped[str] = mapped_column(String)
@@ -131,20 +159,22 @@ class ArchiveFile(Base):
         # 重複判定の要。実装にバグがあっても二重登録を DB が弾く（設計書 §8）
         Index(
             "ux_archive_files_content",
+            "archive_id",
             "filehash",
             "hash_algo",
             unique=True,
             sqlite_where=text(_OWNING_SQL),
         ),
-        # 保存先パスの二重予約を防ぐ
+        # 保存先パスの二重予約を防ぐ（保存フォルダ単位）
         Index(
             "ux_archive_files_path",
+            "archive_id",
             "stored_path_rel",
             unique=True,
             sqlite_where=text(_PATH_HOLDING_SQL),
         ),
         # 衝突回避（§7.2）は casefold して突き合わせるため、小文字の式索引を張る
-        Index("ix_archive_files_path_lower", text("lower(stored_path_rel)")),
+        Index("ix_archive_files_path_lower", "archive_id", text("lower(stored_path_rel)")),
     )
 
 
@@ -175,3 +205,18 @@ class IngestItem(Base):
         # delete-duplicates の対象抽出（result='duplicate' AND resolution IS NULL）
         Index("ix_ingest_items_result_resolution", "result", "resolution"),
     )
+
+
+class LegacyImport(Base):
+    """ar_legacy_imports — v0.1.x の archive.db を取り込み済みの保存フォルダ（v0.2.0 移行用）。
+
+    取り込みデータと同じトランザクションで書く。旧 DB の改名が失敗したり commit 直後に
+    落ちたりして旧 DB が残っても、この行があれば再取り込みせず改名だけやり直す。
+    """
+
+    __tablename__ = "ar_legacy_imports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    archive_id: Mapped[int] = mapped_column(ForeignKey("ar_archives.id"), unique=True)
+    legacy_path: Mapped[str] = mapped_column(Text)
+    imported_at: Mapped[datetime] = mapped_column(TIMESTAMP, default=utcnow)

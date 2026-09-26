@@ -12,7 +12,8 @@ from models import Base
 logger = logging.getLogger(__name__)
 
 META_DIRNAME = ".akasyx"
-DB_FILENAME = "archive.db"
+LEGACY_DB_FILENAME = "archive.db"   # v0.1.x: 保存フォルダの中に置いていた正本（移行元）
+ARCHIVE_ID_FILENAME = "archive.id"  # v0.2.0: 保存フォルダ側に置く識別子（中身は uid 1 行）
 TMP_DIRNAME = "tmp"
 LOCK_FILENAME = "lock"
 
@@ -22,13 +23,14 @@ def meta_dir(archive_root: str) -> str:
     return os.path.join(archive_root, META_DIRNAME)
 
 
-def db_path(archive_root: str) -> str:
-    """archive.db のパスを返します。
+def legacy_db_path(archive_root: str) -> str:
+    """v0.1.x が保存フォルダの中に置いていた archive.db のパス（移行の入力）。"""
+    return os.path.join(meta_dir(archive_root), LEGACY_DB_FILENAME)
 
-    DB を保存フォルダの中に置くのは、フォルダごと別ディスクへ移動・バックアップしても
-    正本が付いてくるようにするため（設計書 §4）。
-    """
-    return os.path.join(meta_dir(archive_root), DB_FILENAME)
+
+def archive_id_path(archive_root: str) -> str:
+    """保存フォルダ側の識別子ファイル `<archive>/.akasyx/archive.id` のパス。"""
+    return os.path.join(meta_dir(archive_root), ARCHIVE_ID_FILENAME)
 
 
 def tmp_dir(archive_root: str) -> str:
@@ -36,13 +38,21 @@ def tmp_dir(archive_root: str) -> str:
     return os.path.join(meta_dir(archive_root), TMP_DIRNAME)
 
 
-def get_session(archive_root: str) -> tuple[Session, object]:
-    """archive.db に接続してセッションを返します。無ければテーブル・索引ごと作成します。
+def get_session(path: str) -> tuple[Session, object]:
+    """正本 DB（既定 <リポジトリルート>/dist/archive.db）に接続してセッションを返します。
 
-    crawler と同じく create_all で索引まで導出し、手動リストとの二重管理をしない。
+    無ければテーブル・索引ごと作成する。crawler と同じく create_all で索引まで導出し、
+    手動リストとの二重管理をしない。DB は保存フォルダの外・ローカルディスクに置く
+    （設計書 §4。ネットワーク上の SQLite を避けるため — v0.2.0）。
     """
-    os.makedirs(tmp_dir(archive_root), exist_ok=True)
-    path = db_path(archive_root)
+    path = os.path.abspath(path)
+    is_new = not os.path.exists(path)
+    if is_new:
+        # 起動時に正本 DB が無ければ作る（初回起動・dist/ を消した後・別マシンでの初回）。
+        # 中身のある既存の保存フォルダは、この DB に登録が無いので開くと断られる
+        # （空の登録として扱うと重複を作るため。使っていた正本 DB を --archive-db で指定する）
+        logger.warning(f"Master DB not found; creating a new one: {path}")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     engine = create_engine(f"sqlite:///{path}")
 
     @event.listens_for(engine, "connect")
@@ -57,8 +67,10 @@ def get_session(archive_root: str) -> tuple[Session, object]:
         cur.close()
 
     Base.metadata.create_all(engine)
+    if is_new and not os.path.exists(path):  # pragma: no cover - SQLite が作れなかった異常系
+        raise PreflightError(f"Could not create the master DB: {path}")
     session = sessionmaker(bind=engine)()
-    logger.info(f"DB 接続: {path}")
+    logger.info(f"DB {'created' if is_new else 'connected'}: {path}")
     return session, engine
 
 
@@ -97,16 +109,16 @@ def archive_lock(archive_root: str):
             except OSError:
                 pass
             if attempt == 0 and holder.isdigit() and not _pid_alive(int(holder)):
-                logger.warning(f"死んだプロセス（PID {holder}）のロックを引き継ぎます")
+                logger.warning(f"Taking over the lock from a dead process (PID {holder})")
                 with contextlib.suppress(OSError):
                     os.unlink(path)
                 continue
             raise PreflightError(
-                f"保存フォルダは他のプロセス（PID {holder or '不明'}）が使用中です: {path}\n"
-                "多重起動でなければ、このロックファイルを削除してください"
+                f"The archive folder is in use by another process (PID {holder or 'unknown'}): {path}\n"
+                "If no other instance is running, delete this lock file"
             )
     else:  # pragma: no cover - 上の for で必ず break か raise する
-        raise PreflightError(f"ロックを取得できません: {path}")
+        raise PreflightError(f"Could not acquire the lock: {path}")
 
     try:
         os.write(fd, str(os.getpid()).encode())

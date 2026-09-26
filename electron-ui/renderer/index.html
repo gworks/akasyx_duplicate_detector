@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:;" />
+  <title>akasyx Duplicate Detector</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<!--
+  文言は locales/<lang>.json（i18n.js）。data-i18n=textContent、data-i18n-html=innerHTML（キー名は *_html）、
+  data-i18n-placeholder=placeholder、data-pick-title=フォルダ選択ダイアログの題名のキー。
+  要素の中身の英語は、辞書を読む前の仮表示。
+-->
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span data-i18n="app_title">akasyx Duplicate Detector</span>
+      <span class="version" id="version"></span>
+    </div>
+    <nav class="tabs" id="tabs">
+      <button type="button" class="tab" data-mode="add" data-i18n="tab_add">Add</button>
+      <button type="button" class="tab" data-mode="verify" data-i18n="tab_verify">Verify</button>
+      <button type="button" class="tab" data-mode="delete-duplicates" data-i18n="tab_delete">Clean up duplicates</button>
+      <button type="button" class="tab" data-mode="report" data-i18n="tab_report">Status &amp; history</button>
+    </nav>
+    <!-- 言語名はそれぞれの言語で書く（どの言語を表示中でも自分の言語を探せるように） -->
+    <select class="lang-select" id="lang-select" data-i18n-aria-label="language" aria-label="Language">
+      <option value="ja">日本語</option>
+      <option value="en">English</option>
+      <option value="fr">Français</option>
+      <option value="de">Deutsch</option>
+      <option value="it">Italiano</option>
+      <option value="et">Eesti</option>
+    </select>
+  </header>
+
+  <p class="banner banner-error" id="env-warning" hidden></p>
+
+  <main class="layout">
+    <!-- ============================ 入力 ============================ -->
+    <section class="pane pane-form">
+      <div class="field">
+        <label class="label" for="archiveRoot"><span data-i18n="archive_root_label">Archive folder</span><span class="req" data-i18n="required">Required</span></label>
+        <div class="path-row">
+          <input class="input drop" type="text" id="archiveRoot" data-field="archiveRoot"
+                 list="recent-archives" data-i18n-placeholder="placeholder_drop" spellcheck="false" />
+          <button type="button" class="btn" data-pick="archiveRoot" data-pick-title="pick_archive_root" data-i18n="browse">Browse…</button>
+        </div>
+        <datalist id="recent-archives"></datalist>
+        <p class="hint" data-i18n-html="hint_archive_root_html"></p>
+      </div>
+
+      <!-- ---- add ---- -->
+      <div class="mode-panel" data-panel="add">
+        <div class="field">
+          <label class="label" for="sourcePath"><span data-i18n="source_label">Source</span><span class="req" data-i18n="required">Required</span></label>
+          <div class="path-row">
+            <input class="input drop" type="text" id="sourcePath" data-field="sourcePath"
+                   data-i18n-placeholder="placeholder_drop" spellcheck="false" />
+            <button type="button" class="btn" data-pick="sourcePath" data-pick-files="1"
+                    data-pick-title="pick_source" data-i18n="browse">Browse…</button>
+          </div>
+          <p class="hint" data-i18n-html="hint_source_html"></p>
+        </div>
+
+        <label class="check big">
+          <input type="checkbox" id="dryRun" data-field="dryRun" />
+          <span data-i18n-html="dry_run_html">Dry run</span>
+        </label>
+
+        <fieldset class="group">
+          <legend data-i18n="legend_destination">Destination</legend>
+          <p class="hint block" data-i18n-html="hint_destination_html"></p>
+          <div class="field inline">
+            <label class="label small" for="folderLimit" data-i18n="folder_limit_label">Max. files placed directly in one folder</label>
+            <input class="input narrow" type="number" id="folderLimit" data-field="folderLimit" min="1" step="1" value="500" />
+          </div>
+        </fieldset>
+
+        <fieldset class="group">
+          <legend data-i18n="legend_options">Options</legend>
+          <div class="field inline">
+            <label class="label small" for="minSize" data-i18n="min_size_label">Minimum size in bytes</label>
+            <input class="input narrow" type="number" id="minSize" data-field="minSize" min="0" step="1" value="1" />
+          </div>
+          <label class="check">
+            <input type="checkbox" id="withMeta" data-field="withMeta" />
+            <span data-i18n-html="with_meta_html"></span>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="followSymlinks" data-field="followSymlinks" />
+            <span data-i18n="follow_symlinks">Follow symbolic links</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="pruneEmptyDirs" data-field="pruneEmptyDirs" checked />
+            <span data-i18n-html="prune_empty_dirs_add_html"></span>
+          </label>
+        </fieldset>
+      </div>
+
+      <!-- ---- verify ---- -->
+      <div class="mode-panel" data-panel="verify">
+        <p class="hint block" data-i18n-html="hint_verify_html"></p>
+        <fieldset class="group">
+          <legend data-i18n="legend_flag_quarantine">Mark these findings for quarantine</legend>
+          <label class="check"><input type="checkbox" data-group="flagQuarantine" value="missing" /><span data-i18n-html="flag_missing_html"><code>missing</code></span></label>
+          <label class="check"><input type="checkbox" data-group="flagQuarantine" value="unregistered" /><span data-i18n-html="flag_unregistered_html"><code>unregistered</code></span></label>
+          <label class="check"><input type="checkbox" data-group="flagQuarantine" value="archive_duplicate" /><span data-i18n-html="flag_archive_duplicate_html"><code>archive_duplicate</code></span></label>
+          <label class="check"><input type="checkbox" data-group="flagQuarantine" value="hash_mismatch" /><span data-i18n-html="flag_hash_mismatch_html"><code>hash_mismatch</code></span></label>
+        </fieldset>
+        <label class="check">
+          <input type="checkbox" id="verifyFollowSymlinks" data-field="followSymlinks" />
+          <span data-i18n="follow_symlinks">Follow symbolic links</span>
+        </label>
+      </div>
+
+      <!-- ---- delete-duplicates ---- -->
+      <div class="mode-panel" data-panel="delete-duplicates">
+        <p class="hint block" data-i18n-html="hint_delete_html"></p>
+        <div class="field">
+          <label class="label small" for="trashDir" data-i18n="trash_dir_label">Move-aside folder</label>
+          <div class="path-row">
+            <input class="input drop" type="text" id="trashDir" data-field="trashDir"
+                   data-i18n-placeholder="placeholder_trash_dir" spellcheck="false" />
+            <button type="button" class="btn" data-pick="trashDir" data-pick-title="pick_trash_dir" data-i18n="browse">Browse…</button>
+          </div>
+        </div>
+        <div class="field inline">
+          <label class="label small" for="ingestId" data-i18n="ingest_id_label">Only this run ID</label>
+          <input class="input narrow" type="number" id="ingestId" data-field="ingestId" min="1" step="1"
+                 data-i18n-placeholder="placeholder_all_unprocessed" />
+        </div>
+        <label class="check">
+          <input type="checkbox" id="delPruneEmptyDirs" data-field="pruneEmptyDirs" />
+          <span data-i18n="prune_empty_dirs_delete">Delete source folders that become empty</span>
+        </label>
+        <label class="check danger big">
+          <input type="checkbox" id="yes" data-field="yes" />
+          <span data-i18n-html="yes_html"><strong>Really delete (--yes)</strong></span>
+        </label>
+      </div>
+
+      <!-- ---- report ---- -->
+      <div class="mode-panel" data-panel="report">
+        <p class="hint block" data-i18n="hint_report"></p>
+        <div class="field inline">
+          <label class="label small" for="reportIngestId" data-i18n="report_ingest_id_label">Show the details of a run (run ID)</label>
+          <input class="input narrow" type="number" id="reportIngestId" data-field="ingestId"
+                 min="1" step="1" data-i18n-placeholder="placeholder_last_runs" />
+        </div>
+      </div>
+
+      <details class="advanced">
+        <summary data-i18n="advanced_summary">Advanced settings</summary>
+        <div class="field">
+          <span class="label small" data-i18n="data_dir_label">Data location</span>
+          <div class="path-row">
+            <code class="data-dir" id="data-dir"></code>
+            <button type="button" class="btn" id="open-data-dir" data-i18n="open_data_dir">Show in Finder</button>
+          </div>
+          <p class="hint" data-i18n="hint_data_dir"></p>
+        </div>
+        <div class="field">
+          <label class="label small" for="archiveDb" data-i18n="archive_db_label">Archive database</label>
+          <div class="path-row">
+            <input class="input drop" type="text" id="archiveDb" data-field="archiveDb"
+                   data-i18n-placeholder="placeholder_archive_db" spellcheck="false" />
+          </div>
+          <p class="hint" data-i18n="hint_archive_db"></p>
+        </div>
+        <div class="field">
+          <label class="label small" for="crawlerRepo" data-i18n="crawler_repo_label">Path to akasyx_crawler</label>
+          <div class="path-row">
+            <input class="input drop" type="text" id="crawlerRepo" data-field="crawlerRepo"
+                   data-i18n-placeholder="placeholder_crawler_repo" spellcheck="false" />
+            <button type="button" class="btn" data-pick="crawlerRepo" data-pick-title="pick_crawler_repo" data-i18n="browse">Browse…</button>
+          </div>
+        </div>
+        <div class="field">
+          <label class="label small" for="dbDir" data-i18n="db_dir_label">Crawler database folder</label>
+          <div class="path-row">
+            <input class="input drop" type="text" id="dbDir" data-field="dbDir"
+                   data-i18n-placeholder="placeholder_db_dir" spellcheck="false" />
+            <button type="button" class="btn" data-pick="dbDir" data-pick-title="pick_db_dir" data-i18n="browse">Browse…</button>
+          </div>
+        </div>
+        <div class="field">
+          <label class="label small" for="logDir" data-i18n="log_dir_label">Log and CSV folder</label>
+          <div class="path-row">
+            <input class="input drop" type="text" id="logDir" data-field="logDir"
+                   data-i18n-placeholder="placeholder_log_dir" spellcheck="false" />
+            <button type="button" class="btn" data-pick="logDir" data-pick-title="pick_log_dir" data-i18n="browse">Browse…</button>
+          </div>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================ 実行 ============================ -->
+    <section class="pane pane-run">
+      <div class="command">
+        <div class="command-head">
+          <span class="label small"><span data-i18n="command_label">Command to run</span><span class="cwd" id="run-cwd"></span></span>
+          <button type="button" class="btn ghost" id="copy-command" data-i18n="copy">Copy</button>
+        </div>
+        <code class="command-text" id="command-text">—</code>
+      </div>
+
+      <div class="actions">
+        <button type="button" class="btn primary" id="run"><span data-i18n="run">Run</span> <span class="kbd">⌘↵</span></button>
+        <button type="button" class="btn stop" id="stop" disabled data-i18n="stop">Stop</button>
+        <span class="spinner" id="spinner" hidden></span>
+        <span class="elapsed" id="elapsed"></span>
+      </div>
+
+      <p class="banner" id="status" hidden></p>
+
+      <div class="progress" id="progress" hidden>
+        <div class="progress-count"><strong id="progress-processed">0</strong> <span data-i18n="progress_checked">files checked</span></div>
+        <div class="chips" id="progress-chips"></div>
+      </div>
+
+      <div class="log-head">
+        <span class="label small" data-i18n="output_label">Output</span>
+        <div class="log-actions">
+          <button type="button" class="btn ghost" id="open-csv" hidden data-i18n="open_csv">Open CSV</button>
+          <button type="button" class="btn ghost" id="reveal-log" hidden data-i18n="reveal_log">Open log folder</button>
+          <button type="button" class="btn ghost" id="clear-log" data-i18n="clear">Clear</button>
+        </div>
+      </div>
+      <pre class="log" id="log"></pre>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
