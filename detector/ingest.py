@@ -75,6 +75,41 @@ def judge(
     return RESULT_MOVED, None, None
 
 
+_SQLITE_SIDECARS = ("", "-wal", "-shm", "-journal")
+
+
+def _own_data_matcher(config):
+    """detector 自身のデータ（正本 DB・作業用 DB・ログ）かを判定する関数を返します。
+
+    ホームフォルダを投入元にすると、配布版の既定データフォルダも投入元の中に入る。
+    処理中の正本 DB を移動すると履歴を失うため、これらは取り込み対象から外す。
+    シンボリックリンク経由でも見逃さないよう abspath と realpath の両方で突き合わせる。
+    """
+
+    def forms(path):
+        return {os.path.normcase(os.path.abspath(path)), os.path.normcase(os.path.realpath(path))}
+
+    dirs = forms(config.db_dir) | forms(config.log_dir)
+    db_files = {f + sfx for f in forms(config.archive_db) for sfx in _SQLITE_SIDECARS}
+
+    def is_own(path):
+        for p in forms(path):
+            if p in db_files or any(p == d or p.startswith(d.rstrip(os.sep) + os.sep) for d in dirs):
+                return True
+        return False
+
+    return is_own
+
+
+def _skip_own_data(files, config):
+    is_own = _own_data_matcher(config)
+    for scanned in files:
+        if is_own(scanned.path_abs):
+            logger.warning(f"Skipped detector's own data inside the source: {scanned.path_abs}")
+            continue
+        yield scanned
+
+
 def _collect_files(config):
     """投入元を走査して ScannedFile のイテレータと crawler スキャン情報を返します。"""
     source = config.source_path
@@ -82,9 +117,10 @@ def _collect_files(config):
         # .DS_Store 等の OS メタデータは保存する価値が無く、取り込むと保存フォルダが汚れる
         scan = crawler_client.run_crawler(source, config, extra_excludes=OS_JUNK_FILES)
         crawler_client.ensure_completed(scan)
-        return crawler_client.read_files(scan.db_path, scan.scan_id), scan
+        files = crawler_client.read_files(scan.db_path, scan.scan_id)
+        return _skip_own_data(files, config), scan
     # 単一ファイルは crawler を使わず直接読む（設計書 §6.4）
-    return iter([crawler_client.scan_single_file(source)]), None
+    return _skip_own_data([crawler_client.scan_single_file(source)], config), None
 
 
 def resolve_dest_subdir(config) -> str | None:

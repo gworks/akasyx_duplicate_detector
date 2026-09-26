@@ -203,3 +203,18 @@ class IngestItem(Base):
         # delete-duplicates の対象抽出（result='duplicate' AND resolution IS NULL）
         Index("ix_ingest_items_result_resolution", "result", "resolution"),
     )
+
+
+class LegacyImport(Base):
+    """ar_legacy_imports — v0.1.x の archive.db を取り込み済みの保存フォルダ（v0.2.0 移行用）。
+
+    取り込みデータと同じトランザクションで書く。旧 DB の改名が失敗したり commit 直後に
+    落ちたりして旧 DB が残っても、この行があれば再取り込みせず改名だけやり直す。
+    """
+
+    __tablename__ = "ar_legacy_imports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    archive_id: Mapped[int] = mapped_column(ForeignKey("ar_archives.id"), unique=True)
+    legacy_path: Mapped[str] = mapped_column(Text)
+    imported_at: Mapped[datetime] = mapped_column(TIMESTAMP, default=utcnow)

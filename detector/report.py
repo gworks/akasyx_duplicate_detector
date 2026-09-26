@@ -60,7 +60,7 @@ def run_report(session, config, ingest) -> tuple[str, dict]:
         lines.append("  Use delete-duplicates to delete them with verification")
 
     if config.ingest_id is not None:
-        lines.extend(_ingest_detail(session, config.ingest_id))
+        lines.extend(_ingest_detail(session, aid, config.ingest_id))
     else:
         lines.extend(_recent_ingests(session, aid, exclude_id=ingest.id))
 
@@ -88,9 +88,10 @@ def _recent_ingests(
     return lines
 
 
-def _ingest_detail(session, ingest_id: int) -> list[str]:
+def _ingest_detail(session, archive_id: int, ingest_id: int) -> list[str]:
     row = session.get(Ingest, ingest_id)
-    if row is None:
+    # 正本 DB は複数の保存フォルダで共有するので、別の保存フォルダの実行は「見つからない」扱い
+    if row is None or row.archive_id != archive_id:
         return ["", f"■ Run #{ingest_id} not found"]
 
     lines = ["", f"■ Run #{row.id} ({row.mode})"]

@@ -2,7 +2,6 @@
 #
 # 正本 DB は 1 つで、保存フォルダは ar_archives の行として区別する。
 # 識別は uid（保存フォルダ内の .akasyx/archive.id にも書く）で行い、絶対パスは「現在の場所」。
-import contextlib
 import logging
 import os
 import sqlite3
@@ -10,7 +9,7 @@ import uuid
 from datetime import datetime
 
 from database import archive_id_path, legacy_db_path, meta_dir, tmp_dir
-from models import Archive, ArchiveFile, Base, Ingest, IngestItem, utcnow
+from models import Archive, ArchiveFile, Base, Ingest, IngestItem, LegacyImport, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -90,8 +89,18 @@ def import_legacy_db(session, archive: Archive, legacy_path: str) -> dict | None
 
     3 テーブルを id の対応表を作りながらコピーし、archive_id を付ける。
     取り込み後、旧 DB は削除せず `archive.db.migrated-<日時>` に改名する（-wal / -shm も）。
+    取り込み済みの印（ar_legacy_imports）をデータと同じトランザクションで書くので、
+    改名に失敗して旧 DB が残っても次回は再取り込みせず改名だけやり直す。
     """
     if not os.path.isfile(legacy_path):
+        return None
+    done = session.query(LegacyImport).filter_by(archive_id=archive.id).first()
+    if done is not None:
+        logger.warning(
+            f"The v0.1.x DB was already imported at {done.imported_at}; "
+            f"retrying only the rename: {legacy_path}"
+        )
+        _rename_legacy(legacy_path)
         return None
     logger.warning(f"Found a v0.1.x DB; importing it into the master DB: {legacy_path}")
 
@@ -136,6 +145,7 @@ def import_legacy_db(session, archive: Archive, legacy_path: str) -> dict | None
             session.add(IngestItem(**data))
             counts["items"] += 1
 
+        session.add(LegacyImport(archive_id=archive.id, legacy_path=legacy_path))
         session.commit()
     except Exception:
         session.rollback()
@@ -143,13 +153,22 @@ def import_legacy_db(session, archive: Archive, legacy_path: str) -> dict | None
     finally:
         conn.close()
 
+    _rename_legacy(legacy_path)
+    return counts
+
+
+def _rename_legacy(legacy_path: str) -> None:
+    """取り込み済みの旧 DB を `.migrated-<日時>` に改名します。失敗は警告して次回に持ち越す。"""
     stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
     for suffix in ("", "-wal", "-shm"):
         src = legacy_path + suffix
         if os.path.exists(src):
-            with contextlib.suppress(OSError):
+            try:
                 os.replace(src, f"{legacy_path}.migrated-{stamp}{suffix}")
-    return counts
+            except OSError as e:
+                logger.warning(
+                    f"Could not rename the imported v0.1.x DB (will retry next run): {src}: {e}"
+                )
 
 
 _DT_COLUMNS = {

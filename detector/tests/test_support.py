@@ -245,6 +245,23 @@ def test_report_unknown_ingest(make_config, archive, capsys):
     assert "not found" in capsys.readouterr().out
 
 
+def test_report_ingest_of_other_archive_is_not_shown(
+    make_config, archive, source, tmp_path, fake_crawler, capsys
+):
+    """正本 DB を共有する別の保存フォルダの実行 ID を指定しても表示しない。"""
+    write_file(os.path.join(source, "a.txt"), b"AAA")
+    fake_crawler(source, str(tmp_path / "seed.db"))
+    main.run(make_config(archive_root=archive, source_path=source))  # 実行 #1 は archive のもの
+    other = str(tmp_path / "other_archive")
+    os.makedirs(other)
+    capsys.readouterr()
+
+    main.run(make_config(mode=MODE_REPORT, archive_root=other, ingest_id=1))
+    out = capsys.readouterr().out
+    assert "Run #1 not found" in out
+    assert source not in out
+
+
 def test_recent_ingests_on_empty_db(session):
     assert "(no history)" in "\n".join(report._recent_ingests(session, 1))
 

@@ -191,6 +191,27 @@ def test_add_keeps_source_structure_under_month(
     assert os.path.exists(os.path.join(archive, month, name, "deep", "nested", "b.txt"))
 
 
+def test_add_skips_own_data_inside_source(make_config, archive, source, tmp_path, fake_crawler):
+    """正本 DB・作業用 DB・ログが投入元の中にあっても取り込まない（ホームを投入元にした配布版）。"""
+    write_file(os.path.join(source, "a.txt"), b"AAA")
+    data = os.path.join(source, "appdata")
+    db = os.path.join(data, "archive.db")
+    write_file(os.path.join(data, "db", "crawler.db"), b"crawler")
+    write_file(os.path.join(data, "log", "old.log"), b"log")
+    fake_crawler(source, str(tmp_path / "crawler.db"))
+    config = make_config(
+        archive_root=archive, source_path=source, archive_db=db,
+        db_dir=os.path.join(data, "db"), log_dir=os.path.join(data, "log"),
+    )
+    assert _run(config) == main.EXIT_OK
+
+    assert os.path.exists(db)  # 処理中の正本 DB は動かさない
+    assert os.path.exists(os.path.join(data, "db", "crawler.db"))
+    assert os.path.exists(os.path.join(data, "log", "old.log"))
+    stored = [n for _, _, ns in os.walk(archive) for n in ns if n != "archive.id"]
+    assert stored == ["a.txt"]
+
+
 def test_add_ignores_os_junk_and_prunes_it(
     make_config, archive, source, tmp_path, fake_crawler
 ):

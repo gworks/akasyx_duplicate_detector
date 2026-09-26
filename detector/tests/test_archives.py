@@ -149,3 +149,24 @@ def test_second_run_does_not_reimport(session, archive):
     archives.resolve_archive(session, archive)
     archives.resolve_archive(session, archive)  # 2 回目: 旧 DB は既に改名済みで何もしない
     assert session.query(ArchiveFile).count() == 1
+
+
+def test_rename_failure_does_not_reimport_next_run(session, archive, monkeypatch):
+    """取り込み後に旧 DB の改名が失敗しても、次回は再取り込みせず（UNIQUE 違反にならず）改名だけやり直す。"""
+    legacy = legacy_db_path(archive)
+    _make_legacy_db(legacy, archive)
+
+    def _fail(*_a, **_k):
+        raise PermissionError("locked")
+
+    real_replace = os.replace
+    monkeypatch.setattr(archives.os, "replace", _fail)
+    archives.resolve_archive(session, archive)
+    assert os.path.exists(legacy)  # 改名に失敗して残っている
+
+    monkeypatch.setattr(archives.os, "replace", real_replace)
+    archives.resolve_archive(session, archive)
+    assert session.query(ArchiveFile).count() == 1
+    assert session.query(Ingest).count() == 1
+    assert not os.path.exists(legacy)
+    assert any(n.startswith("archive.db.migrated-") for n in os.listdir(os.path.dirname(legacy)))

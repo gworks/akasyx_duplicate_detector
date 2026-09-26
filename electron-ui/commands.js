@@ -35,21 +35,29 @@ function trimmed(value) {
  *   - 前後の空白を落とす
  *   - 全体を囲む '…' / "…" を外す（`'/Users/a b/c'` → `/Users/a b/c`）
  *   - シェルのバックスラッシュエスケープを解く（`/Users/a\ b` → `/Users/a b`）
+ *     ただし Windows ではパス区切りなので解かない（`C:\Users\me` や UNC `\\server\share`）
  *   - 先頭の `~/` をホームに展開する
  * 正規化後の値がコマンドプレビューに出るので、何が渡るかは画面で確認できる。
  */
-function normalizePath(value) {
+function normalizePath(value, platform = process.platform) {
   let p = trimmed(value);
   if (!p) return '';
   const q = p[0];
   if ((q === "'" || q === '"') && p.length >= 2 && p[p.length - 1] === q) {
     p = p.slice(1, -1).trim();
   }
-  p = p.replace(/\\(.)/g, '$1');
+  if (platform !== 'win32' && !isWindowsPath(p)) {
+    p = p.replace(/\\(.)/g, '$1');
+  }
   if (p === '~' || p.startsWith('~/')) {
     p = require('node:os').homedir() + p.slice(1);
   }
   return p;
+}
+
+/** ドライブ指定（`C:\` `C:/`）か UNC（`\\server`）で始まる Windows のパスか。 */
+function isWindowsPath(p) {
+  return /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('\\\\');
 }
 
 /** フォーム1件から CLI 引数配列を作ります。不備は FormError で返します。 */
