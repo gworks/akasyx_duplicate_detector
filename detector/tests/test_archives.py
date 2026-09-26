@@ -2,6 +2,8 @@
 import os
 import sqlite3
 
+import pytest
+
 import archives
 import main
 from conftest import ARCHIVE_ID, archive_db_path, write_file
@@ -246,3 +248,64 @@ def test_main_rename_failure_is_retried_next_run(session, archive, monkeypatch):
     archives.resolve_archive(session, archive)
     assert not os.path.exists(legacy)
     assert session.query(Ingest).count() == 2
+
+
+def test_same_location_does_not_trust_zero_file_ids(tmp_path, monkeypatch):
+    """ファイル ID を返さない FS（st_ino が 0）では、別々のフォルダを同じ場所とみなさない。"""
+    a, b = tmp_path / "A", tmp_path / "B"
+    a.mkdir()
+    b.mkdir()
+    real_stat = os.stat
+
+    def _zero_ino(path, *args, **kwargs):
+        st = real_stat(path, *args, **kwargs)
+        return os.stat_result((st.st_mode, 0, 0, *tuple(st)[3:]))  # st_ino と st_dev を 0 に
+
+    monkeypatch.setattr(archives.os, "stat", _zero_ino)
+    assert not archives._same_location(str(a), str(b))
+    assert archives._same_location(str(a), str(a))
+
+
+def test_zero_file_id_same_folder_with_other_case_is_same(tmp_path, monkeypatch):
+    """ファイル ID が 0 でも、大文字小文字だけ違う表記の同じフォルダは同じ場所とみなす（複製と誤判定しない）。"""
+    a = tmp_path / "Archive"
+    a.mkdir()
+    if not os.path.exists(str(a).swapcase()):
+        pytest.skip("大文字小文字を区別するボリューム")
+    real_stat = os.stat
+
+    def _zero_ino(path, *args, **kwargs):
+        st = real_stat(path, *args, **kwargs)
+        return os.stat_result((st.st_mode, 0, 0, *tuple(st)[3:]))
+
+    monkeypatch.setattr(archives.os, "stat", _zero_ino)
+    other_case = os.path.join(str(tmp_path), "ARCHIVE")
+    assert archives._same_location(str(a), other_case)
+
+
+def test_zero_file_id_does_not_merge_folders_whose_parents_differ_in_case(tmp_path, monkeypatch):
+    """ファイル ID が 0 で親フォルダの表記だけ違う場合は、確かめようがないので別々とみなす。"""
+    a = tmp_path / "Parent" / "arch"
+    a.mkdir(parents=True)
+    real_stat = os.stat
+
+    def _zero_ino(path, *args, **kwargs):
+        st = real_stat(path, *args, **kwargs)
+        return os.stat_result((st.st_mode, 0, 0, *tuple(st)[3:]))
+
+    monkeypatch.setattr(archives.os, "stat", _zero_ino)
+    other = tmp_path / "parent" / "arch"
+    if not os.path.exists(other):
+        pytest.skip("大文字小文字を区別するボリュームでは別パスを作れない前提が崩れる")
+    assert not archives._same_location(str(a), str(other))
+
+
+def test_alias_registered_by_older_version_is_rewritten_to_real_path(session, archive, tmp_path):
+    """以前の版が別名（シンボリックリンク経由）のまま記録した登録は、同じ場所で開いたとき実体のパスに直す。"""
+    archives.resolve_archive(session, archive)  # archive.id を書く
+    link = str(tmp_path / "archive_link")
+    os.symlink(archive, link)
+    row = session.get(Archive, ARCHIVE_ID)
+    row.root_abs = link  # 以前の版の記録を模す
+    session.commit()
+    assert archives.resolve_archive(session, archive).root_abs == os.path.realpath(archive)

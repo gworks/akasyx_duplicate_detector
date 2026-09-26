@@ -10,6 +10,7 @@ from conftest import archive_db_path, build_crawler_db, write_file
 from crawler_client import CrawlerScan
 from errors import PreflightError
 from models import (
+    MODE_ADD,
     MODE_DELETE_DUPLICATES,
     MODE_REPORT,
     MODE_VERIFY,
@@ -409,15 +410,48 @@ def test_own_data_skip_is_recorded_as_ingest_item(
         engine.dispose()
 
 
-def test_data_root_inside_archive_is_fine_when_nothing_is_written_there(
-    make_config, archive, source, tmp_path, fake_crawler, monkeypatch
+@pytest.mark.parametrize("mode", [MODE_ADD, MODE_VERIFY, MODE_REPORT, MODE_DELETE_DUPLICATES])
+def test_rejects_archive_containing_data_folder(
+    make_config, archive, source, tmp_path, fake_crawler, monkeypatch, mode
 ):
-    """データフォルダが保存フォルダの中でも、正本 DB・作業用 DB・ログを外に出していれば断らない。"""
+    """データフォルダ（配布版の ui/ を含む）を中に含むフォルダは、正本 DB 等を外に出していても
+    保存フォルダにできない（ホームフォルダを選んだ等。verify が UI のデータを保存物として拾う）。"""
     fake_crawler(source, str(tmp_path / "crawler.db"))
     monkeypatch.setenv("AKASYX_PACKAGED", "1")
     monkeypatch.setenv("AKASYX_DETECTOR_HOME", os.path.join(archive, "appdata"))
-    config = make_config(archive_root=archive, source_path=source)  # DB 類は tmp/dist 側
-    main.preflight(config)
+    config = make_config(mode=mode, archive_root=archive, source_path=source)  # DB 類は tmp/dist 側
+    with pytest.raises(PreflightError, match="overlaps the detector's data folder"):
+        main.preflight(config)
+
+
+def test_home_as_archive_with_default_paths_gets_the_data_folder_message(
+    tmp_path, archive, source, monkeypatch
+):
+    """既定のまま（正本 DB 等もデータフォルダの中）ホームを保存フォルダにしたとき、
+    オプションで移す案内（直らない）ではなく、保存フォルダを選び直す案内が出る。"""
+    import config as config_module
+
+    home = os.path.join(archive, "Library", "akasyx-duplicate-detector")
+    monkeypatch.setenv("AKASYX_PACKAGED", "1")
+    monkeypatch.setenv("AKASYX_DETECTOR_HOME", home)
+    config = config_module.DetectorConfig(
+        mode=MODE_REPORT, archive_root=archive, archive_db=os.path.join(home, "archive.db"),
+        db_dir=os.path.join(home, "db"), log_dir=os.path.join(home, "log"),
+    )
+    with pytest.raises(PreflightError, match="overlaps the detector's data folder"):
+        main.preflight(config)
+
+
+def test_rejects_archive_inside_data_folder(make_config, tmp_path, monkeypatch):
+    """データフォルダの中の保存フォルダも断る（データフォルダを消すと保存物まで消える）。"""
+    home = tmp_path / "appdata"
+    inner = home / "my_archive"
+    inner.mkdir(parents=True)
+    monkeypatch.setenv("AKASYX_PACKAGED", "1")
+    monkeypatch.setenv("AKASYX_DETECTOR_HOME", str(home))
+    config = make_config(mode=MODE_REPORT, archive_root=str(inner))
+    with pytest.raises(PreflightError, match="overlaps the detector's data folder"):
+        main.preflight(config)
 
 
 @pytest.mark.skipif(sys.platform not in ("darwin", "win32"), reason="大文字小文字を区別しない OS のみ")
@@ -457,6 +491,90 @@ def test_move_is_followed_even_if_old_location_is_unreadable(
         assert _run(make_config(mode=MODE_REPORT, archive_root=moved)) == main.EXIT_OK
     finally:
         os.chmod(id_path, 0o644)
+
+
+def test_archive_without_id_opened_via_symlink_reuses_registration(
+    make_config, archive, source, tmp_path, fake_crawler
+):
+    """archive.id を失った保存フォルダを別表記（シンボリックリンク経由）で開いても、同じ登録を使う。"""
+    write_file(os.path.join(source, "a.txt"), b"AAA")
+    fake_crawler(source, str(tmp_path / "c1.db"))
+    assert _run(make_config(archive_root=archive, source_path=source)) == main.EXIT_OK
+    os.unlink(os.path.join(archive, ".akasyx", "archive.id"))
+    link = str(tmp_path / "archive_link")
+    os.symlink(archive, link)
+
+    write_file(os.path.join(source, "again.txt"), b"AAA")  # 保存済みと同じ内容
+    fake_crawler(source, str(tmp_path / "c2.db"))
+    assert _run(make_config(archive_root=link, source_path=source)) == main.EXIT_OK
+
+    assert os.path.exists(os.path.join(source, "again.txt"))  # 重複として投入元に残る
+    assert os.path.exists(os.path.join(archive, ".akasyx", "archive.id"))  # 識別子を書き戻す
+    sess, engine = _open(archive)
+    try:
+        row = sess.query(Archive).one()  # 2 つ目の登録を作らない
+        assert row.root_abs == os.path.realpath(archive)  # 一時的な別名ではなく実体のパスを記録
+    finally:
+        sess.close()
+        engine.dispose()
+
+
+def _case_insensitive_fs(path) -> bool:
+    """path のあるボリュームが大文字小文字を区別しないか（OS ではなく実際に確かめる）。"""
+    return os.path.exists(str(path).swapcase())
+
+
+def test_archive_without_id_opened_with_other_case_reuses_registration(
+    make_config, archive, source, tmp_path, fake_crawler
+):
+    """大文字小文字を区別しないボリュームでは、表記だけ違っても同じ登録を使う。"""
+    if not _case_insensitive_fs(archive):
+        pytest.skip("大文字小文字を区別するボリューム")
+    _seed_with_db_a(make_config, archive, source, tmp_path, fake_crawler)
+    os.unlink(os.path.join(archive, ".akasyx", "archive.id"))
+    assert _run(make_config(mode=MODE_REPORT, archive_root=archive.swapcase())) == main.EXIT_OK
+    sess, engine = _open(archive)
+    try:
+        row = sess.query(Archive).one()
+        assert row.root_abs == os.path.realpath(archive)  # 別表記で開いても書き換えない
+    finally:
+        sess.close()
+        engine.dispose()
+
+
+def test_distinct_folders_differing_only_in_case_are_not_merged(
+    make_config, archive, source, tmp_path, fake_crawler
+):
+    """大文字小文字を区別するボリュームでは、表記だけ違う別フォルダを同じ登録にしない。"""
+    other = os.path.join(os.path.dirname(archive), os.path.basename(archive).swapcase())
+    if _case_insensitive_fs(archive):
+        pytest.skip("大文字小文字を区別しないボリューム")
+    _seed_with_db_a(make_config, archive, source, tmp_path, fake_crawler)
+    os.makedirs(other)
+    assert _run(make_config(mode=MODE_REPORT, archive_root=other)) == main.EXIT_OK
+    sess, engine = _open(archive)
+    try:
+        assert sess.query(Archive).count() == 2
+    finally:
+        sess.close()
+        engine.dispose()
+
+
+def test_location_match_prefers_most_recently_used_registration(session, archive):
+    """同じ場所を指す登録が複数あれば、最後に使った方を選ぶ（archive.id を失ったとき）。"""
+    from datetime import timedelta, timezone
+
+    import archives as archives_module
+
+    first = archives_module.resolve_archive(session, archive)  # session フィクスチャの #1
+    newer = Archive(
+        uid="b" * 32, root_abs=os.path.abspath(archive),
+        last_used_at=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+    session.add(newer)
+    session.commit()
+    os.unlink(os.path.join(archive, ".akasyx", "archive.id"))
+    assert archives_module.resolve_archive(session, archive).id == newer.id != first.id
 
 
 def _seed_with_db_a(make_config, archive, source, tmp_path, fake_crawler):

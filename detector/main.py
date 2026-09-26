@@ -53,21 +53,28 @@ def preflight(config: DetectorConfig) -> None:
         raise PreflightError("No archive folder specified")
     if not os.path.isdir(config.archive_root):
         raise PreflightError(f"Archive folder not found: {config.archive_root}")
-    # detector 自身のデータを保存フォルダの中に置かせない。正本 DB が .akasyx/archive.db だと
-    # 旧 DB として取り込んで改名してしまい（次回は空の DB から始まる）、それ以外の場所でも
-    # verify が実体として拾う（作業用 DB・ログは実行のたびに変わりハッシュが食い違う）
-    # データフォルダ全体ではなく、detector が実際に書く場所だけ見る（どれもオプションで移せる）
-    for label, path in (
-        ("master DB", config.archive_db),
-        ("work DB dir", config.db_dir),
-        ("log dir", config.log_dir),
-    ):
-        if is_nested(config.archive_root, path):
+    # detector 自身のデータを保存フォルダと重ねない（設計書 §12）。重なると verify が更新中の
+    # UI データ・DB・ログを保存物として記録し、正本 DB が .akasyx/archive.db だと旧 DB として改名する
+    for _kind, label, path, movable in config_module.own_data_locations(config):
+        if movable:
+            if is_nested(config.archive_root, path):
+                raise PreflightError(
+                    f"The detector's {label} is inside the archive folder:\n"
+                    f"  archive folder: {config.archive_root}\n"
+                    f"  {label:<14}: {path}\n"
+                    "  Put it outside the archive folder (--archive-db / --db-dir / --log-dir)."
+                )
+        elif is_nested(config.archive_root, path) or is_nested(path, config.archive_root):
+            # データフォルダはオプションで移せないので、保存フォルダの選び直しを案内する。
+            # 先頭で見るのは、既定のままホームを選んだ場合に「オプションで外へ」という直らない案内を
+            # 出さないため。中に置くのも断る（データフォルダを消すと保存物まで消える）
             raise PreflightError(
-                f"The detector's {label} is inside the archive folder:\n"
+                "The archive folder overlaps the detector's data folder "
+                "(contains it, is inside it, or is the same):\n"
                 f"  archive folder: {config.archive_root}\n"
-                f"  {label:<14}: {path}\n"
-                "  Put it outside the archive folder (--archive-db / --db-dir / --log-dir)."
+                f"  data folder   : {path}\n"
+                "  Choose a dedicated folder outside the data folder as the archive folder\n"
+                "  (not your home folder)."
             )
     if not os.access(config.archive_root, os.W_OK):
         raise PreflightError(f"Archive folder is not writable: {config.archive_root}")

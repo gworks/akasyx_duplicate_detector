@@ -5,7 +5,7 @@ from datetime import datetime
 
 import crawler_client
 import mover
-from config import OS_JUNK_FILES, own_data_dirs
+from config import OS_JUNK_FILES, OWN_DATA_DB, own_data_dirs, own_data_locations
 from models import (
     OWNING_STATUSES,
     RESULT_DUPLICATE,
@@ -103,7 +103,13 @@ def own_data_matcher(config, source: str | None = None):
         return found
 
     dirs = set().union(*(keys(d) for d in own_data_dirs(config)))
-    db_files = {k + sfx for k in keys(config.archive_db) for sfx in _SQLITE_SIDECARS}
+    db_files = {
+        k + sfx
+        for kind, _label, path, _movable in own_data_locations(config)
+        if kind == OWN_DATA_DB
+        for k in keys(path)
+        for sfx in _SQLITE_SIDECARS
+    }
 
     def matches(p):
         return p in db_files or any(key_within(d, p) for d in dirs)

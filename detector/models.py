@@ -75,7 +75,8 @@ class Archive(Base):
 
     DB は保存フォルダの外（ローカルディスク）に 1 つだけ置き、複数の保存フォルダを
     この表で区別する。識別子は uid（保存フォルダ内の `.akasyx/archive.id` にも書く）で、
-    root_abs は「現在の絶対パス」。フォルダを移動しても uid が同じなら同じ行に繋がる。
+    root_abs は「現在の実体のパス」（realpath。移動を検出したら更新）。フォルダを移動しても uid が同じなら
+    同じ行に繋がる。
     """
 
     __tablename__ = "ar_archives"

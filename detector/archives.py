@@ -56,15 +56,91 @@ def _has_stored_content(root: str) -> bool:
     return False
 
 
+def _same_location(a: str, b: str, st_b: os.stat_result | None = None) -> bool:
+    """2 つのパスが同じ実体のフォルダか（シンボリックリンク・大文字小文字違いの表記も含む）。
+
+    判定は OS に実体を問い合わせる（st_dev と st_ino）。文字列を大文字小文字無視で比べると、
+    区別するボリューム上の別々のフォルダを 1 つの登録にまとめてしまう（入れ子の判定とは逆に、
+    ここでの一致しすぎは危険側）。どちらかが存在しなければ同じ場所ではない。
+    ファイル ID を返さない FS（一部の SMB 等で st_ino が 0）では ID が当てにならないので、
+    実体のパスの比較に落とす。st_b は b の stat を使い回すときに渡す。
+    """
+    try:
+        st_a = os.stat(a)
+        st_b = st_b if st_b is not None else os.stat(b)
+    except OSError:
+        return False
+    if st_a.st_ino == 0 or st_b.st_ino == 0:
+        return _same_real_path(a, b)
+    return os.path.samestat(st_a, st_b)
+
+
+def _same_real_path(a: str, b: str) -> bool:
+    """ファイル ID が使えないときの代わり: 実体のパスが同じか。
+
+    最後の要素（フォルダ名）の大文字小文字だけ違う場合は、親フォルダの中にその名前が 1 つしか無ければ
+    同じフォルダ（区別しないボリュームで表記が違うだけ）、2 つあれば別々のフォルダとみなす。
+    親フォルダの表記が違う場合は確かめようがないので別々とみなす（一致しすぎは危険側）。
+    """
+    ra = os.path.normcase(os.path.realpath(a))
+    rb = os.path.normcase(os.path.realpath(b))
+    if ra == rb:
+        return True
+    if os.path.dirname(ra) != os.path.dirname(rb) or ra.casefold() != rb.casefold():
+        return False
+    name = os.path.basename(ra).casefold()
+    try:
+        spellings = [n for n in os.listdir(os.path.dirname(ra)) if n.casefold() == name]
+    except OSError:
+        return False
+    return len(spellings) == 1
+
+
+def _find_by_location(session, root: str) -> Archive | None:
+    """登録済みの保存フォルダのうち、root と同じ実体の場所にあるもの。
+
+    文字列の一致だけだと、archive.id を失った保存フォルダを別表記（シンボリックリンク経由・
+    大文字小文字違い）で開いたときに見つけられず、同じ実体を新規登録して重複を作る。
+    保存フォルダの行は少ないので全件を比べる。
+
+    同じ表記の登録があればそれを使う（接続していないネットワークの場所を stat して待たないため）。
+    無ければ実体で照合し、複数一致したら最後に使った行を選んで警告する（文字列一致しか見ていなかった
+    頃に同じ実体が重複登録されていることがあるため）。同じ表記の登録が複数あるときも同じ規則で選ぶ。
+    制限: 同じ表記の登録が無いときは全登録を順に stat するので、接続していないネットワークの登録が
+    あるとその分待たされる（archive.id を失ったときだけ起きる。将来の課題）。
+    """
+    rows = session.query(Archive).all()
+    # 同じ表記の登録があれば stat せずに済ませる（登録に接続していないネットワークの場所があると
+    # stat がタイムアウトまで待つため、まず文字列で当てる）
+    matches = [r for r in rows if r.root_abs == root]
+    if not matches:
+        try:
+            st_root = os.stat(root)
+        except OSError:
+            return None
+        matches = [r for r in rows if _same_location(r.root_abs, root, st_root)]
+    if not matches:
+        return None
+    # DB から読んだ値は naive、同じセッション内で入れた値は aware なので揃えて比べる
+    matches.sort(
+        key=lambda r: (r.last_used_at.replace(tzinfo=None) if r.last_used_at else datetime.min, r.id),
+        reverse=True,
+    )
+    if len(matches) > 1:
+        logger.warning(
+            "Several registrations point to this archive folder; using the most recently used one: "
+            + ", ".join(f"#{r.id} {r.root_abs}" for r in matches)
+        )
+    return matches[0]
+
+
 def _is_live_copy_source(row: Archive, root: str) -> bool:
     """登録上の場所に、同じ uid の保存フォルダがまだ残っているか（= root はその複製）。
 
-    シンボリックリンクや大文字小文字違いで同じ場所を指しているだけなら複製ではない。
+    呼び出し側で「root は登録上の場所とは別の実体」と確かめてから呼ぶ（同じ場所の別表記は複製ではない）。
     """
     old = row.root_abs
     if not os.path.isdir(old):
-        return False
-    if os.path.realpath(old) == os.path.realpath(root) or os.path.samefile(old, root):
         return False
     try:
         return _read_uid(old) == row.uid
@@ -79,7 +155,8 @@ def resolve_archive(session, archive_root: str) -> Archive:
 
     1. `.akasyx/archive.id` があれば uid で探す。見つかれば、パスが変わっていれば更新する
        （保存フォルダを移動・改名した場合）
-    2. 無ければ絶対パスで探す（識別子ファイルだけ消えた場合）。見つかれば識別子を書き戻す
+    2. 無ければ場所で探す（識別子ファイルだけ消えた場合）。シンボリックリンク経由や大文字小文字
+       違いの表記でも同じ実体なら同じ行とみなす。見つかれば識別子を書き戻す
     3. どちらも無ければ新規登録し、識別子を書く。v0.1.x の `.akasyx/archive.db` が
        残っていればその内容を取り込む（旧 DB は `.migrated-<日時>` に改名して残す）
 
@@ -90,7 +167,9 @@ def resolve_archive(session, archive_root: str) -> Archive:
     - 同じ uid の元の保存フォルダがまだ別の場所にある: フォルダの複製。移動とみなすと
       2 つのフォルダが 1 つの登録を交互に書き換える
     """
-    root = os.path.abspath(archive_root)
+    # 登録には実体のパスを記録する（シンボリックリンク等の一時的な別名を記録すると、別名が消えたあとに
+    # 場所で見つけられなくなる）。新規登録・移動・別表記のどの分岐でもこの形を使う
+    root = os.path.realpath(archive_root)
     os.makedirs(tmp_dir(root), exist_ok=True)
     uid = _read_uid(root)
 
@@ -98,7 +177,7 @@ def resolve_archive(session, archive_root: str) -> Archive:
     if uid:
         row = session.query(Archive).filter(Archive.uid == uid).first()
     if row is None:
-        row = session.query(Archive).filter(Archive.root_abs == root).first()
+        row = _find_by_location(session, root)
         if row is not None and uid and row.uid != uid:
             row = None  # 同じ場所に別の保存フォルダが置かれた。パス一致では同一視しない
 
@@ -119,7 +198,8 @@ def resolve_archive(session, archive_root: str) -> Archive:
         _write_uid(root, row.uid)
         logger.info(f"Registered archive folder: #{row.id} {root}")
     else:
-        if row.root_abs != root and _is_live_copy_source(row, root):
+        moved = row.root_abs != root and not _same_location(row.root_abs, root)
+        if moved and _is_live_copy_source(row, root):
             raise PreflightError(
                 "This archive folder looks like a copy of another archive folder (same ID):\n"
                 f"  this folder    : {root}\n"
@@ -127,8 +207,13 @@ def resolve_archive(session, archive_root: str) -> Archive:
                 "  To use the copy as a separate archive, delete its .akasyx/archive.id first.\n"
                 "  If you moved the folder, remove or rename the old one."
             )
-        if row.root_abs != root:
+        if moved:
             logger.info(f"Archive folder location changed: {row.root_abs} -> {root}")
+            row.root_abs = root
+        elif row.root_abs != root and os.path.realpath(row.root_abs) != row.root_abs:
+            # 同じ場所だが、登録上のパスが別名（以前の版がシンボリックリンク経由のまま記録した等）なら
+            # 実体のパスに直す。登録上のパスが既に実体で、大文字小文字等の表記が違うだけなら書き換えない
+            # （開くたびに揺れないように）
             row.root_abs = root
         if not uid:
             _write_uid(root, row.uid)

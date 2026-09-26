@@ -97,14 +97,30 @@ def data_root() -> str:
     return app_home() if is_packaged() else os.path.join(repo_root(), "dist")
 
 
-def own_data_dirs(config) -> list[str]:
-    """detector 自身のデータを置くフォルダ（正本 DB 以外）。
+OWN_DATA_DIR = "dir"   # own_data_locations の種類: フォルダ
+OWN_DATA_DB = "db"     # own_data_locations の種類: 正本 DB（ファイル。-wal / -shm と合わせて扱う）
 
-    データフォルダ全体（配布版では UI の設定と Electron のプロファイル `ui/` も入る）と、
-    作業用 DB・ログの置き場。投入元からは取り込まず、保存フォルダの中にも置かせない。
-    正本 DB（config.archive_db）は -wal / -shm と合わせて別に扱う。
+
+def own_data_locations(config) -> list[tuple[str, str, str, bool]]:
+    """detector 自身のデータの置き場 (種類, 表示名, パス, オプションで移せるか) の一覧。定義はここだけ。
+
+    投入元からは取り込まない（ingest）。保存フォルダについては（main.preflight）、データフォルダは
+    重ねない（含む・中にある・同じのどれも不可）、それ以外は保存フォルダの中に置かない。
+    - データフォルダ: アプリが持つフォルダ（配布版は UI の設定・Electron のプロファイル `ui/` も入る。
+      アプリを完全に消すときはこのフォルダごと消す）。開発時は <repo>/dist（正本 DB 等の既定の置き場）
+    - 正本 DB（-wal / -shm と合わせて扱う）・作業用 DB・ログ: 既定はデータフォルダの中
     """
-    return [data_root(), config.db_dir, config.log_dir]
+    return [
+        (OWN_DATA_DIR, "data folder", data_root(), False),
+        (OWN_DATA_DB, "master DB", config.archive_db, True),
+        (OWN_DATA_DIR, "work DB dir", config.db_dir, True),
+        (OWN_DATA_DIR, "log dir", config.log_dir, True),
+    ]
+
+
+def own_data_dirs(config) -> list[str]:
+    """自データのフォルダ（正本 DB 以外）。正本 DB はファイルとして別に扱う。"""
+    return [path for kind, _label, path, _ in own_data_locations(config) if kind == OWN_DATA_DIR]
 
 
 def _default_db_dir() -> str:
