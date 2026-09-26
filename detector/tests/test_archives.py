@@ -170,3 +170,79 @@ def test_rename_failure_does_not_reimport_next_run(session, archive, monkeypatch
     assert session.query(Ingest).count() == 1
     assert not os.path.exists(legacy)
     assert any(n.startswith("archive.db.migrated-") for n in os.listdir(os.path.dirname(legacy)))
+
+
+def _make_legacy_db_with_wal(path: str, root: str) -> None:
+    """実行 1 件を本体に、もう 1 件を WAL にだけ持つ v0.1.x の DB を作る（落ちた直後の状態）。"""
+    import shutil
+
+    _make_legacy_db(path, root)
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    conn.execute(
+        "INSERT INTO ar_ingests (id, mode, archive_root, dry_run, status, started_at, moved)"
+        " VALUES (8, 'add', ?, 0, 'completed', '2026-08-31 00:00:00', 0)", (root,)
+    )
+    conn.commit()
+    # 接続を閉じると書き戻されるので、開いたままの状態を写し取る
+    for suffix in ("", "-wal"):
+        shutil.copyfile(path + suffix, path + suffix + ".snap")
+    conn.close()
+    for suffix in ("", "-wal"):
+        os.replace(path + suffix + ".snap", path + suffix)
+    assert os.path.getsize(path + "-wal") > 0
+
+
+def test_wal_only_changes_are_imported(session, archive):
+    """WAL にだけある変更も取り込む（読む前に本体へ書き戻す）。"""
+    legacy = legacy_db_path(archive)
+    _make_legacy_db_with_wal(legacy, archive)
+    archives.resolve_archive(session, archive)
+    assert session.query(Ingest).count() == 2
+
+
+def test_kept_legacy_copy_has_wal_contents_even_if_wal_rename_fails(session, archive, monkeypatch):
+    """-wal の改名に失敗しても、改名して残す旧 DB 本体だけで内容が揃っている。"""
+    legacy = legacy_db_path(archive)
+    _make_legacy_db_with_wal(legacy, archive)
+    real_replace = os.replace
+
+    def _fail_wal(src, dst):
+        if src.endswith("-wal"):
+            raise PermissionError("locked")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(archives.os, "replace", _fail_wal)
+    archives.resolve_archive(session, archive)
+    kept = next(
+        os.path.join(os.path.dirname(legacy), n)
+        for n in os.listdir(os.path.dirname(legacy))
+        if n.startswith("archive.db.migrated-") and not n.endswith(("-wal", "-shm"))
+    )
+    conn = sqlite3.connect(f"file:{kept}?mode=ro&immutable=1", uri=True)
+    try:
+        assert conn.execute("SELECT count(*) FROM ar_ingests").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_main_rename_failure_is_retried_next_run(session, archive, monkeypatch):
+    """本体の改名に失敗したら止めて、次回に再試行する（取り込み直しはしない）。"""
+    legacy = legacy_db_path(archive)
+    _make_legacy_db_with_wal(legacy, archive)
+    real_replace = os.replace
+
+    def _fail_main(src, dst):
+        if src == legacy:
+            raise PermissionError("locked")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(archives.os, "replace", _fail_main)
+    archives.resolve_archive(session, archive)
+    assert os.path.exists(legacy)
+
+    monkeypatch.setattr(archives.os, "replace", real_replace)
+    archives.resolve_archive(session, archive)
+    assert not os.path.exists(legacy)
+    assert session.query(Ingest).count() == 2

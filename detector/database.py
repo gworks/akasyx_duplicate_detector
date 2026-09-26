@@ -49,7 +49,8 @@ def get_session(path: str) -> tuple[Session, object]:
     is_new = not os.path.exists(path)
     if is_new:
         # 起動時に正本 DB が無ければ作る（初回起動・dist/ を消した後・別マシンでの初回）。
-        # 保存フォルダ側の .akasyx/archive.id が残っていれば、次の add / report で再登録される
+        # 中身のある既存の保存フォルダは、この DB に登録が無いので開くと断られる
+        # （空の登録として扱うと重複を作るため。使っていた正本 DB を --archive-db で指定する）
         logger.warning(f"Master DB not found; creating a new one: {path}")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     engine = create_engine(f"sqlite:///{path}")

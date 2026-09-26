@@ -1,7 +1,9 @@
 # test_main.py - 事前チェック・終了コード・end-to-end（設計書 §11 / §12）
 import os
+import sys
 from datetime import datetime
 
+import ingest as ingest_module
 import main
 import pytest
 from conftest import archive_db_path, build_crawler_db, write_file
@@ -219,6 +221,199 @@ def test_add_skips_own_data_inside_source(make_config, archive, source, tmp_path
     assert os.path.exists(os.path.join(data, "log", "old.log"))
     stored = [n for _, _, ns in os.walk(archive) for n in ns if n != "archive.id"]
     assert stored == ["a.txt"]
+
+
+def test_add_skips_whole_data_folder_inside_source(
+    make_config, archive, source, tmp_path, fake_crawler, monkeypatch
+):
+    """配布版のデータフォルダ全体（UI の設定・Electron のプロファイル ui/ も）を取り込まない。"""
+    home = os.path.join(source, "Library", "akasyx-duplicate-detector")
+    monkeypatch.setenv("AKASYX_PACKAGED", "1")
+    monkeypatch.setenv("AKASYX_DETECTOR_HOME", home)
+    write_file(os.path.join(source, "a.txt"), b"AAA")
+    write_file(os.path.join(home, "ui", "settings.json"), b"{}")
+    write_file(os.path.join(home, "ui", "Local Storage", "leveldb", "000003.log"), b"x")
+    fake_crawler(source, str(tmp_path / "crawler.db"))
+    assert _run(make_config(archive_root=archive, source_path=source)) == main.EXIT_OK
+
+    assert os.path.exists(os.path.join(home, "ui", "settings.json"))
+    assert os.path.exists(os.path.join(home, "ui", "Local Storage", "leveldb", "000003.log"))
+    stored = [n for _, _, ns in os.walk(archive) for n in ns if n != "archive.id"]
+    assert stored == ["a.txt"]
+
+
+@pytest.mark.parametrize("key", ["db_dir", "log_dir"])
+def test_rejects_work_data_inside_archive(make_config, archive, source, key):
+    """作業用 DB・ログも保存フォルダの中には置かせない（verify が実体として拾うため）。"""
+    config = make_config(archive_root=archive, source_path=source, **{key: os.path.join(archive, key)})
+    with pytest.raises(PreflightError, match="inside the archive folder"):
+        main.preflight(config)
+
+
+_NO_CHMOD = pytest.mark.skipif(
+    os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="権限で読めない状態を作れない環境",
+)
+
+
+@_NO_CHMOD
+def test_rejects_unknown_archive_whose_content_is_unreadable(
+    make_config, archive, source, tmp_path, fake_crawler
+):
+    """読めない配下しかない保存フォルダを「空」とみなして新規登録しない。"""
+    other_db = _seed_with_db_a(make_config, archive, source, tmp_path, fake_crawler)
+    month_dirs = [d for d in os.listdir(archive) if d != ".akasyx"]
+    locked = os.path.join(archive, month_dirs[0])
+    os.chmod(locked, 0)
+    try:
+        with pytest.raises(PreflightError, match="Cannot read part of the archive folder"):
+            _run(make_config(mode=MODE_REPORT, archive_root=archive, archive_db=other_db))
+    finally:
+        os.chmod(locked, 0o755)
+
+
+@_NO_CHMOD
+def test_rejects_unreadable_archive_id(make_config, archive, source, tmp_path, fake_crawler):
+    """archive.id が読めないのを「無い」とみなして登録し直さない。"""
+    _seed_with_db_a(make_config, archive, source, tmp_path, fake_crawler)
+    id_path = os.path.join(archive, ".akasyx", "archive.id")
+    os.chmod(id_path, 0)
+    try:
+        with pytest.raises(PreflightError, match="Cannot read the archive folder ID"):
+            _run(make_config(mode=MODE_REPORT, archive_root=archive))
+    finally:
+        os.chmod(id_path, 0o644)
+
+
+def test_own_data_skips_are_reported(make_config, archive, source, tmp_path, fake_crawler, capsys):
+    """除外した自データはサマリと CSV に残す（黙って件数を減らさない）。"""
+    write_file(os.path.join(source, "a.txt"), b"AAA")
+    data = os.path.join(source, "appdata")
+    write_file(os.path.join(data, "log", "old.log"), b"log")
+    fake_crawler(source, str(tmp_path / "crawler.db"))
+    config = make_config(
+        archive_root=archive, source_path=source, archive_db=os.path.join(data, "archive.db"),
+        db_dir=os.path.join(data, "db"), log_dir=os.path.join(data, "log"),
+    )
+    assert _run(config) == main.EXIT_OK
+    out = capsys.readouterr().out
+    assert "own data skipped: " in out
+    csv_path = next(
+        os.path.join(config.log_dir, n) for n in os.listdir(config.log_dir) if n.startswith("add_result")
+    )
+    with open(csv_path, encoding="utf-8") as f:
+        assert "skipped_own_data" in f.read()
+
+
+def test_own_data_is_skipped_when_source_is_given_via_symlink(
+    make_config, archive, tmp_path, fake_crawler
+):
+    """投入元をシンボリックリンク経由で指定しても、実体の位置で指定した自データを取り込まない。"""
+    real_src = tmp_path / "real_inbox"
+    write_file(str(real_src / "a.txt"), b"AAA")
+    data = real_src / "appdata"
+    write_file(str(data / "log" / "old.log"), b"log")
+    link = tmp_path / "inbox_link"
+    os.symlink(real_src, link)
+    fake_crawler(str(link), str(tmp_path / "crawler.db"))
+    config = make_config(
+        archive_root=archive, source_path=str(link), archive_db=str(data / "archive.db"),
+        db_dir=str(data / "db"), log_dir=str(data / "log"),
+    )
+    assert _run(config) == main.EXIT_OK
+    assert os.path.exists(data / "log" / "old.log")
+
+
+def test_own_data_behind_symlink_inside_source_is_skipped_with_follow_symlinks(
+    make_config, archive, source, tmp_path, fake_crawler
+):
+    """--follow-symlinks で、投入元の中の symlink 越しに見える自データも取り込まない。"""
+    data = tmp_path / "appdata"
+    write_file(str(data / "log" / "old.log"), b"log")
+    write_file(os.path.join(source, "a.txt"), b"AAA")
+    os.symlink(data, os.path.join(source, "dd"))
+    config = make_config(
+        archive_root=archive, source_path=source, archive_db=str(data / "archive.db"),
+        db_dir=str(data / "db"), log_dir=str(data / "log"), follow_symlinks=True,
+    )
+    is_own = ingest_module._own_data_matcher(config)
+    assert is_own(os.path.join(source, "dd", "log", "old.log"))
+    assert is_own(os.path.join(source, "dd", "archive.db-wal"))
+    assert not is_own(os.path.join(source, "a.txt"))
+
+
+def test_own_data_skip_is_recorded_as_ingest_item(
+    make_config, archive, source, tmp_path, fake_crawler
+):
+    """除外も他の結果と同じく ar_ingest_items に残す（ar_ingests の件数と揃う）。"""
+    write_file(os.path.join(source, "a.txt"), b"AAA")
+    data = os.path.join(source, "appdata")
+    write_file(os.path.join(data, "log", "old.log"), b"log")
+    fake_crawler(source, str(tmp_path / "crawler.db"))
+    config = make_config(
+        archive_root=archive, source_path=source, archive_db=os.path.join(data, "archive.db"),
+        db_dir=os.path.join(data, "db"), log_dir=os.path.join(data, "log"),
+    )
+    assert _run(config) == main.EXIT_OK
+    sess, engine = _open(archive)
+    try:
+        record = sess.query(Ingest).filter(Ingest.mode == "add").one()
+        items = sess.query(IngestItem).filter(IngestItem.ingest_id == record.id).all()
+        assert record.total == len(items)
+        assert any(i.result == "skipped_own_data" for i in items)
+    finally:
+        sess.close()
+        engine.dispose()
+
+
+def test_data_root_inside_archive_is_fine_when_nothing_is_written_there(
+    make_config, archive, source, tmp_path, fake_crawler, monkeypatch
+):
+    """データフォルダが保存フォルダの中でも、正本 DB・作業用 DB・ログを外に出していれば断らない。"""
+    fake_crawler(source, str(tmp_path / "crawler.db"))
+    monkeypatch.setenv("AKASYX_PACKAGED", "1")
+    monkeypatch.setenv("AKASYX_DETECTOR_HOME", os.path.join(archive, "appdata"))
+    config = make_config(archive_root=archive, source_path=source)  # DB 類は tmp/dist 側
+    main.preflight(config)
+
+
+@pytest.mark.skipif(sys.platform not in ("darwin", "win32"), reason="大文字小文字を区別しない OS のみ")
+def test_master_db_inside_archive_detected_despite_case(make_config, archive, source):
+    """大文字小文字だけ違う表記でも、保存フォルダの中の正本 DB を見逃さない。"""
+    swapped = archive.swapcase()
+    config = make_config(
+        archive_root=archive, source_path=source,
+        archive_db=os.path.join(swapped, ".akasyx", "archive.db"),
+    )
+    with pytest.raises(PreflightError, match="inside the archive folder"):
+        main.preflight(config)
+
+
+def test_rejects_undecodable_archive_id(make_config, archive, source, tmp_path, fake_crawler):
+    """文字化けした archive.id は異常終了せず、断る。"""
+    _seed_with_db_a(make_config, archive, source, tmp_path, fake_crawler)
+    with open(os.path.join(archive, ".akasyx", "archive.id"), "wb") as f:
+        f.write(b"\xff\xfe\x00garbage")
+    with pytest.raises(PreflightError, match="Cannot read the archive folder ID"):
+        _run(make_config(mode=MODE_REPORT, archive_root=archive))
+
+
+@_NO_CHMOD
+def test_move_is_followed_even_if_old_location_is_unreadable(
+    make_config, archive, source, tmp_path, fake_crawler
+):
+    """移動元に同名フォルダが残っていて archive.id が読めなくても、移動として扱う。"""
+    import shutil
+
+    _seed_with_db_a(make_config, archive, source, tmp_path, fake_crawler)
+    moved = str(tmp_path / "archive_moved")
+    shutil.copytree(archive, moved)
+    id_path = os.path.join(archive, ".akasyx", "archive.id")
+    os.chmod(id_path, 0)
+    try:
+        assert _run(make_config(mode=MODE_REPORT, archive_root=moved)) == main.EXIT_OK
+    finally:
+        os.chmod(id_path, 0o644)
 
 
 def _seed_with_db_a(make_config, archive, source, tmp_path, fake_crawler):

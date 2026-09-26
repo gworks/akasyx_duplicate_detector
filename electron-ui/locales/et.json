@@ -71,6 +71,7 @@
   "result_duplicate": "Duplikaat (jäeti alles)",
   "result_skipped_empty": "Tühi fail",
   "result_skipped_nohash": "Räsi puudub",
+  "result_skipped_own_data": "Oma andmed (vahele jäetud)",
   "result_failed": "Ebaõnnestus",
   "result_ok": "OK",
   "result_missing": "Puudub",

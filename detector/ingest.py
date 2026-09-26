@@ -5,7 +5,7 @@ from datetime import datetime
 
 import crawler_client
 import mover
-from config import OS_JUNK_FILES
+from config import OS_JUNK_FILES, own_data_dirs
 from models import (
     OWNING_STATUSES,
     RESULT_DUPLICATE,
@@ -13,9 +13,11 @@ from models import (
     RESULT_MOVED,
     RESULT_SKIPPED_EMPTY,
     RESULT_SKIPPED_NOHASH,
+    RESULT_SKIPPED_OWN_DATA,
     ArchiveFile,
     IngestItem,
 )
+from utl.helpers import is_nested, key_within, path_key
 from utl.result_csv import create_csv, csv_update
 
 logger = logging.getLogger(__name__)
@@ -79,35 +81,41 @@ _SQLITE_SIDECARS = ("", "-wal", "-shm", "-journal")
 
 
 def _own_data_matcher(config):
-    """detector 自身のデータ（正本 DB・作業用 DB・ログ）かを判定する関数を返します。
+    """detector 自身のデータ（データフォルダ全体・正本 DB・作業用 DB・ログ）かを判定する関数を返します。
 
     ホームフォルダを投入元にすると、配布版の既定データフォルダも投入元の中に入る。
-    処理中の正本 DB を移動すると履歴を失うため、これらは取り込み対象から外す。
-    シンボリックリンク経由でも見逃さないよう abspath と realpath の両方で突き合わせる。
+    処理中の正本 DB や UI の設定・Electron のプロファイル（`ui/`）を移動すると履歴や設定を
+    失い、開いたまま書き込まれて保存後の実体がハッシュと食い違うため、取り込み対象から外す。
+
+    crawler のパスは投入元の表記のまま来るので、1 ファイルごとに realpath は呼ばない。
+    代わりに自データ側を「そのままの表記」「実体の位置」「投入元の表記に写した位置」の
+    キーにしておき、ファイル側は文字列の比較だけで判定する。
     """
+    source = config.source_path
+    src_abs, src_real = os.path.abspath(source), os.path.realpath(source)
 
-    def forms(path):
-        return {os.path.normcase(os.path.abspath(path)), os.path.normcase(os.path.realpath(path))}
+    def keys(path):
+        found = {path_key(path, real=False), path_key(path)}
+        real = os.path.realpath(path)
+        if is_nested(src_real, real):
+            # 投入元がシンボリックリンク経由（/var → /private/var 等）でも投入元の表記で突き合わせる
+            found.add(path_key(os.path.join(src_abs, os.path.relpath(real, src_real)), real=False))
+        return found
 
-    dirs = forms(config.db_dir) | forms(config.log_dir)
-    db_files = {f + sfx for f in forms(config.archive_db) for sfx in _SQLITE_SIDECARS}
+    dirs = set().union(*(keys(d) for d in own_data_dirs(config)))
+    db_files = {k + sfx for k in keys(config.archive_db) for sfx in _SQLITE_SIDECARS}
+
+    def matches(p):
+        return p in db_files or any(key_within(d, p) for d in dirs)
 
     def is_own(path):
-        for p in forms(path):
-            if p in db_files or any(p == d or p.startswith(d.rstrip(os.sep) + os.sep) for d in dirs):
-                return True
-        return False
+        if matches(path_key(path, real=False)):
+            return True
+        # --follow-symlinks だと投入元の中の symlink（~/dd → データフォルダ等）越しに自データが
+        # 見えるので、そのときだけファイル側も実体の位置で比べる（既定では crawler は辿らない）
+        return config.follow_symlinks and matches(path_key(path))
 
     return is_own
-
-
-def _skip_own_data(files, config):
-    is_own = _own_data_matcher(config)
-    for scanned in files:
-        if is_own(scanned.path_abs):
-            logger.warning(f"Skipped detector's own data inside the source: {scanned.path_abs}")
-            continue
-        yield scanned
 
 
 def _collect_files(config):
@@ -117,10 +125,9 @@ def _collect_files(config):
         # .DS_Store 等の OS メタデータは保存する価値が無く、取り込むと保存フォルダが汚れる
         scan = crawler_client.run_crawler(source, config, extra_excludes=OS_JUNK_FILES)
         crawler_client.ensure_completed(scan)
-        files = crawler_client.read_files(scan.db_path, scan.scan_id)
-        return _skip_own_data(files, config), scan
+        return crawler_client.read_files(scan.db_path, scan.scan_id), scan
     # 単一ファイルは crawler を使わず直接読む（設計書 §6.4）
-    return _skip_own_data([crawler_client.scan_single_file(source)], config), None
+    return iter([crawler_client.scan_single_file(source)]), None
 
 
 def resolve_dest_subdir(config) -> str | None:
@@ -153,13 +160,21 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
     ts_start = f"{datetime.now():%Y%m%d_%H%M%S}"
     csv_file = create_csv(config.log_dir, "add_result", ts_start)
     processed = 0
+    is_own = _own_data_matcher(config)
 
     try:
         for scanned in files:
             processed += 1
-            result, stored_rel, message = _process_one(
-                session, config, ingest, scanned, planner, reserved, virtual_hashes
-            )
+            if is_own(scanned.path_abs):
+                # 取り込まないが、CSV とサマリには残す（黙って減らすと件数が合わず取りこぼしに見える）
+                result, stored_rel = RESULT_SKIPPED_OWN_DATA, None
+                message = "The detector's own data (master DB / work DB / logs / UI data); not ingested"
+                logger.warning(f"Skipped the detector's own data inside the source: {scanned.path_abs}")
+                _record_item(session, config, ingest, scanned, result, None, None, message)
+            else:
+                result, stored_rel, message = _process_one(
+                    session, config, ingest, scanned, planner, reserved, virtual_hashes
+                )
             counters[result] = counters.get(result, 0) + 1
             csv_update(
                 csv_file,
@@ -235,21 +250,26 @@ def _process_one(
                 result = RESULT_FAILED
                 message = move.message
 
-    if not config.dry_run:
-        session.add(
-            IngestItem(
-                ingest_id=ingest.id,
-                source_path_abs=scanned.path_abs,
-                source_path_rel=scanned.path_rel,
-                name=scanned.name,
-                size=scanned.size,
-                filehash=scanned.filehash,
-                hash_algo=scanned.hash_algo,
-                result=result,
-                archive_file_id=archive_file_id,
-                planned_path_rel=stored_rel,
-                message=message,
-            )
-        )
-
+    _record_item(session, config, ingest, scanned, result, archive_file_id, stored_rel, message)
     return result, stored_rel, message
+
+
+def _record_item(session, config, ingest, scanned, result, archive_file_id, stored_rel, message):
+    """判定を ar_ingest_items に 1 行残します（dry-run では書かない）。"""
+    if config.dry_run:
+        return
+    session.add(
+        IngestItem(
+            ingest_id=ingest.id,
+            source_path_abs=scanned.path_abs,
+            source_path_rel=scanned.path_rel,
+            name=scanned.name,
+            size=scanned.size,
+            filehash=scanned.filehash,
+            hash_algo=scanned.hash_algo,
+            result=result,
+            archive_file_id=archive_file_id,
+            planned_path_rel=stored_rel,
+            message=message,
+        )
+    )

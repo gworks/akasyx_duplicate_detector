@@ -71,6 +71,7 @@
   "result_duplicate": "Duplicate (left in place)",
   "result_skipped_empty": "Empty file",
   "result_skipped_nohash": "No hash",
+  "result_skipped_own_data": "Own data (skipped)",
   "result_failed": "Failed",
   "result_ok": "OK",
   "result_missing": "Missing",

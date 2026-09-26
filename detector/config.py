@@ -97,6 +97,16 @@ def data_root() -> str:
     return app_home() if is_packaged() else os.path.join(repo_root(), "dist")
 
 
+def own_data_dirs(config) -> list[str]:
+    """detector 自身のデータを置くフォルダ（正本 DB 以外）。
+
+    データフォルダ全体（配布版では UI の設定と Electron のプロファイル `ui/` も入る）と、
+    作業用 DB・ログの置き場。投入元からは取り込まず、保存フォルダの中にも置かせない。
+    正本 DB（config.archive_db）は -wal / -shm と合わせて別に扱う。
+    """
+    return [data_root(), config.db_dir, config.log_dir]
+
+
 def _default_db_dir() -> str:
     return os.path.join(data_root(), "db")
 

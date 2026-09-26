@@ -71,6 +71,7 @@
   "result_duplicate": "重複(据え置き)",
   "result_skipped_empty": "空ファイル",
   "result_skipped_nohash": "ハッシュ不明",
+  "result_skipped_own_data": "自データ（除外）",
   "result_failed": "失敗",
   "result_ok": "一致",
   "result_missing": "実体なし",

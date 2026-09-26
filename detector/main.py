@@ -26,6 +26,7 @@ from models import (
     RESULT_MOVED,
     RESULT_SKIPPED_EMPTY,
     RESULT_SKIPPED_NOHASH,
+    RESULT_SKIPPED_OWN_DATA,
     Ingest,
 )
 from utl.helpers import is_nested, json_dumps
@@ -52,15 +53,22 @@ def preflight(config: DetectorConfig) -> None:
         raise PreflightError("No archive folder specified")
     if not os.path.isdir(config.archive_root):
         raise PreflightError(f"Archive folder not found: {config.archive_root}")
-    # 正本 DB が保存フォルダの中にあると、.akasyx/archive.db なら旧 DB として取り込んで
-    # 改名してしまい（次回は空の DB から始まる）、それ以外の場所でも verify が拾ってしまう
-    if is_nested(config.archive_root, config.archive_db):
-        raise PreflightError(
-            "The master DB is inside the archive folder:\n"
-            f"  archive folder: {config.archive_root}\n"
-            f"  master DB     : {config.archive_db}\n"
-            "  Put the master DB outside the archive folder (--archive-db)."
-        )
+    # detector 自身のデータを保存フォルダの中に置かせない。正本 DB が .akasyx/archive.db だと
+    # 旧 DB として取り込んで改名してしまい（次回は空の DB から始まる）、それ以外の場所でも
+    # verify が実体として拾う（作業用 DB・ログは実行のたびに変わりハッシュが食い違う）
+    # データフォルダ全体ではなく、detector が実際に書く場所だけ見る（どれもオプションで移せる）
+    for label, path in (
+        ("master DB", config.archive_db),
+        ("work DB dir", config.db_dir),
+        ("log dir", config.log_dir),
+    ):
+        if is_nested(config.archive_root, path):
+            raise PreflightError(
+                f"The detector's {label} is inside the archive folder:\n"
+                f"  archive folder: {config.archive_root}\n"
+                f"  {label:<14}: {path}\n"
+                "  Put it outside the archive folder (--archive-db / --db-dir / --log-dir)."
+            )
     if not os.access(config.archive_root, os.W_OK):
         raise PreflightError(f"Archive folder is not writable: {config.archive_root}")
 
@@ -99,6 +107,11 @@ def _summarize(config: DetectorConfig, counters: dict) -> str:
             f"empty files: {counters.get(RESULT_SKIPPED_EMPTY, 0)}, "
             f"no hash: {counters.get(RESULT_SKIPPED_NOHASH, 0)}, "
             f"failed: {counters.get(RESULT_FAILED, 0)}"
+            + (
+                f", own data skipped: {counters[RESULT_SKIPPED_OWN_DATA]}"
+                if counters.get(RESULT_SKIPPED_OWN_DATA)
+                else ""
+            )
         )
     parts = ", ".join(f"{k}: {v}" for k, v in sorted(counters.items()))
     return f"[Summary] {parts or 'nothing to process'}"
@@ -108,8 +121,10 @@ def _apply_counters(record: Ingest, counters: dict) -> None:
     record.total = sum(counters.values())
     record.moved = counters.get(RESULT_MOVED, 0)
     record.duplicated = counters.get(RESULT_DUPLICATE, 0)
-    record.skipped = counters.get(RESULT_SKIPPED_EMPTY, 0) + counters.get(
-        RESULT_SKIPPED_NOHASH, 0
+    record.skipped = (
+        counters.get(RESULT_SKIPPED_EMPTY, 0)
+        + counters.get(RESULT_SKIPPED_NOHASH, 0)
+        + counters.get(RESULT_SKIPPED_OWN_DATA, 0)
     )
     record.failed = counters.get(RESULT_FAILED, 0) + counters.get("failed", 0)
     record.stats_json = json_dumps(counters)

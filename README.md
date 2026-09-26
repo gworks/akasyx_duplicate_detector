@@ -53,6 +53,7 @@ uv run main.py --help
 | `.DS_Store` / `Thumbs.db` / `desktop.ini` | 走査対象外（レポートにも出ない） | 投入元に残す（`--prune-empty-dirs` で消える） |
 | 0 バイト（`--min-size` 未満） | `skipped_empty` | 投入元に残す |
 | ハッシュが取れなかった | `skipped_nohash` | 投入元に残す |
+| detector 自身のデータ（データフォルダ・正本 DB・作業用 DB・ログ） | `skipped_own_data` | 投入元に残す（ホームを投入元にした場合など。サマリに件数が出る） |
 | 同一ハッシュが保存 DB にある | `duplicate` | **投入元に残す** |
 | 上記以外 | `moved` | 保存フォルダへ移動 |
 

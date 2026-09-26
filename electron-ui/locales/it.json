@@ -71,6 +71,7 @@
   "result_duplicate": "Duplicato (lasciato)",
   "result_skipped_empty": "File vuoto",
   "result_skipped_nohash": "Senza hash",
+  "result_skipped_own_data": "Dati interni (saltati)",
   "result_failed": "Non riuscito",
   "result_ok": "OK",
   "result_missing": "Mancante",

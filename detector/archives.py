@@ -17,11 +17,19 @@ logger = logging.getLogger(__name__)
 
 
 def _read_uid(archive_root: str) -> str | None:
+    """`.akasyx/archive.id` の uid。ファイルが無ければ None。
+
+    読めない（権限・I/O エラー）のは「無い」と区別して断る。無いとみなすと別の保存フォルダとして
+    登録したり識別子を書き直したりして、既にある内容と同じファイルを取り込んでしまう。
+    """
+    path = archive_id_path(archive_root)
     try:
-        with open(archive_id_path(archive_root), encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             uid = f.read().strip()
-    except OSError:
+    except FileNotFoundError:
         return None
+    except (OSError, UnicodeDecodeError) as e:
+        raise PreflightError(f"Cannot read the archive folder ID: {path}: {e}") from e
     return uid or None
 
 
@@ -32,8 +40,15 @@ def _write_uid(archive_root: str, uid: str) -> None:
 
 
 def _has_stored_content(root: str) -> bool:
-    """保存フォルダに実ファイルがあるか（.akasyx/ と OS のゴミファイルは数えない）。"""
-    for dirpath, dirs, names in os.walk(root):
+    """保存フォルダに実ファイルがあるか（.akasyx/ と OS のゴミファイルは数えない）。
+
+    読めない配下があれば「空」とは言えないので断る（os.walk は既定で黙って飛ばす）。
+    """
+
+    def _unreadable(e: OSError):
+        raise PreflightError(f"Cannot read part of the archive folder: {e.filename}: {e}") from e
+
+    for dirpath, dirs, names in os.walk(root, onerror=_unreadable):
         if dirpath == root:
             dirs[:] = [d for d in dirs if d != META_DIRNAME]
         if any(n not in OS_JUNK_FILES for n in names):
@@ -51,7 +66,12 @@ def _is_live_copy_source(row: Archive, root: str) -> bool:
         return False
     if os.path.realpath(old) == os.path.realpath(root) or os.path.samefile(old, root):
         return False
-    return _read_uid(old) == row.uid
+    try:
+        return _read_uid(old) == row.uid
+    except PreflightError as e:
+        # もう使っていない場所の不調で、移動した保存フォルダまで開けなくしない
+        logger.warning(f"Could not check the previous location; treating as moved: {e}")
+        return False
 
 
 def resolve_archive(session, archive_root: str) -> Archive:
@@ -77,11 +97,6 @@ def resolve_archive(session, archive_root: str) -> Archive:
     row = None
     if uid:
         row = session.query(Archive).filter(Archive.uid == uid).first()
-        if row is None:
-            logger.warning(
-                f"ID {uid} is not in the DB; registering the archive folder as new "
-                "(the folder may have been used with a different DB)"
-            )
     if row is None:
         row = session.query(Archive).filter(Archive.root_abs == root).first()
         if row is not None and uid and row.uid != uid:
@@ -95,6 +110,8 @@ def resolve_archive(session, archive_root: str) -> Archive:
             "  another computer). Using it as a new archive could store duplicates of files\n"
             "  already in it. Specify the master DB it was used with via --archive-db."
         )
+    if row is None and uid:
+        logger.warning(f"ID {uid} is not in the DB; the archive folder is empty, registering it as new")
     if row is None:
         row = Archive(uid=uid or uuid.uuid4().hex, root_abs=root, last_used_at=utcnow())
         session.add(row)
@@ -142,13 +159,16 @@ def import_legacy_db(session, archive: Archive, legacy_path: str) -> dict | None
     """
     if not os.path.isfile(legacy_path):
         return None
+    # WAL に残っている分を本体へ書き戻す。読み取り（mode=ro）でも改名後に残す控えでも、
+    # 本体 1 ファイルだけで内容が揃うようにする
+    checkpointed = _checkpoint_legacy(legacy_path)
     done = session.query(LegacyImport).filter_by(archive_id=archive.id).first()
     if done is not None:
         logger.warning(
             f"The v0.1.x DB was already imported at {done.imported_at}; "
             f"retrying only the rename: {legacy_path}"
         )
-        _rename_legacy(legacy_path)
+        _rename_legacy(legacy_path, checkpointed)
         return None
     logger.warning(f"Found a v0.1.x DB; importing it into the master DB: {legacy_path}")
 
@@ -201,22 +221,51 @@ def import_legacy_db(session, archive: Archive, legacy_path: str) -> dict | None
     finally:
         conn.close()
 
-    _rename_legacy(legacy_path)
+    _rename_legacy(legacy_path, checkpointed)
     return counts
 
 
-def _rename_legacy(legacy_path: str) -> None:
-    """取り込み済みの旧 DB を `.migrated-<日時>` に改名します。失敗は警告して次回に持ち越す。"""
+def _checkpoint_legacy(legacy_path: str) -> bool:
+    """旧 DB の WAL を本体へ書き戻します（-wal が無ければ何もしない）。成否を返す。"""
+    if not os.path.exists(legacy_path + "-wal"):
+        return True
+    try:
+        conn = sqlite3.connect(legacy_path)
+        try:
+            busy, _log, _done = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        logger.warning(f"Could not checkpoint the v0.1.x DB's WAL: {legacy_path}: {e}")
+        return False
+    return busy == 0
+
+
+def _rename_legacy(legacy_path: str, checkpointed: bool) -> None:
+    """取り込み済みの旧 DB を `.migrated-<日時>` に改名します。
+
+    本体から改名し、失敗したらそこで止めて次回に再試行する（本体が残るので再試行される）。
+    本体の後の -wal / -shm は、WAL を書き戻せていれば中身は本体にあるので、改名に失敗しても
+    そのまま残す（次回は本体が無いので再試行されない。書き戻せていなければその旨を警告する）。
+    """
     stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
-    for suffix in ("", "-wal", "-shm"):
+    try:
+        os.replace(legacy_path, f"{legacy_path}.migrated-{stamp}")
+    except OSError as e:
+        logger.warning(f"Could not rename the imported v0.1.x DB (will retry next run): {legacy_path}: {e}")
+        return
+    for suffix in ("-wal", "-shm"):
         src = legacy_path + suffix
         if os.path.exists(src):
             try:
                 os.replace(src, f"{legacy_path}.migrated-{stamp}{suffix}")
             except OSError as e:
-                logger.warning(
-                    f"Could not rename the imported v0.1.x DB (will retry next run): {src}: {e}"
+                note = (
+                    "its contents were already written back to the DB"
+                    if checkpointed
+                    else "the kept copy may lack the changes that were only in it"
                 )
+                logger.warning(f"Could not rename {src}; left in place ({note}): {e}")
 
 
 _DT_COLUMNS = {
