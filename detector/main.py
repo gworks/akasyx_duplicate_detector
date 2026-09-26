@@ -52,6 +52,15 @@ def preflight(config: DetectorConfig) -> None:
         raise PreflightError("No archive folder specified")
     if not os.path.isdir(config.archive_root):
         raise PreflightError(f"Archive folder not found: {config.archive_root}")
+    # 正本 DB が保存フォルダの中にあると、.akasyx/archive.db なら旧 DB として取り込んで
+    # 改名してしまい（次回は空の DB から始まる）、それ以外の場所でも verify が拾ってしまう
+    if is_nested(config.archive_root, config.archive_db):
+        raise PreflightError(
+            "The master DB is inside the archive folder:\n"
+            f"  archive folder: {config.archive_root}\n"
+            f"  master DB     : {config.archive_db}\n"
+            "  Put the master DB outside the archive folder (--archive-db)."
+        )
     if not os.access(config.archive_root, os.W_OK):
         raise PreflightError(f"Archive folder is not writable: {config.archive_root}")
 
@@ -138,9 +147,7 @@ def run(config: DetectorConfig) -> int:
     with archive_lock(config.archive_root):
         session, _engine = get_session(config.archive_db)
         try:
-            archive = archives.resolve_archive(
-                session, config.archive_root, allow_unknown_uid=config.mode != MODE_ADD
-            )
+            archive = archives.resolve_archive(session, config.archive_root)
             config.archive_id = archive.id
 
             # 前回の中断分を先に片付ける（どのサブコマンドでも実施 — 設計書 §7.4）

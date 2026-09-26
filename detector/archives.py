@@ -41,7 +41,20 @@ def _has_stored_content(root: str) -> bool:
     return False
 
 
-def resolve_archive(session, archive_root: str, allow_unknown_uid: bool = True) -> Archive:
+def _is_live_copy_source(row: Archive, root: str) -> bool:
+    """登録上の場所に、同じ uid の保存フォルダがまだ残っているか（= root はその複製）。
+
+    シンボリックリンクや大文字小文字違いで同じ場所を指しているだけなら複製ではない。
+    """
+    old = row.root_abs
+    if not os.path.isdir(old):
+        return False
+    if os.path.realpath(old) == os.path.realpath(root) or os.path.samefile(old, root):
+        return False
+    return _read_uid(old) == row.uid
+
+
+def resolve_archive(session, archive_root: str) -> Archive:
     """保存フォルダに対応する ar_archives 行を返します（無ければ登録）。
 
     1. `.akasyx/archive.id` があれば uid で探す。見つかれば、パスが変わっていれば更新する
@@ -50,9 +63,12 @@ def resolve_archive(session, archive_root: str, allow_unknown_uid: bool = True) 
     3. どちらも無ければ新規登録し、識別子を書く。v0.1.x の `.akasyx/archive.db` が
        残っていればその内容を取り込む（旧 DB は `.migrated-<日時>` に改名して残す）
 
-    allow_unknown_uid=False（add）のとき、識別子があるのに DB に無く、中にファイルがある
-    保存フォルダは PreflightError で断る。別の正本 DB で使われていた保存フォルダを
-    空の登録として扱うと、既にある内容と同じファイルまで取り込んで重複を作るため。
+    次の 2 つは PreflightError で断る（どのサブコマンドでも。登録を作らないため）:
+    - 識別子があるのに DB に無く、中にファイルがある: 別の正本 DB で使われていた保存フォルダを
+      空の登録として扱うと、既にある内容と同じファイルまで取り込んで重複を作る。
+      add 以外で登録を許すと、その後の add が「登録済み」として素通りするので全コマンドで断る
+    - 同じ uid の元の保存フォルダがまだ別の場所にある: フォルダの複製。移動とみなすと
+      2 つのフォルダが 1 つの登録を交互に書き換える
     """
     root = os.path.abspath(archive_root)
     os.makedirs(tmp_dir(root), exist_ok=True)
@@ -71,13 +87,13 @@ def resolve_archive(session, archive_root: str, allow_unknown_uid: bool = True) 
         if row is not None and uid and row.uid != uid:
             row = None  # 同じ場所に別の保存フォルダが置かれた。パス一致では同一視しない
 
-    if row is None and uid and not allow_unknown_uid and _has_stored_content(root):
+    if row is None and uid and _has_stored_content(root):
         raise PreflightError(
             "This archive folder is not registered in the master DB, but it already contains files:\n"
             f"  archive folder: {root} (ID {uid})\n"
             "  It may have been used with a different master DB (e.g. development vs. packaged app,\n"
-            "  another computer). Adding now could store duplicates of files already in it.\n"
-            "  Specify the master DB it was used with via --archive-db."
+            "  another computer). Using it as a new archive could store duplicates of files\n"
+            "  already in it. Specify the master DB it was used with via --archive-db."
         )
     if row is None:
         row = Archive(uid=uid or uuid.uuid4().hex, root_abs=root, last_used_at=utcnow())
@@ -86,6 +102,14 @@ def resolve_archive(session, archive_root: str, allow_unknown_uid: bool = True) 
         _write_uid(root, row.uid)
         logger.info(f"Registered archive folder: #{row.id} {root}")
     else:
+        if row.root_abs != root and _is_live_copy_source(row, root):
+            raise PreflightError(
+                "This archive folder looks like a copy of another archive folder (same ID):\n"
+                f"  this folder    : {root}\n"
+                f"  registered one : {row.root_abs} (ID {row.uid})\n"
+                "  To use the copy as a separate archive, delete its .akasyx/archive.id first.\n"
+                "  If you moved the folder, remove or rename the old one."
+            )
         if row.root_abs != root:
             logger.info(f"Archive folder location changed: {row.root_abs} -> {root}")
             row.root_abs = root

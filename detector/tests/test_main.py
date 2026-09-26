@@ -7,7 +7,16 @@ import pytest
 from conftest import archive_db_path, build_crawler_db, write_file
 from crawler_client import CrawlerScan
 from errors import PreflightError
-from models import MODE_VERIFY, STATUS_STORED, Archive, ArchiveFile, Ingest, IngestItem
+from models import (
+    MODE_DELETE_DUPLICATES,
+    MODE_REPORT,
+    MODE_VERIFY,
+    STATUS_STORED,
+    Archive,
+    ArchiveFile,
+    Ingest,
+    IngestItem,
+)
 
 
 _OPEN_DB_PATH = [None]
@@ -241,14 +250,70 @@ def test_add_rejects_archive_unknown_to_master_db(
         engine.dispose()
 
 
-def test_verify_still_runs_on_archive_unknown_to_master_db(
-    make_config, archive, source, tmp_path, fake_crawler
+@pytest.mark.parametrize("mode", [MODE_VERIFY, MODE_REPORT, MODE_DELETE_DUPLICATES])
+def test_other_commands_also_reject_archive_unknown_to_master_db(
+    make_config, archive, source, tmp_path, fake_crawler, mode
 ):
-    """断るのは add だけ。verify は実体を unregistered として拾い直せる（README の案内どおり）。"""
+    """add 以外も断り、登録を作らない。作ると次の add が「登録済み」として素通りし重複を取り込む。"""
     other_db = _seed_with_db_a(make_config, archive, source, tmp_path, fake_crawler)
     fake_crawler(archive, str(tmp_path / "v.db"))
-    config = make_config(mode=MODE_VERIFY, archive_root=archive, archive_db=other_db)
-    assert _run(config) == main.EXIT_OK
+    with pytest.raises(PreflightError, match="not registered in the master DB"):
+        _run(make_config(mode=mode, archive_root=archive, archive_db=other_db))
+
+    # その後の add も断られる（先に別コマンドを流して拒否を迂回できない）
+    write_file(os.path.join(source, "again.txt"), b"AAA")
+    fake_crawler(source, str(tmp_path / "c2.db"))
+    with pytest.raises(PreflightError, match="not registered in the master DB"):
+        _run(make_config(archive_root=archive, source_path=source, archive_db=other_db))
+    assert os.path.exists(os.path.join(source, "again.txt"))
+
+
+def test_rejects_master_db_inside_archive(make_config, archive, source, tmp_path, fake_crawler):
+    """正本 DB を保存フォルダの中（.akasyx/archive.db 等）に置くと断る。旧 DB として改名されるため。"""
+    for db in (
+        os.path.join(archive, ".akasyx", "archive.db"),
+        os.path.join(archive, "db", "archive.db"),
+    ):
+        config = make_config(archive_root=archive, source_path=source, archive_db=db)
+        with pytest.raises(PreflightError, match="master DB is inside the archive folder"):
+            main.preflight(config)
+
+
+def test_rejects_copied_archive_while_original_exists(
+    make_config, archive, source, tmp_path, fake_crawler
+):
+    """archive.id ごとコピーした保存フォルダは、元が残っていれば移動とみなさず断る。"""
+    import shutil
+
+    _seed_with_db_a(make_config, archive, source, tmp_path, fake_crawler)
+    copy = str(tmp_path / "archive_copy")
+    shutil.copytree(archive, copy)
+    with pytest.raises(PreflightError, match="copy of another archive folder"):
+        _run(make_config(mode=MODE_REPORT, archive_root=copy))
+
+    sess, engine = _open(archive)
+    try:
+        assert sess.query(Archive).one().root_abs == os.path.abspath(archive)  # 書き換えない
+    finally:
+        sess.close()
+        engine.dispose()
+
+
+def test_moved_archive_is_followed_when_original_is_gone(
+    make_config, archive, source, tmp_path, fake_crawler
+):
+    """元の場所に無ければ移動として扱い、登録上のパスを更新する。"""
+    _seed_with_db_a(make_config, archive, source, tmp_path, fake_crawler)
+    moved = str(tmp_path / "archive_moved")
+    os.rename(archive, moved)
+    assert _run(make_config(mode=MODE_REPORT, archive_root=moved)) == main.EXIT_OK
+
+    sess, engine = _open(moved)
+    try:
+        assert sess.query(Archive).one().root_abs == os.path.abspath(moved)
+    finally:
+        sess.close()
+        engine.dispose()
 
 
 def test_add_allows_empty_archive_unknown_to_master_db(
