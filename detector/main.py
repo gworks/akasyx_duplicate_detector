@@ -47,14 +47,16 @@ RUNNERS = {
 }
 
 
-def preflight(config: DetectorConfig) -> None:
-    """実行前チェック。1件も処理しないまま断るケースをここに集める（設計書 §12）。"""
+def check_own_data_placement(config: DetectorConfig) -> None:
+    """detector 自身のデータを保存フォルダと重ねない（設計書 §12）。何も書き込まずに判定する。
+
+    main() はログのフォルダ作成・ログファイルの初期化より前にこれを呼ぶ（断る前に保存フォルダの中へ
+    ログを作ると、それ自体を verify が保存物として拾ってしまう）。
+    """
     if not config.archive_root:
-        raise PreflightError("No archive folder specified")
-    if not os.path.isdir(config.archive_root):
-        raise PreflightError(f"Archive folder not found: {config.archive_root}")
-    # detector 自身のデータを保存フォルダと重ねない（設計書 §12）。重なると verify が更新中の
-    # UI データ・DB・ログを保存物として記録し、正本 DB が .akasyx/archive.db だと旧 DB として改名する
+        return
+    # 重なると verify が更新中の UI データ・DB・ログを保存物として記録し、
+    # 正本 DB が .akasyx/archive.db だと旧 DB として取り込んで改名してしまう
     for _kind, label, path, movable in config_module.own_data_locations(config):
         if movable:
             if is_nested(config.archive_root, path):
@@ -76,6 +78,15 @@ def preflight(config: DetectorConfig) -> None:
                 "  Choose a dedicated folder outside the data folder as the archive folder\n"
                 "  (not your home folder)."
             )
+
+
+def preflight(config: DetectorConfig) -> None:
+    """実行前チェック。1件も処理しないまま断るケースをここに集める（設計書 §12）。"""
+    if not config.archive_root:
+        raise PreflightError("No archive folder specified")
+    if not os.path.isdir(config.archive_root):
+        raise PreflightError(f"Archive folder not found: {config.archive_root}")
+    check_own_data_placement(config)
     if not os.access(config.archive_root, os.W_OK):
         raise PreflightError(f"Archive folder is not writable: {config.archive_root}")
 
@@ -232,6 +243,12 @@ def run(config: DetectorConfig) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     config = config_module.parse_arguments(argv)
+    try:
+        # フォルダやログを作る前に判定する（断る前に保存フォルダの中へ書き込まない）
+        check_own_data_placement(config)
+    except PreflightError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return EXIT_REJECTED
     config_module.setup_directories(config)
     config_module.setup_logging(config)
     logger.info(

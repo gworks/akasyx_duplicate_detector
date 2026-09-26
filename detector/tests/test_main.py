@@ -108,6 +108,23 @@ def test_rejects_incomplete_crawler_scan(
     assert os.path.exists(os.path.join(source, "a.txt"))  # 1件も動いていない
 
 
+@pytest.mark.parametrize("key", ["--log-dir", "--db-dir"])
+def test_rejected_placement_writes_nothing_into_archive(archive, source, tmp_path, key):
+    """保存フォルダの中のログ／作業用 DB の置き場は、フォルダやログファイルを作る前に断る
+    （断る前に作ると、それを verify が保存物として拾う）。"""
+    inside = os.path.join(archive, "logs")
+    args = {
+        "--db-dir": str(tmp_path / "db"),
+        "--log-dir": str(tmp_path / "log"),
+        "--archive-db": archive_db_path(tmp_path),
+    }
+    args[key] = inside
+    code = main.main(["report", archive, *[x for kv in args.items() for x in kv]])
+    assert code == main.EXIT_REJECTED
+    assert not os.path.exists(inside)
+    assert os.listdir(archive) == []  # 保存フォルダには何も作らない
+
+
 # --- end-to-end（add）--------------------------------------------------------
 
 
