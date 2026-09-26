@@ -8,7 +8,9 @@ import sqlite3
 import uuid
 from datetime import datetime
 
-from database import archive_id_path, legacy_db_path, meta_dir, tmp_dir
+from config import OS_JUNK_FILES
+from database import META_DIRNAME, archive_id_path, legacy_db_path, meta_dir, tmp_dir
+from errors import PreflightError
 from models import Archive, ArchiveFile, Base, Ingest, IngestItem, LegacyImport, utcnow
 
 logger = logging.getLogger(__name__)
@@ -29,7 +31,17 @@ def _write_uid(archive_root: str, uid: str) -> None:
         f.write(uid + "\n")
 
 
-def resolve_archive(session, archive_root: str) -> Archive:
+def _has_stored_content(root: str) -> bool:
+    """保存フォルダに実ファイルがあるか（.akasyx/ と OS のゴミファイルは数えない）。"""
+    for dirpath, dirs, names in os.walk(root):
+        if dirpath == root:
+            dirs[:] = [d for d in dirs if d != META_DIRNAME]
+        if any(n not in OS_JUNK_FILES for n in names):
+            return True
+    return False
+
+
+def resolve_archive(session, archive_root: str, allow_unknown_uid: bool = True) -> Archive:
     """保存フォルダに対応する ar_archives 行を返します（無ければ登録）。
 
     1. `.akasyx/archive.id` があれば uid で探す。見つかれば、パスが変わっていれば更新する
@@ -37,6 +49,10 @@ def resolve_archive(session, archive_root: str) -> Archive:
     2. 無ければ絶対パスで探す（識別子ファイルだけ消えた場合）。見つかれば識別子を書き戻す
     3. どちらも無ければ新規登録し、識別子を書く。v0.1.x の `.akasyx/archive.db` が
        残っていればその内容を取り込む（旧 DB は `.migrated-<日時>` に改名して残す）
+
+    allow_unknown_uid=False（add）のとき、識別子があるのに DB に無く、中にファイルがある
+    保存フォルダは PreflightError で断る。別の正本 DB で使われていた保存フォルダを
+    空の登録として扱うと、既にある内容と同じファイルまで取り込んで重複を作るため。
     """
     root = os.path.abspath(archive_root)
     os.makedirs(tmp_dir(root), exist_ok=True)
@@ -55,6 +71,14 @@ def resolve_archive(session, archive_root: str) -> Archive:
         if row is not None and uid and row.uid != uid:
             row = None  # 同じ場所に別の保存フォルダが置かれた。パス一致では同一視しない
 
+    if row is None and uid and not allow_unknown_uid and _has_stored_content(root):
+        raise PreflightError(
+            "This archive folder is not registered in the master DB, but it already contains files:\n"
+            f"  archive folder: {root} (ID {uid})\n"
+            "  It may have been used with a different master DB (e.g. development vs. packaged app,\n"
+            "  another computer). Adding now could store duplicates of files already in it.\n"
+            "  Specify the master DB it was used with via --archive-db."
+        )
     if row is None:
         row = Archive(uid=uid or uuid.uuid4().hex, root_abs=root, last_used_at=utcnow())
         session.add(row)

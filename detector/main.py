@@ -138,7 +138,9 @@ def run(config: DetectorConfig) -> int:
     with archive_lock(config.archive_root):
         session, _engine = get_session(config.archive_db)
         try:
-            archive = archives.resolve_archive(session, config.archive_root)
+            archive = archives.resolve_archive(
+                session, config.archive_root, allow_unknown_uid=config.mode != MODE_ADD
+            )
             config.archive_id = archive.id
 
             # 前回の中断分を先に片付ける（どのサブコマンドでも実施 — 設計書 §7.4）

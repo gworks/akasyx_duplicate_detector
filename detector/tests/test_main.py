@@ -7,7 +7,7 @@ import pytest
 from conftest import archive_db_path, build_crawler_db, write_file
 from crawler_client import CrawlerScan
 from errors import PreflightError
-from models import STATUS_STORED, ArchiveFile, Ingest, IngestItem
+from models import MODE_VERIFY, STATUS_STORED, Archive, ArchiveFile, Ingest, IngestItem
 
 
 _OPEN_DB_PATH = [None]
@@ -210,6 +210,60 @@ def test_add_skips_own_data_inside_source(make_config, archive, source, tmp_path
     assert os.path.exists(os.path.join(data, "log", "old.log"))
     stored = [n for _, _, ns in os.walk(archive) for n in ns if n != "archive.id"]
     assert stored == ["a.txt"]
+
+
+def _seed_with_db_a(make_config, archive, source, tmp_path, fake_crawler):
+    """正本 DB A で 1 件保存した保存フォルダを作り、別の正本 DB B のパスを返す。"""
+    write_file(os.path.join(source, "a.txt"), b"AAA")
+    fake_crawler(source, str(tmp_path / "c1.db"))
+    assert _run(make_config(archive_root=archive, source_path=source)) == main.EXIT_OK
+    return str(tmp_path / "other_dist" / "archive.db")
+
+
+def test_add_rejects_archive_unknown_to_master_db(
+    make_config, archive, source, tmp_path, fake_crawler
+):
+    """別の正本 DB で使っていた保存フォルダ（uid が DB に無く中身がある）への add は断る。
+    空の登録として続けると、既にある内容と同じファイルまで取り込んで重複を作るため。"""
+    other_db = _seed_with_db_a(make_config, archive, source, tmp_path, fake_crawler)
+    write_file(os.path.join(source, "again.txt"), b"AAA")  # 保存済みと同じ内容
+    fake_crawler(source, str(tmp_path / "c2.db"))
+    config = make_config(archive_root=archive, source_path=source, archive_db=other_db)
+    with pytest.raises(PreflightError, match="not registered in the master DB"):
+        _run(config)
+
+    assert os.path.exists(os.path.join(source, "again.txt"))  # 何も動かしていない
+    sess, engine = _open(archive)
+    try:
+        assert sess.query(Archive).count() == 0  # 新しい登録も作らない
+    finally:
+        sess.close()
+        engine.dispose()
+
+
+def test_verify_still_runs_on_archive_unknown_to_master_db(
+    make_config, archive, source, tmp_path, fake_crawler
+):
+    """断るのは add だけ。verify は実体を unregistered として拾い直せる（README の案内どおり）。"""
+    other_db = _seed_with_db_a(make_config, archive, source, tmp_path, fake_crawler)
+    fake_crawler(archive, str(tmp_path / "v.db"))
+    config = make_config(mode=MODE_VERIFY, archive_root=archive, archive_db=other_db)
+    assert _run(config) == main.EXIT_OK
+
+
+def test_add_allows_empty_archive_unknown_to_master_db(
+    make_config, archive, source, tmp_path, fake_crawler
+):
+    """識別子だけ残った空の保存フォルダは、重複の心配が無いので新規登録して続ける。"""
+    other_db = _seed_with_db_a(make_config, archive, source, tmp_path, fake_crawler)
+    for dirpath, _, names in os.walk(archive):
+        if ".akasyx" not in dirpath:
+            for n in names:
+                os.unlink(os.path.join(dirpath, n))
+    write_file(os.path.join(source, "b.txt"), b"BBB")
+    fake_crawler(source, str(tmp_path / "c2.db"))
+    config = make_config(archive_root=archive, source_path=source, archive_db=other_db)
+    assert _run(config) == main.EXIT_OK
 
 
 def test_add_ignores_os_junk_and_prunes_it(

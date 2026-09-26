@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { buildArgs, formatCommand, quoteArg, FormError } = require('./commands');
+const { buildArgs, formatCommand, quoteArg, FormError, normalizePath } = require('./commands');
 const i18n = require('./i18n');
 
 // electron-ui/ はリポジトリルート直下に置く（設計書 §16）
@@ -347,8 +347,10 @@ ipcMain.handle('shell:reveal', (_event, target) => {
   return true;
 });
 
+// 呼び出し元は「ログの場所を開く」（パス欄の値）。CLI に渡す --log-dir と同じ正規化
+// （囲み引用符・エスケープ・~/）を通さないと、detector の出力先と違う場所を開いてしまう
 ipcMain.handle('shell:open', (_event, target) => {
-  const resolved = resolveDetectorPath(target);
+  const resolved = resolveDetectorPath(normalizePath(String(target ?? '')));
   if (!resolved || !fs.existsSync(resolved)) return false;
   shell.openPath(resolved);
   return true;
