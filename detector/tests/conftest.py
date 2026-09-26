@@ -5,6 +5,7 @@
 import os
 import sqlite3
 import sys
+from datetime import datetime, timezone
 
 import pytest
 
@@ -80,11 +81,15 @@ def build_crawler_db(
             rel = os.path.relpath(abs_path, root_dir).replace(os.sep, "/")
             size = os.path.getsize(abs_path)
             filehash = hashing.file_hash(abs_path)
+            # 実 crawler と同じく実体の mtime を UTC naive で書く。birthtime が取れない
+            # Linux（CI）では年月フォルダがこの値で決まるため、固定日付にしない
+            mtime = datetime.fromtimestamp(os.path.getmtime(abs_path), tz=timezone.utc)
             conn.execute(
                 "INSERT INTO fs_files (scan_id, last_seen_scan_id, name, path_abs,"
                 " path_rel, size, filehash, hash_algo, status, modified_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, 'sha256', 'active', '2026-08-30T00:00:00')",
-                (scan_id, scan_id, name, abs_path, rel, size, filehash),
+                " VALUES (?, ?, ?, ?, ?, ?, ?, 'sha256', 'active', ?)",
+                (scan_id, scan_id, name, abs_path, rel, size, filehash,
+                 mtime.replace(tzinfo=None).isoformat()),
             )
     conn.commit()
     conn.close()

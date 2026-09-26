@@ -25,6 +25,8 @@ def _scanned(path, rel=None):
         size=os.path.getsize(path),
         filehash=hashing.file_hash(path),
         hash_algo="sha256",
+        # 実 crawler と同じく mtime を持たせる（birthtime の無い Linux ではこれで年月が決まる）
+        modified_at=datetime.fromtimestamp(os.path.getmtime(path), tz=timezone.utc),
     )
 
 
