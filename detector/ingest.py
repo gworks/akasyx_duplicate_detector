@@ -112,8 +112,12 @@ def owner_location(session, row: ArchiveFile, config=None, lookup=None) -> str:
     message = f"Same content already in archive folder {root}: {row.stored_path_rel}"
     if archive is None or config is None or row.archive_id == config.archive_id:
         return message
-    available, _reason = (lookup or archives.ArchiveLookup()).available(archive)
+    lookup = lookup or archives.ArchiveLookup()
+    available, _reason = lookup.available(archive)
     if not available:
+        lookup.unavailable_duplicates[row.archive_id] = (
+            lookup.unavailable_duplicates.get(row.archive_id, 0) + 1
+        )
         message += (
             " (this archive folder is not available now; if it no longer exists, "
             f"run `archives --forget {row.archive_id}`)"
@@ -255,6 +259,8 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
         if not config.dry_run:
             session.commit()
 
+    _report_unavailable_owners(session, lookup)
+
     if config.prune_empty_dirs and not config.dry_run and os.path.isdir(config.source_path):
         removed = mover.prune_empty_dirs(config.source_path, keep=is_own)
         if removed:
@@ -262,6 +268,23 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
 
     logger.info(f"CSV report: {csv_file}")
     return status, counters
+
+
+def _report_unavailable_owners(session, lookup) -> None:
+    """つながっていない保存フォルダにしか無い重複を知らせます（#6）。
+
+    保存フォルダを消したのに登録を外していないと、その内容はどこにも保存されないまま duplicate として
+    投入元に残り続ける。サマリの duplicate 件数だけでは正常な重複除去と見分けられないので、分けて出す。
+    """
+    for archive_id, count in sorted(lookup.unavailable_duplicates.items()):
+        archive = session.get(Archive, archive_id)
+        line = (
+            f"Note: {count} duplicates are only in archive folder #{archive_id} "
+            f"({archive.root_abs if archive else '?'}), which is not available now. "
+            f"If it was deleted, run `archives --forget {archive_id}` and add again."
+        )
+        logger.warning(line)
+        print(line)
 
 
 def archive_matcher(config, lookup: "archives.ArchiveLookup | None" = None):

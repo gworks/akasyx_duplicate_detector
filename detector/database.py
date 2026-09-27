@@ -89,8 +89,15 @@ def _pid_alive(pid: int) -> bool:
 
 
 @contextlib.contextmanager
-def _pid_lock(path: str, in_use_message: str):
-    """ロックファイルに PID を書いて排他します。死んだプロセスのロックは引き継ぎます。"""
+def archive_lock(archive_root: str):
+    """保存フォルダ単位の多重起動を防ぐロック（設計書 §12）。
+
+    WAL でも書き込みは排他されるが、複数プロセスが同時に移動すると実体の整合が崩れる。
+    ロックファイルに PID を書き、死んだプロセスのロックは引き継ぐ。
+    """
+    os.makedirs(meta_dir(archive_root), exist_ok=True)
+    path = os.path.join(meta_dir(archive_root), LOCK_FILENAME)
+
     for attempt in range(2):
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -108,7 +115,7 @@ def _pid_lock(path: str, in_use_message: str):
                     os.unlink(path)
                 continue
             raise PreflightError(
-                f"{in_use_message} (PID {holder or 'unknown'}): {path}\n"
+                f"The archive folder is in use by another process (PID {holder or 'unknown'}): {path}\n"
                 "If no other instance is running, delete this lock file"
             )
     else:  # pragma: no cover - 上の for で必ず break か raise する
@@ -121,18 +128,6 @@ def _pid_lock(path: str, in_use_message: str):
     finally:
         with contextlib.suppress(OSError):
             os.unlink(path)
-
-
-@contextlib.contextmanager
-def archive_lock(archive_root: str):
-    """保存フォルダ単位の多重起動を防ぐロック（設計書 §12）。
-
-    WAL でも書き込みは排他されるが、複数プロセスが同時に移動すると実体の整合が崩れる。
-    """
-    os.makedirs(meta_dir(archive_root), exist_ok=True)
-    path = os.path.join(meta_dir(archive_root), LOCK_FILENAME)
-    with _pid_lock(path, "The archive folder is in use by another process"):
-        yield path
 
 
 def master_db_lock_path(archive_db: str) -> str:

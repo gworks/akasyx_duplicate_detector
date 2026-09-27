@@ -835,3 +835,59 @@ def test_prune_does_not_touch_archive_folders(make_config, tmp_path, fake_crawle
     )
     assert main.run(cfg) == main.EXIT_OK
     assert os.path.isdir(empty)
+
+
+# --- レビュー指摘 6 回目（2026-09-27）------------------------------------------
+
+
+def test_forget_refuses_folder_present_without_id(make_config, tmp_path, fake_crawler):
+    """識別子ファイルだけ消えて保存フォルダ自体がその場所にあるなら forget を断る。"""
+    t, src_t = _dirs(tmp_path, "trial", "in_t")
+    write_file(os.path.join(src_t, "x.txt"), b"SAME")
+    assert _add(make_config, t, src_t, tmp_path, fake_crawler) == main.EXIT_OK
+    tid = _archive_id_of(tmp_path, t)
+    os.unlink(os.path.join(t, ".akasyx", "archive.id"))
+    argv = ["archives", "--forget", str(tid), "--archive-db", archive_db_path(tmp_path)]
+    assert main.main(argv) == main.EXIT_REJECTED
+    assert _stored_count(tmp_path, b"SAME") == 1
+
+
+def test_restore_keeps_duplicates_that_existed_before_forget(make_config, tmp_path, fake_crawler):
+    """forget より前から別の保存フォルダにも stored だった内容（#6 以前のデータ）は、戻すときに降格しない。"""
+    n, b, src_n, src_b = _dirs(tmp_path, "nas_archive", "archive_b", "in_n", "in_b")
+    write_file(os.path.join(src_n, "x.txt"), b"SAME")
+    assert _add(make_config, n, src_n, tmp_path, fake_crawler) == main.EXIT_OK
+    write_file(os.path.join(src_b, "seed.txt"), b"SEED")
+    assert _add(make_config, b, src_b, tmp_path, fake_crawler) == main.EXIT_OK
+    bid = _archive_id_of(tmp_path, b)
+    sess, engine = _db(tmp_path)
+    try:  # #6 以前の保存フォルダ単位の判定で B にも保存されていた
+        copy = write_file(os.path.join(b, "old", "x.txt"), b"SAME")
+        sess.add(ArchiveFile(
+            archive_id=bid, filehash=_file_hash(copy), hash_algo="sha256", size=4,
+            name="x.txt", stored_path_rel="old/x.txt", status=STATUS_STORED,
+        ))
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    nid = _archive_id_of(tmp_path, n)
+    unplugged = str(tmp_path / "unplugged")
+    shutil.move(n, unplugged)
+    argv = ["archives", "--forget", str(nid), "--archive-db", archive_db_path(tmp_path)]
+    assert main.main(argv) == main.EXIT_OK
+    shutil.move(unplugged, n)
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=n)) == main.EXIT_OK
+    assert _stored_count(tmp_path, b"SAME") == 2  # forget 前の状態に戻る
+
+
+def test_duplicates_in_unavailable_archive_are_reported(make_config, tmp_path, fake_crawler, capsys):
+    """持ち主の保存フォルダにつながっていない重複は、サマリで分けて知らせる。"""
+    t, r, src_t, src_r = _dirs(tmp_path, "trial", "real", "in_t", "in_r")
+    write_file(os.path.join(src_t, "x.txt"), b"SAME")
+    assert _add(make_config, t, src_t, tmp_path, fake_crawler) == main.EXIT_OK
+    shutil.rmtree(t)
+    write_file(os.path.join(src_r, "y.txt"), b"SAME")
+    capsys.readouterr()
+    assert _add(make_config, r, src_r, tmp_path, fake_crawler) == main.EXIT_OK
+    out = capsys.readouterr().out
+    assert "not available" in out and "--forget" in out

@@ -8,6 +8,8 @@ import sqlite3
 import uuid
 from datetime import datetime
 
+from sqlalchemy.orm import aliased
+
 from config import OS_JUNK_FILES
 from database import META_DIRNAME, archive_id_path, legacy_db_path, meta_dir, tmp_dir
 from errors import PreflightError
@@ -157,16 +159,7 @@ def enclosing_archive(path: str) -> str | None:
     正本 DB の登録ではなく実物の目印で見る。移動したまま開いていない保存フォルダ、別の正本 DB の
     保存フォルダも拾い、目印を消した（もう保存フォルダではない）フォルダは拾わない（#6）。
     """
-    d = os.path.realpath(path)
-    if not os.path.isdir(d):
-        d = os.path.dirname(d)
-    while True:
-        if has_archive_marker(d):
-            return d
-        parent = os.path.dirname(d)
-        if parent == d:
-            return None
-        d = parent
+    return ArchiveLookup().enclosing(path)
 
 
 def archives_below(root: str, follow_symlinks: bool = False, limit: int = 5) -> list[str]:
@@ -207,6 +200,8 @@ class ArchiveLookup:
     def __init__(self):
         self._enclosing: dict[str, str | None] = {}  # 実体のパス → それを含む保存フォルダ
         self._available: dict[int, tuple[bool, str | None]] = {}
+        # add: つながっていない保存フォルダにしか無い重複の件数（保存フォルダごと。サマリで知らせる）
+        self.unavailable_duplicates: dict[int, int] = {}
 
     def enclosing(self, path: str) -> str | None:
         """path を含む保存フォルダ（enclosing_archive と同じ判定）。上位フォルダごとの結果を使い回す。"""
@@ -511,6 +506,7 @@ def _settle_forgotten(session, row: Archive, returned: bool) -> None:
 
     - 識別子（uid）で見つかった = 外していた保存フォルダそのものが戻った: stored に戻す。ただし外している間に
       同じ内容が別の保存フォルダに stored になったもの、同じパスが別の行に使われているものは戻さず missing にする
+      （forget の時刻は forgotten 行の updated_at。それ以降に作られた別の保存フォルダの stored だけを見る）
       （stored は全体で 1 つ。実体が本当に無くなっていれば次の verify が missing にする）
     - 場所の一致だけ（消した跡に作り直したフォルダ等）: 元の保存物はもう無いので missing にする
     """
@@ -523,12 +519,25 @@ def _settle_forgotten(session, row: Archive, returned: bool) -> None:
         return
     restored = 0
     if returned:
+        # 外している間（forget の後）に別の保存フォルダへ保存された内容だけを戻さない。forget より前から
+        # 別の保存フォルダにもあった内容（#6 以前の保存フォルダ単位の判定で入ったもの）は元どおり戻す
+        other = aliased(ArchiveFile)
         stored_elsewhere = set(
-            session.query(ArchiveFile.filehash, ArchiveFile.hash_algo)
-            .filter(ArchiveFile.status == STATUS_STORED, ArchiveFile.archive_id != row.id)
-            .distinct()
+            session.query(ArchiveFile.id)
+            .join(
+                other,
+                (other.filehash == ArchiveFile.filehash) & (other.hash_algo == ArchiveFile.hash_algo),
+            )
+            .filter(
+                ArchiveFile.archive_id == row.id,
+                ArchiveFile.status == STATUS_FORGOTTEN,
+                other.status == STATUS_STORED,
+                other.archive_id != row.id,
+                other.created_at >= ArchiveFile.updated_at,
+            )
             .all()
         )
+        stored_elsewhere = {i for (i,) in stored_elsewhere}
         taken = {
             p.casefold()
             for (p,) in session.query(ArchiveFile.stored_path_rel).filter(
@@ -536,7 +545,7 @@ def _settle_forgotten(session, row: Archive, returned: bool) -> None:
             )
         }
     for f in rows:
-        if returned and (f.filehash, f.hash_algo) not in stored_elsewhere and f.stored_path_rel.casefold() not in taken:
+        if returned and f.id not in stored_elsewhere and f.stored_path_rel.casefold() not in taken:
             f.status = STATUS_STORED
             taken.add(f.stored_path_rel.casefold())
             restored += 1
@@ -561,7 +570,11 @@ def forget_archive(session, archive_id: int) -> int:
     row = session.get(Archive, archive_id)
     if row is None:
         raise PreflightError(f"No archive folder with ID #{archive_id} is registered")
-    if is_at_registered_location(row):
+    # 識別子ファイルだけ消えた保存フォルダも「ある」とみなす（開けば場所で見つかり識別子が書き戻される）
+    present = is_at_registered_location(row) or (
+        os.path.isdir(row.root_abs) and read_uid(row.root_abs) is None
+    )
+    if present:
         raise PreflightError(
             f"Archive folder #{archive_id} is present at its location; it cannot be forgotten:\n"
             f"  {row.root_abs}"
