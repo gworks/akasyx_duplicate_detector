@@ -17,7 +17,7 @@
   "build": {
     "appId": "net.at-first.akasyx-duplicate-detector",
     "productName": "akasyx Duplicate Detector",
-    "copyright": "at-first OÜ",
+    "copyright": "© 2026 Tadayuki Kusakabe (akasyx)",
     "directories": {
       "output": "../build/electron",
       "buildResources": "../packaging"
