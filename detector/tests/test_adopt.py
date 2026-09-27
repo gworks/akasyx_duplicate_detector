@@ -289,3 +289,11 @@ def test_failed_count_is_not_doubled(make_config, tmp_path, monkeypatch, photos)
         assert sess.query(Ingest).filter_by(mode=MODE_ADOPT).one().failed == 1
     finally:
         sess.close(); engine.dispose()
+
+
+def test_git_folder_is_not_counted_as_content(make_config, tmp_path):
+    """crawler は既定で .git/ を走査しない（adopt でも登録されない）ので、中身として数えない。"""
+    root = str(tmp_path / "repo_like")
+    write_file(os.path.join(root, ".git", "objects", "ab", "cdef"), b"blob")
+    write_file(os.path.join(root, "sub", ".git", "HEAD"), b"ref")
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=root)) == main.EXIT_OK

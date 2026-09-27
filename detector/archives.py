@@ -55,10 +55,13 @@ def _write_uid(archive_root: str, uid: str) -> None:
         f.write(uid + "\n")
 
 
+CRAWLER_DEFAULT_IGNORED_DIR = ".git"
+
+
 def _has_stored_content(root: str) -> bool:
     """保存フォルダに、adopt が登録する実ファイルがあるか（#4 / #5）。
 
-    adopt と同じ条件で数える: `.akasyx/`・OS のゴミファイル・シンボリックリンク（crawler は既定で辿らない）・
+    adopt と同じ条件で数える: `.akasyx/`・`.git/`（crawler の既定除外）・OS のゴミファイル・シンボリックリンク（crawler は既定で辿らない）・
     0 バイトのファイル（min_size 未満。add でも取り込まない）は数えない。条件がずれると、adopt が何も登録しない
     フォルダを「中身あり」として断り続けたり、逆に登録すべきファイルを見逃したりする。
     読めない配下があれば「空」とは言えないので断る（os.walk は既定で黙って飛ばす）。
@@ -70,6 +73,9 @@ def _has_stored_content(root: str) -> bool:
     for dirpath, dirs, names in os.walk(root, onerror=_unreadable):
         if dirpath == root:
             dirs[:] = [d for d in dirs if d != META_DIRNAME]
+        # crawler の組み込みの既定除外（akasyx_crawler ignore.DEFAULT_IGNORE_PATTERNS = [".git/"]、どの深さでも）。
+        # detector は --gitignore-mode off で呼ぶので、これ以外に crawler が黙って飛ばすものは無い
+        dirs[:] = [d for d in dirs if d != CRAWLER_DEFAULT_IGNORED_DIR]
         for n in names:
             if n in OS_JUNK_FILES:
                 continue
