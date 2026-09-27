@@ -210,6 +210,18 @@ def read_files(db_path: str, scan_id: int) -> Iterator[ScannedFile]:
             )
 
 
+def find_archive_markers(db_path: str, scan_id: int, limit: int = 5) -> list[str]:
+    """走査結果の中にある保存フォルダの目印（`.akasyx/archive.id`）のパスを返します。"""
+    sql = (
+        "SELECT path_abs FROM fs_files WHERE last_seen_scan_id = ? AND status = 'active'"
+        " AND name = 'archive.id' AND (path_rel = '.akasyx/archive.id'"
+        " OR path_rel LIKE '%/.akasyx/archive.id' OR path_rel LIKE '%\\.akasyx\\archive.id')"
+        " ORDER BY path_abs LIMIT ?"
+    )
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        return [r[0] for r in conn.execute(sql, (scan_id, limit))]
+
+
 def scan_single_file(path: str) -> ScannedFile:
     """単一ファイルを crawler を使わずに直接読み取ります（設計書 §6.4）。
 

@@ -6,11 +6,10 @@ import logging
 import os
 from datetime import datetime
 
-from sqlalchemy import case
 
 import archives
 import mover
-from ingest import own_data_matcher
+from ingest import owning_query, own_data_matcher
 from database import tmp_dir
 from errors import PreflightError
 from models import (
@@ -18,9 +17,7 @@ from models import (
     RESOLUTION_GONE,
     RESOLUTION_TRASHED,
     RESULT_DUPLICATE,
-    STATUS_STORED,
     Archive,
-    ArchiveFile,
     Ingest,
     IngestItem,
     utcnow,
@@ -40,6 +37,8 @@ CHECK_ARCHIVE_MISSING = "archive_missing"
 CHECK_ARCHIVE_UNAVAILABLE = "archive_unavailable"
 # 消す対象が保存済みの実物そのもの（投入元が保存フォルダの中だった等）。消すと唯一の実物を失う
 CHECK_SAME_FILE = "same_file"
+# 投入元のファイルが保存フォルダ（.akasyx/archive.id のあるフォルダ）の中にある。その保存フォルダの保存物かもしれない
+CHECK_SOURCE_IN_ARCHIVE = "source_in_archive"
 
 
 def _pending_items(session, config):
@@ -65,7 +64,8 @@ def check_item(session, config, item, owner_roots: dict | None = None) -> tuple[
     ① 投入元のファイルが存在し、現在のハッシュが記録と一致する
     ② 同じ内容の stored 行があり（どの保存フォルダでもよい — #6）、実体があり、ハッシュが一致する
        実体がある保存フォルダにつながっていなければ消さない。消す対象が実体そのものでも消さない
-    owner_roots は保存フォルダごとの場所の確認結果のキャッシュ（1 回の実行で共有する）
+    ③ 投入元のファイルが保存フォルダの中にない（別の保存フォルダの保存物を消さない）
+    owner_roots は保存フォルダごとの場所などの確認結果のキャッシュ（1 回の実行で共有する）
     """
     src = item.source_path_abs
     if not src or not os.path.lexists(src):
@@ -78,55 +78,55 @@ def check_item(session, config, item, owner_roots: dict | None = None) -> tuple[
     if actual != item.filehash:
         return CHECK_SOURCE_CHANGED, f"Source file content has changed (now {actual})"
 
-    rows = _stored_candidates(session, config, item)
+    # 投入元がどこかの保存フォルダの中なら消さない。add の事前チェックより前の記録や、あとから投入元の
+    # フォルダを保存フォルダにした場合、消すと別の保存フォルダの保存物（DB は stored のまま）を失う（#6）
+    cache = owner_roots if owner_roots is not None else {}
+    inside = _enclosing_archive_cached(os.path.dirname(src), cache)
+    if inside is not None:
+        return CHECK_SOURCE_IN_ARCHIVE, f"The source file is inside an archive folder: {inside}"
+
+    rows = owning_query(
+        session, item.filehash, item.hash_algo, config.archive_id, stored_only=True
+    ).all()
     if not rows:
         return CHECK_ARCHIVE_MISSING, "No matching record in any archive folder"
+    # 判定時に参照した行を先に試す。どれか 1 つで検証できればよい（今の保存フォルダを優先 — #6）
+    rows.sort(key=lambda r: r.id != item.archive_file_id)
 
-    # 実物は、つながっている保存フォルダのものを使う（今の保存フォルダを優先 — #6）
-    cache = owner_roots if owner_roots is not None else {}
-    unavailable = None
+    failures = []
     for row in rows:
-        root, reason = _owner_root(session, config, row, cache)
-        if reason is None:
-            break
-        unavailable = unavailable or reason
-    else:
-        return CHECK_ARCHIVE_UNAVAILABLE, unavailable
+        verdict, message = _check_copy(session, config, src, item.filehash, row, cache)
+        if verdict in (CHECK_OK, CHECK_SAME_FILE):
+            return verdict, message
+        failures.append((verdict, message))
+    # 検証できる実物が無い。つながっていない保存フォルダがあればそれを理由にする（つないで実行し直せば消せる）
+    return next((f for f in failures if f[0] == CHECK_ARCHIVE_UNAVAILABLE), failures[0])
 
+
+def _check_copy(session, config, src, filehash, row, cache) -> tuple[str, str | None]:
+    """stored 行 1 つについて、保存フォルダの実物で検証します。"""
+    root, unavailable = _owner_root(session, config, row, cache)
+    if unavailable:
+        return CHECK_ARCHIVE_UNAVAILABLE, unavailable
     dst = from_posix(root, row.stored_path_rel)
     if not os.path.lexists(dst):
         return CHECK_ARCHIVE_MISSING, f"Archived file is missing: {dst}"
     try:
         if os.path.samefile(src, dst):
             return CHECK_SAME_FILE, f"The source is the archived file itself: {dst}"
+        if hashing.file_hash(dst) != filehash:
+            return CHECK_ARCHIVE_MISSING, f"Archived file content does not match: {dst}"
     except OSError as e:
         return CHECK_ARCHIVE_MISSING, f"Cannot read archived file: {e}"
-    try:
-        if hashing.file_hash(dst) != item.filehash:
-            return CHECK_ARCHIVE_MISSING, "Archived file content does not match"
-    except OSError as e:
-        return CHECK_ARCHIVE_MISSING, f"Cannot read archived file: {e}"
-
     return CHECK_OK, None
 
 
-def _stored_candidates(session, config, item) -> list:
-    """検証に使える stored 行（判定時に参照した行 → 今の保存フォルダ → 他の保存フォルダの順）。"""
-    rows = (
-        session.query(ArchiveFile)
-        .filter(
-            ArchiveFile.filehash == item.filehash,
-            ArchiveFile.hash_algo == item.hash_algo,
-            ArchiveFile.status == STATUS_STORED,
-        )
-        .order_by(
-            case((ArchiveFile.id == (item.archive_file_id or 0), 0), else_=1),
-            case((ArchiveFile.archive_id == config.archive_id, 0), else_=1),
-            ArchiveFile.id,
-        )
-        .all()
-    )
-    return rows
+def _enclosing_archive_cached(directory: str, cache: dict) -> str | None:
+    """archives.enclosing_archive をフォルダごとにキャッシュします（同じフォルダの重複が多いため）。"""
+    key = ("enclosing", directory)
+    if key not in cache:
+        cache[key] = archives.enclosing_archive(directory)
+    return cache[key]
 
 
 def _owner_root(session, config, row, cache: dict) -> tuple[str, str | None]:

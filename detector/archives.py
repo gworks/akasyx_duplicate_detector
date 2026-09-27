@@ -134,6 +134,24 @@ def _find_by_location(session, root: str) -> Archive | None:
     return matches[0]
 
 
+def enclosing_archive(path: str) -> str | None:
+    """path 自身か、その上位にある保存フォルダ（`.akasyx/archive.id` がある）を返します。無ければ None。
+
+    正本 DB の登録ではなく実物の目印で見る。移動したまま開いていない保存フォルダ、別の正本 DB の
+    保存フォルダも拾い、目印を消した（もう保存フォルダではない）フォルダは拾わない（#6）。
+    """
+    d = os.path.realpath(path)
+    if not os.path.isdir(d):
+        d = os.path.dirname(d)
+    while True:
+        if os.path.isfile(archive_id_path(d)):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
 def is_at_registered_location(row: Archive) -> bool:
     """登録上の場所に、この保存フォルダ（同じ uid）が今あるか。
 

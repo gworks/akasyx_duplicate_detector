@@ -146,11 +146,63 @@ def master_db_lock(archive_db: str):
     重複判定は全保存フォルダ共通だが、部分 UNIQUE 索引は保存フォルダ単位のまま。
     別の保存フォルダへの実行が同時に走ると、判定と予約の隙間で同じ内容が両方に入るため、
     同じ正本 DB を使う実行は 1 本に限る。
+
+    この排他が二重登録を防ぐ唯一の仕組みなので、PID ファイルの引き継ぎ（死んだ PID を読んで消して作り直す間に
+    別のプロセスが割り込める）ではなく OS のロック（flock / Windows は msvcrt.locking）を使う。
+    プロセスが落ちれば OS が外すので、引き継ぎの処理が要らない。正本 DB はローカルディスクに置く前提。
+    ロックファイルは消さずに残す（消すと、開いたままの別プロセスと別の実体をロックし合う隙間ができる）。
     """
     path = master_db_lock_path(archive_db)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with _pid_lock(
-        path,
-        "The master DB is in use by another process (possibly for another archive folder)",
-    ):
-        yield path
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        if not _try_os_lock(fd):
+            holder = ""
+            with contextlib.suppress(OSError):
+                holder = os.pread(fd, 32, 0).decode(errors="replace").strip() if hasattr(os, "pread") else ""
+            raise PreflightError(
+                "The master DB is in use by another process (possibly for another archive folder)"
+                f" (PID {holder or 'unknown'}): {path}"
+            )
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, str(os.getpid()).encode())
+        try:
+            yield path
+        finally:
+            with contextlib.suppress(OSError):
+                os.ftruncate(fd, 0)
+            _os_unlock(fd)
+    finally:
+        os.close(fd)
+
+
+def _try_os_lock(fd: int) -> bool:
+    if os.name == "nt":  # pragma: no cover - Windows
+        import msvcrt
+
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    import fcntl
+
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+
+
+def _os_unlock(fd: int) -> None:
+    with contextlib.suppress(OSError):
+        if os.name == "nt":  # pragma: no cover - Windows
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)

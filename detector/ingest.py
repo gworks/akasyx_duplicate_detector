@@ -8,6 +8,8 @@ from sqlalchemy import and_, case, or_
 import crawler_client
 import mover
 from config import OS_JUNK_FILES, OWN_DATA_DB, own_data_dirs, own_data_locations
+from database import META_DIRNAME
+from errors import PreflightError
 from models import (
     OWNING_STATUSES,
     RESULT_DUPLICATE,
@@ -38,18 +40,26 @@ def find_owning(session, filehash: str, hash_algo: str, archive_id: int) -> Arch
     消されると参照している判定記録が FK 違反で復旧を止めるため。
     複数あれば今の保存フォルダの行を優先する（delete-duplicates で、つながっている実物で検証できるように）。
     """
+    return owning_query(session, filehash, hash_algo, archive_id).first()
+
+
+def owning_query(
+    session, filehash: str, hash_algo: str, archive_id: int, stored_only: bool = False
+):
+    """同一内容の持ち主の候補（今の保存フォルダ → id 順）。add の判定と delete-duplicates の検証で共用する。
+
+    stored_only=True は実体が確定した行だけ（delete-duplicates の検証用）。
+    """
+    owning = ArchiveFile.status == STATUS_STORED
+    if not stored_only:
+        owning = or_(
+            owning,
+            and_(ArchiveFile.status.in_(OWNING_STATUSES), ArchiveFile.archive_id == archive_id),
+        )
     return (
         session.query(ArchiveFile)
-        .filter(
-            ArchiveFile.filehash == filehash,
-            ArchiveFile.hash_algo == hash_algo,
-            or_(
-                ArchiveFile.status == STATUS_STORED,
-                and_(ArchiveFile.status.in_(OWNING_STATUSES), ArchiveFile.archive_id == archive_id),
-            ),
-        )
+        .filter(ArchiveFile.filehash == filehash, ArchiveFile.hash_algo == hash_algo, owning)
         .order_by(case((ArchiveFile.archive_id == archive_id, 0), else_=1), ArchiveFile.id)
-        .first()
     )
 
 
@@ -136,6 +146,9 @@ def own_data_matcher(config, source: str | None = None):
         return p in db_files or any(key_within(d, p) for d in dirs)
 
     def is_own(path):
+        if META_DIRNAME in os.path.normpath(path).split(os.sep):
+            # 保存フォルダの管理用フォルダ（識別子の無いロック・作業ファイルの残り）。保存物ではない
+            return True
         if matches(path_key(path, real=False)):
             return True
         # --follow-symlinks だと投入元の中の symlink（~/dd → データフォルダ等）越しに自データが
@@ -152,6 +165,16 @@ def _collect_files(config):
         # .DS_Store 等の OS メタデータは保存する価値が無く、取り込むと保存フォルダが汚れる
         scan = crawler_client.run_crawler(source, config, extra_excludes=OS_JUNK_FILES)
         crawler_client.ensure_completed(scan)
+        markers = crawler_client.find_archive_markers(scan.db_path, scan.scan_id)
+        if markers:
+            # 中の保存フォルダの保存物を自分自身の重複と判定したり、識別子ごと移したりしないよう、
+            # 1 件も動かす前に断る（#6。登録の有無・正本 DB に関係なく目印で見る）
+            listed = "\n".join(f"  {os.path.dirname(os.path.dirname(m))}" for m in markers)
+            raise PreflightError(
+                "The source contains an archive folder (a folder with .akasyx/archive.id):\n"
+                f"{listed}\n"
+                "  Choose a source that does not include archive folders."
+            )
         return crawler_client.read_files(scan.db_path, scan.scan_id), scan
     # 単一ファイルは crawler を使わず直接読む（設計書 §6.4）
     return iter([crawler_client.scan_single_file(source)]), None
