@@ -14,10 +14,10 @@ import archives
 import crawler_client
 from config import OS_JUNK_FILES
 from database import META_DIRNAME
+from errors import PreflightError
 from models import (
     RESULT_ADOPTED,
     RESULT_ARCHIVE_DUPLICATE,
-    RESULT_FAILED,
     RESULT_SKIPPED_EMPTY,
     STATUS_UNREGISTERED,
     Archive,
@@ -30,7 +30,13 @@ logger = logging.getLogger(__name__)
 
 
 def run_adopt(session, config, ingest) -> tuple[str, dict]:
-    """保存フォルダの実体を登録します。戻り値は (実行ステータス, result 別件数)。"""
+    """保存フォルダの実体を登録します。戻り値は (実行ステータス, result 別件数)。
+
+    全部か無しか: 読めない場所・ハッシュを取れないファイルが 1 つでもあれば何も登録せずに断る。
+    一部だけ登録して確定すると、記録があるので adopt をやり直せず、登録し損ねた内容と同じファイルを
+    あとの add が重複として止めずに取り込む。直してから adopt をやり直せばよい。
+    """
+    archives.check_tree_readable(config.archive_root)
     scan = crawler_client.run_crawler(
         config.archive_root, config, extra_excludes=(f"{META_DIRNAME}/", *OS_JUNK_FILES)
     )
@@ -45,6 +51,7 @@ def run_adopt(session, config, ingest) -> tuple[str, dict]:
     counters: dict[str, int] = {}
     decisions: list[tuple[object, str, ArchiveFile | None, str | None]] = []
     first_of: dict[tuple[str, str], ArchiveFile] = {}
+    unreadable: list[str] = []
 
     try:
         for f in scanned:
@@ -53,8 +60,8 @@ def run_adopt(session, config, ingest) -> tuple[str, dict]:
                 decisions.append((f, RESULT_SKIPPED_EMPTY, None, f"size {f.size} is below min_size"))
                 continue
             if not f.filehash or not f.hash_algo:
-                # 読めなかった。登録すると重複判定に使えない行になるので登録せず、失敗として数える
-                decisions.append((f, RESULT_FAILED, None, "Cannot register: hash unavailable"))
+                # 読めなかった。1 つでもあれば全体を断る（下で）
+                unreadable.append(f.path_abs)
                 continue
             row = ArchiveFile(
                 archive_id=config.archive_id,
@@ -78,6 +85,16 @@ def run_adopt(session, config, ingest) -> tuple[str, dict]:
             else:
                 first_of[key] = row
                 decisions.append((f, RESULT_ADOPTED, row, None))
+
+        if unreadable:
+            session.rollback()
+            listed = "\n".join(f"  {p}" for p in unreadable[:5])
+            more = f"\n  ... and {len(unreadable) - 5} more" if len(unreadable) > 5 else ""
+            raise PreflightError(
+                f"{len(unreadable)} files could not be read, so adopt did not register anything:\n"
+                f"{listed}{more}\n"
+                "  Fix the permissions (or remove these files) and run adopt again."
+            )
 
         promoted = {id(r) for r in archives.promote_many(session, list(first_of.values()))}
         for i, (f, result, row, message) in enumerate(decisions):
@@ -113,11 +130,6 @@ def run_adopt(session, config, ingest) -> tuple[str, dict]:
         return "interrupted", {}
 
     logger.info(f"CSV report: {csv_file}")
-    if counters.get(RESULT_FAILED):
-        logger.warning(
-            f"{counters[RESULT_FAILED]} files could not be read and were not registered "
-            "(they are not used for duplicate detection). See the CSV report"
-        )
     return "completed", counters
 
 

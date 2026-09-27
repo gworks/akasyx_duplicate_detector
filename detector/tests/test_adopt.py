@@ -203,8 +203,12 @@ def test_adopt_skips_metadata_and_empty_files(make_config, tmp_path, fake_crawle
     assert names == ["2024/a.jpg", "2024/b.jpg"]
 
 
-def test_unreadable_files_are_reported_and_fail_the_run(make_config, tmp_path, monkeypatch, photos):
-    """ハッシュを取れなかったファイルは登録せず、件数を出して終了コードを 0 以外にする。"""
+def test_unreadable_file_makes_adopt_register_nothing(make_config, tmp_path, monkeypatch, photos):
+    """ハッシュを取れないファイルが 1 つでもあれば、何も登録せずに断る（直してからやり直せる）。
+
+    一部だけ登録して確定すると、記録があるので adopt をやり直せず、登録し損ねた内容と同じファイルを
+    あとの add が重複として止めずに取り込む。
+    """
     from conftest import build_crawler_db
     import sqlite3
     crawl_db = str(tmp_path / "c.db")
@@ -218,8 +222,32 @@ def test_unreadable_files_are_reported_and_fail_the_run(make_config, tmp_path, m
 
     monkeypatch.setattr(crawler_client, "resolve_crawler_repo", lambda path: path)
     monkeypatch.setattr(crawler_client, "run_crawler", _run)
-    assert main.run(make_config(mode=MODE_ADOPT, archive_root=photos)) == main.EXIT_HAS_FAILURES
-    assert _rows(tmp_path) == [("2024/a.jpg", STATUS_STORED)]
+    with pytest.raises(PreflightError, match="b.jpg"):
+        main.run(make_config(mode=MODE_ADOPT, archive_root=photos))
+    assert _rows(tmp_path) == []
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root は権限を無視して読める")
+def test_unreadable_folder_makes_adopt_register_nothing(make_config, tmp_path, fake_crawler, photos):
+    """読めないフォルダがあれば（crawler は黙って飛ばす）、走査の前に断り、何も登録しない。"""
+    locked = os.path.join(photos, "2019")
+    write_file(os.path.join(locked, "c.jpg"), b"CCCC")
+    os.chmod(locked, 0)
+    try:
+        with pytest.raises(PreflightError, match="2019"):
+            _adopt(make_config, photos, tmp_path, fake_crawler)
+        assert _rows(tmp_path) == []
+    finally:
+        os.chmod(locked, 0o755)
+    assert _adopt(make_config, photos, tmp_path, fake_crawler) == main.EXIT_OK  # 直せばやり直せる
+    assert ("2019/c.jpg", STATUS_STORED) in _rows(tmp_path)
+
+
+def test_nested_leftover_akasyx_is_not_counted_as_content(make_config, tmp_path):
+    """途中の階層の .akasyx/（識別子の無い残り）も、adopt と同じく中身として数えない。"""
+    root = str(tmp_path / "arch")
+    write_file(os.path.join(root, "sub", ".akasyx", "tmp", "x.part"), b"PART")
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=root)) == main.EXIT_OK
 
 
 def test_legacy_archive_is_migrated_not_adopted(make_config, tmp_path, fake_crawler):
@@ -267,28 +295,12 @@ def test_files_copied_after_an_empty_adopt_still_need_adopt(make_config, tmp_pat
     assert ("manual/x.jpg", STATUS_STORED) in _rows(tmp_path)
 
 
-def test_failed_count_is_not_doubled(make_config, tmp_path, monkeypatch, photos):
-    """実行記録の failed は、失敗した件数そのもの（2 倍にしない）。"""
-    from conftest import build_crawler_db
-    import sqlite3
-    from models import Ingest
-    crawl_db = str(tmp_path / "c.db")
-
-    def _run(target, config, extra_excludes=()):
-        scan_id = build_crawler_db(crawl_db, target, excludes=tuple(extra_excludes))
-        conn = sqlite3.connect(crawl_db)
-        conn.execute("UPDATE fs_files SET filehash = NULL, hash_algo = NULL WHERE name = 'b.jpg'")
-        conn.commit(); conn.close()
-        return crawler_client.CrawlerScan(db_path=crawl_db, scan_id=scan_id, status="completed", root_dir=target)
-
-    monkeypatch.setattr(crawler_client, "resolve_crawler_repo", lambda path: path)
-    monkeypatch.setattr(crawler_client, "run_crawler", _run)
-    main.run(make_config(mode=MODE_ADOPT, archive_root=photos))
-    sess, engine = _db(tmp_path)
-    try:
-        assert sess.query(Ingest).filter_by(mode=MODE_ADOPT).one().failed == 1
-    finally:
-        sess.close(); engine.dispose()
+def test_failed_count_is_not_doubled():
+    """実行記録の failed は、失敗した件数そのもの（RESULT_FAILED と "failed" は同じ文字列。2 倍にしない）。"""
+    from models import RESULT_FAILED, Ingest
+    record = Ingest()
+    main._apply_counters(record, {RESULT_FAILED: 1})
+    assert record.failed == 1
 
 
 def test_git_folder_is_not_counted_as_content(make_config, tmp_path):

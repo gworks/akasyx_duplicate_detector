@@ -71,11 +71,10 @@ def _has_stored_content(root: str) -> bool:
         raise PreflightError(f"Cannot read part of the archive folder: {e.filename}: {e}") from e
 
     for dirpath, dirs, names in os.walk(root, onerror=_unreadable):
-        if dirpath == root:
-            dirs[:] = [d for d in dirs if d != META_DIRNAME]
-        # crawler の組み込みの既定除外（akasyx_crawler ignore.DEFAULT_IGNORE_PATTERNS = [".git/"]、どの深さでも）。
+        # adopt・verify は crawler に --exclude .akasyx/ を渡す（gitignore の書き方なのでどの深さでも効く）。
+        # .git/ は crawler の組み込みの既定除外（akasyx_crawler ignore.DEFAULT_IGNORE_PATTERNS、どの深さでも）。
         # detector は --gitignore-mode off で呼ぶので、これ以外に crawler が黙って飛ばすものは無い
-        dirs[:] = [d for d in dirs if d != CRAWLER_DEFAULT_IGNORED_DIR]
+        dirs[:] = [d for d in dirs if d not in (META_DIRNAME, CRAWLER_DEFAULT_IGNORED_DIR)]
         for n in names:
             if n in OS_JUNK_FILES:
                 continue
@@ -284,6 +283,36 @@ def promote_many(session, rows) -> list:
         holders.setdefault(key, set()).add(r.archive_id)  # 同じ呼び出しの中で別の保存フォルダと重ならないように
         promoted.append(r)
     return promoted
+
+
+def check_tree_readable(root: str) -> None:
+    """root の配下がすべて読めることを確かめます（adopt の走査の前 — #4 / #5）。
+
+    crawler は読めないフォルダを警告だけ出して飛ばし、走査を completed で終える。adopt がそれを
+    知らずに確定すると一部だけ登録され、記録があるので adopt をやり直せず、登録し損ねた内容と同じ
+    ファイルをあとの add が取り込んでしまう。読めない場所があれば 1 件も登録する前に断る。
+    """
+    problems: list[str] = []
+
+    def _unreadable(e: OSError):
+        problems.append(f"{e.filename}: {e.strerror or e}")
+
+    for dirpath, dirs, names in os.walk(root, onerror=_unreadable):
+        dirs[:] = [d for d in dirs if d not in (META_DIRNAME, CRAWLER_DEFAULT_IGNORED_DIR)]
+        for n in names:
+            try:
+                os.lstat(os.path.join(dirpath, n))
+            except OSError as e:
+                _unreadable(e)
+        if len(problems) >= 5:
+            break
+    if problems:
+        listed = "\n".join(f"  {p}" for p in problems)
+        raise PreflightError(
+            "Part of the archive folder cannot be read, so adopt did not register anything:\n"
+            f"{listed}\n"
+            "  Fix the permissions (or remove these) and run adopt again."
+        )
 
 
 def is_at_registered_location(row: Archive) -> bool:
