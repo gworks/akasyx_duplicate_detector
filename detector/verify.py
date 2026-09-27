@@ -18,7 +18,6 @@ from models import (
     RESULT_RELOCATED,
     RESULT_UNREGISTERED,
     STATUS_MISSING,
-    STATUS_STORED,
     STATUS_UNREGISTERED,
     ArchiveFile,
     IngestItem,
@@ -198,10 +197,9 @@ def _revive_missing(session, archive_id, found, key, owning_hashes) -> ArchiveFi
     )
     if row is None:
         return None
-    if archives.stored_in_other_archive(session, found.filehash, found.hash_algo, archive_id):
+    if not archives.promote_many(session, [row]):
         # 別の保存フォルダに stored がある（外していた間に保存された等）。stored は全体で 1 つ（#6）
         return None
-    row.status = STATUS_STORED
     row.stored_path_rel = found.path_rel
     row.verified_at = utcnow()
     row.disposition = None

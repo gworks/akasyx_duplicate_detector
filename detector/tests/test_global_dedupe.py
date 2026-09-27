@@ -852,8 +852,14 @@ def test_forget_refuses_folder_present_without_id(make_config, tmp_path, fake_cr
     assert _stored_count(tmp_path, b"SAME") == 1
 
 
-def test_restore_keeps_duplicates_that_existed_before_forget(make_config, tmp_path, fake_crawler):
-    """forget より前から別の保存フォルダにも stored だった内容（#6 以前のデータ）は、戻すときに降格しない。"""
+def test_restore_keeps_one_stored_even_for_duplicates_from_before_forget(
+    make_config, tmp_path, fake_crawler
+):
+    """forget より前から別の保存フォルダにも stored だった内容（#6 以前のデータ）も、戻すときは全体で 1 つに寄せる。
+
+    規則は「今、別の保存フォルダに stored があれば stored にしない」の 1 つだけ（2026-09-27 レビュー 8 回目で単純化）。
+    外れた記録は missing になるだけで、ファイルは消えない（次の verify で未登録として拾われる）。
+    """
     n, b, src_n, src_b = _dirs(tmp_path, "nas_archive", "archive_b", "in_n", "in_b")
     write_file(os.path.join(src_n, "x.txt"), b"SAME")
     assert _add(make_config, n, src_n, tmp_path, fake_crawler) == main.EXIT_OK
@@ -877,7 +883,8 @@ def test_restore_keeps_duplicates_that_existed_before_forget(make_config, tmp_pa
     assert main.main(argv) == main.EXIT_OK
     shutil.move(unplugged, n)
     assert main.run(make_config(mode=MODE_REPORT, archive_root=n)) == main.EXIT_OK
-    assert _stored_count(tmp_path, b"SAME") == 2  # forget 前の状態に戻る
+    assert _stored_count(tmp_path, b"SAME") == 1
+    assert os.path.exists(os.path.join(n, *_stored_rel_in(tmp_path, n, b"SAME")))  # ファイルは残る
 
 
 def test_duplicates_in_unavailable_archive_are_reported(make_config, tmp_path, fake_crawler, capsys):
@@ -1013,3 +1020,113 @@ def test_restore_path_check_matches_sqlite_lower(session, tmp_path):
     session.commit()
     archives.resolve_archive(session, root)
     assert session.query(ArchiveFile).filter_by(filehash="h1").one().status == STATUS_STORED
+
+
+def _stored_rel_in(tmp_path, root, content: bytes):
+    import hashlib
+    aid = _archive_id_of(tmp_path, root)
+    sess, engine = _db(tmp_path)
+    try:
+        row = sess.query(ArchiveFile).filter_by(
+            archive_id=aid, filehash=hashlib.sha256(content).hexdigest()
+        ).one()
+        return row.stored_path_rel.split("/")
+    finally:
+        sess.close(); engine.dispose()
+
+
+# --- レビュー指摘 8 回目（2026-09-27）: stored への遷移を 1 か所に集める ---------------------------
+
+
+def test_promote_is_the_single_rule(session, tmp_path):
+    """promote_many は「今、別の保存フォルダに stored があれば stored にしない」だけで決める。"""
+    import archives
+    from models import STATUS_MISSING, Archive
+    other = Archive(uid="o", root_abs=str(tmp_path / "o"))
+    session.add(other)
+    session.commit()
+    session.add(ArchiveFile(archive_id=other.id, filehash="h1", hash_algo="sha256", size=1,
+                            name="a", stored_path_rel="a", status=STATUS_STORED))
+    mine = [
+        ArchiveFile(archive_id=1, filehash="h1", hash_algo="sha256", size=1, name="a",
+                    stored_path_rel="a", status=STATUS_MISSING),
+        ArchiveFile(archive_id=1, filehash="h2", hash_algo="sha256", size=1, name="b",
+                    stored_path_rel="b", status=STATUS_MISSING),
+    ]
+    session.add_all(mine)
+    session.commit()
+    promoted = archives.promote_many(session, mine)
+    assert [r.filehash for r in promoted] == ["h2"]
+    assert mine[0].status == STATUS_MISSING and mine[1].status == STATUS_STORED
+
+
+def test_unavailable_owner_note_prefers_connected_copy(make_config, tmp_path, fake_crawler, capsys):
+    """同じ内容がつながっている別の保存フォルダにもあれば、「そこにしか無い」とも forget とも案内しない。"""
+    b, c, a, src_b, src_c, src_a = _dirs(tmp_path, "archive_b", "archive_c", "archive_a", "in_b", "in_c", "in_a")
+    write_file(os.path.join(src_b, "x.txt"), b"SAME")
+    assert _add(make_config, b, src_b, tmp_path, fake_crawler) == main.EXIT_OK
+    write_file(os.path.join(src_c, "seed.txt"), b"SEED")
+    assert _add(make_config, c, src_c, tmp_path, fake_crawler) == main.EXIT_OK
+    cid = _archive_id_of(tmp_path, c)
+    copy = write_file(os.path.join(c, "old", "x.txt"), b"SAME")
+    sess, engine = _db(tmp_path)
+    try:  # #6 以前のデータで C にもあった
+        sess.add(ArchiveFile(archive_id=cid, filehash=_file_hash(copy), hash_algo="sha256", size=4,
+                             name="x.txt", stored_path_rel="old/x.txt", status=STATUS_STORED))
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    shutil.move(b, str(tmp_path / "unplugged"))  # B（id が小さい）が外れている
+    write_file(os.path.join(src_a, "y.txt"), b"SAME")
+    capsys.readouterr()
+    assert _add(make_config, a, src_a, tmp_path, fake_crawler) == main.EXIT_OK
+    assert "--forget" not in capsys.readouterr().out
+    sess, engine = _db(tmp_path)
+    try:
+        item = sess.query(IngestItem).filter_by(name="y.txt").one()
+        assert "--forget" not in item.message and c in item.message
+    finally:
+        sess.close(); engine.dispose()
+
+
+def test_dedupe_checks_other_archives_only_when_needed(make_config, tmp_path, fake_crawler, monkeypatch):
+    """今の保存フォルダの実物で検証できれば、別の保存フォルダがつながっているかは確かめない。"""
+    import archives
+    a, b, leftover = _seed_cross(make_config, tmp_path, fake_crawler)
+    bid = _archive_id_of(tmp_path, b)
+    copy = write_file(os.path.join(b, "old", "x.txt"), b"SAME")
+    sess, engine = _db(tmp_path)
+    try:
+        sess.add(ArchiveFile(archive_id=bid, filehash=_file_hash(copy), hash_algo="sha256", size=4,
+                             name="x.txt", stored_path_rel="old/x.txt", status=STATUS_STORED))
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    calls = []
+    real = archives.ArchiveLookup.available
+    monkeypatch.setattr(archives.ArchiveLookup, "available", lambda self, row: calls.append(row.id) or real(self, row))
+    cfg = make_config(mode=MODE_DELETE_DUPLICATES, archive_root=b, assume_yes=True)
+    assert main.run(cfg) == main.EXIT_OK
+    assert not os.path.exists(leftover)
+    assert calls == []
+
+
+def test_archives_below_limit_excludes_root(tmp_path):
+    import archives
+    root = tmp_path / "root"
+    write_file(str(root / ".akasyx" / "archive.db"), b"legacy")
+    for i in range(5):
+        write_file(str(root / f"n{i}" / ".akasyx" / "archive.id"), b"x\n")
+    found = archives.archives_below(str(root), exclude_root=True)
+    assert len(found) == 5 and str(root) not in found
+
+
+def test_dedupe_verdicts_have_ui_labels():
+    import json
+    import pathlib
+    loc = pathlib.Path(__file__).resolve().parents[2] / "electron-ui" / "locales"
+    for f in loc.glob("*.json"):
+        d = json.loads(f.read_text(encoding="utf-8"))
+        for v in ("verified", "gone", "source_changed", "archive_missing",
+                  "archive_unavailable", "source_in_archive", "same_file", "skipped_in_archive"):
+            assert f"result_{v}" in d, (f.name, v)

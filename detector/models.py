@@ -36,9 +36,6 @@ STATUS_UNREGISTERED = "unregistered"  # 実体はあるが DB に無かった（
 STATUS_QUARANTINED = "quarantined"    # 隔離フォルダへ移動済み（将来拡張）
 STATUS_FAILED = "failed"              # 復旧で判断がつかなかった（人の確認待ち）
 STATUS_FORGOTTEN = "forgotten"        # archives --forget で外した stored（#6）。同じ保存フォルダが戻れば stored に戻す
-# forget した時点で別の保存フォルダにも同じ内容が stored だった（#6 以前の保存フォルダ単位の判定で入ったもの）。
-# 戻すときに「別の保存フォルダにある」ことを理由に降格しない
-STATUS_FORGOTTEN_SHARED = "forgotten_shared"
 
 # 内容を「保持している」状態。重複判定と部分 UNIQUE 索引の対象（設計書 §8）。
 # missing / unregistered を外すことで、消えたファイルと同内容のものを後から再登録できる。

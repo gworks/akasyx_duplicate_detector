@@ -5,11 +5,10 @@
 import logging
 import os
 import sqlite3
-import string
 import uuid
 from datetime import datetime
 
-from sqlalchemy.orm import aliased
+from sqlalchemy import func
 
 from config import OS_JUNK_FILES
 from database import META_DIRNAME, archive_id_path, legacy_db_path, meta_dir, tmp_dir
@@ -17,7 +16,6 @@ from errors import PreflightError
 from models import (
     PATH_HOLDING_STATUSES,
     STATUS_FORGOTTEN,
-    STATUS_FORGOTTEN_SHARED,
     STATUS_UNREGISTERED,
     STATUS_MISSING,
     STATUS_STORED,
@@ -165,7 +163,9 @@ def enclosing_archive(path: str) -> str | None:
     return ArchiveLookup().enclosing(path)
 
 
-def archives_below(root: str, follow_symlinks: bool = False, limit: int = 5) -> list[str]:
+def archives_below(
+    root: str, follow_symlinks: bool = False, limit: int = 5, exclude_root: bool = False
+) -> list[str]:
     """root の中にある保存フォルダ（`.akasyx/archive.id` のあるフォルダ）を返します（最大 limit 件）。
 
     add の事前チェック用。crawler の走査（全ハッシュ）より前に断れるよう、メタデータだけを歩く。
@@ -186,7 +186,7 @@ def archives_below(root: str, follow_symlinks: bool = False, limit: int = 5) -> 
                 continue
             seen.add((st.st_dev, st.st_ino))
         if META_DIRNAME in dirnames:
-            if has_archive_marker(dirpath):
+            if has_archive_marker(dirpath) and not (exclude_root and dirpath == root):
                 found.append(dirpath)
                 if len(found) >= limit:
                     break
@@ -241,23 +241,32 @@ class ArchiveLookup:
         return self._available[row.id]
 
 
-def stored_in_other_archive(session, filehash: str, hash_algo: str, archive_id: int):
-    """同じ内容を stored で持つ別の保存フォルダの行（無ければ None）。
+def promote_many(session, rows) -> list:
+    """rows を stored にします。同じ内容が今、別の保存フォルダに stored なら stored にしません（#6）。
 
-    重複判定は全保存フォルダ共通なので、同じ内容の stored は全体で 1 つにする（#6）。add 以外で行を
-    stored にする経路（中断の復旧・verify の復活・forget の取り消し）はこれで確かめる。
+    「同じ内容の stored は全保存フォルダで 1 つ」を守る唯一の入口。add 以外で行を stored にする経路
+    （中断の復旧・verify の missing 復活・v0.1.x の DB の取り込み・forget の取り消し）はすべてここを通す。
+    add は判定（find_owning）と正本 DB のロックで同じことを守っている。
+    stored にしなかった行は触らない（どうするかは呼び出し側が決める）。戻り値は stored にした行。
     """
-    return (
-        session.query(ArchiveFile)
-        .filter(
-            ArchiveFile.filehash == filehash,
-            ArchiveFile.hash_algo == hash_algo,
-            ArchiveFile.status == STATUS_STORED,
-            ArchiveFile.archive_id != archive_id,
-        )
-        .order_by(ArchiveFile.id)
-        .first()
-    )
+    rows = list(rows)
+    hashes = sorted({r.filehash for r in rows if r.filehash})
+    holders: dict[tuple[str, str], set[int]] = {}
+    for i in range(0, len(hashes), 500):  # SQLite の変数の上限を超えないよう分ける
+        chunk = hashes[i : i + 500]
+        for h, algo, aid in session.query(
+            ArchiveFile.filehash, ArchiveFile.hash_algo, ArchiveFile.archive_id
+        ).filter(ArchiveFile.status == STATUS_STORED, ArchiveFile.filehash.in_(chunk)):
+            holders.setdefault((h, algo), set()).add(aid)
+    promoted = []
+    for r in rows:
+        key = (r.filehash, r.hash_algo)
+        if holders.get(key, set()) - {r.archive_id}:
+            continue
+        r.status = STATUS_STORED
+        holders.setdefault(key, set()).add(r.archive_id)  # 同じ呼び出しの中で別の保存フォルダと重ならないように
+        promoted.append(r)
+    return promoted
 
 
 def is_at_registered_location(row: Archive) -> bool:
@@ -328,7 +337,7 @@ def resolve_archive(session, archive_root: str) -> Archive:
     if row is None:
         # 新しく登録する保存フォルダの中に別の保存フォルダがあれば断る（#6）。中の保存物を verify が
         # 未登録として拾い、同じ実体を 2 つの保存フォルダが持つことになる。歩くのは初回の登録時だけ
-        nested = [d for d in archives_below(root) if os.path.realpath(d) != root]
+        nested = archives_below(root, exclude_root=True)
         if nested:
             listed = "\n".join(f"  {d}" for d in nested)
             raise PreflightError(
@@ -424,9 +433,7 @@ def import_legacy_db(session, archive: Archive, legacy_path: str) -> dict | None
             if data.get("ingest_id") is not None:
                 data["ingest_id"] = ingest_ids.get(data["ingest_id"])
             obj = ArchiveFile(archive_id=archive.id, **data)
-            if obj.status == STATUS_STORED and stored_in_other_archive(
-                session, obj.filehash, obj.hash_algo, archive.id
-            ):
+            if obj.status == STATUS_STORED and not promote_many(session, [obj]):
                 # 同じ内容の stored は全体で 1 つ（#6）。実体は残るので未登録として取り込む
                 obj.status = STATUS_UNREGISTERED
             session.add(obj)
@@ -517,72 +524,42 @@ def _fix_datetimes(data: dict) -> None:
                 data[key] = None
 
 
-def _ids_stored_elsewhere(session, archive_id: int, statuses) -> set[int]:
-    """この保存フォルダの statuses の行のうち、同じ内容が別の保存フォルダに stored な行の id。"""
-    other = aliased(ArchiveFile)
-    rows = (
-        session.query(ArchiveFile.id)
-        .join(
-            other,
-            (other.filehash == ArchiveFile.filehash) & (other.hash_algo == ArchiveFile.hash_algo),
-        )
-        .filter(
-            ArchiveFile.archive_id == archive_id,
-            ArchiveFile.status.in_(statuses),
-            other.status == STATUS_STORED,
-            other.archive_id != archive_id,
-        )
-        .distinct()
-    )
-    return {i for (i,) in rows}
-
-
-def _sqlite_lower(s: str) -> str:
-    """SQLite の lower() と同じ（ASCII だけ小文字にする）。mover._path_taken_in_db の比べ方と揃える。"""
-    return s.translate(_ASCII_LOWER)
-
-
-_ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
-
-
 def _settle_forgotten(session, row: Archive, returned: bool) -> None:
-    """archives --forget で外した記録を、保存フォルダを開いたときに片付けます（#6）。
+    """archives --forget で外した記録（forgotten）を、保存フォルダを開いたときに片付けます（#6）。
 
-    - 識別子（uid）で見つかった = 外していた保存フォルダそのものが戻った: stored に戻す。ただし
-      forgotten（forget の時点では全体で 1 つだった）のうち、今は別の保存フォルダにも stored があるもの、
-      同じパスが別の行に使われているものは戻さず missing にする（stored は全体で 1 つ）。
-      forgotten_shared（forget の時点で既に別の保存フォルダにもあった＝#6 以前のデータ）は元どおり戻す
-    - 場所の一致だけ（消した跡に作り直したフォルダ等）: 元の保存物はもう無いので missing にする
-    実体が本当に無くなっていれば、次の verify が missing にする。
+    - 識別子（uid）で見つかった = 外していた保存フォルダそのものが戻った: promote_many で stored に戻す
+      （今、別の保存フォルダに stored がある内容は戻さない）。同じパスが別の行に使われているものも戻さない
+    - 場所の一致だけ（消した跡に作り直したフォルダ等）: 元の保存物はもう無い
+    戻さなかった行は missing にする。ファイルは触らない（実体があれば次の verify が未登録として拾う）。
     """
-    forgotten = (STATUS_FORGOTTEN, STATUS_FORGOTTEN_SHARED)
     rows = (
-        session.query(ArchiveFile)
-        .filter(ArchiveFile.archive_id == row.id, ArchiveFile.status.in_(forgotten))
+        session.query(ArchiveFile, func.lower(ArchiveFile.stored_path_rel))
+        .filter(ArchiveFile.archive_id == row.id, ArchiveFile.status == STATUS_FORGOTTEN)
         .order_by(ArchiveFile.id)
         .all()
     )
     if not rows:
         return
-    restored = 0
+    candidates = []
     if returned:
-        stored_elsewhere = _ids_stored_elsewhere(session, row.id, [STATUS_FORGOTTEN])
+        # パスの衝突は mover._path_taken_in_db と同じく SQL の lower() で比べる
         taken = {
-            _sqlite_lower(p)
-            for (p,) in session.query(ArchiveFile.stored_path_rel).filter(
+            p
+            for (p,) in session.query(func.lower(ArchiveFile.stored_path_rel)).filter(
                 ArchiveFile.archive_id == row.id, ArchiveFile.status.in_(PATH_HOLDING_STATUSES)
             )
         }
-    for f in rows:
-        if returned and f.id not in stored_elsewhere and _sqlite_lower(f.stored_path_rel) not in taken:
-            f.status = STATUS_STORED
-            taken.add(_sqlite_lower(f.stored_path_rel))
-            restored += 1
-        else:
+        for f, lowered in rows:
+            if lowered not in taken:
+                taken.add(lowered)
+                candidates.append(f)
+    restored = promote_many(session, candidates)
+    for f, _ in rows:
+        if f.status == STATUS_FORGOTTEN:
             f.status = STATUS_MISSING
     session.commit()
     logger.info(
-        f"Archive folder #{row.id} was forgotten: restored {restored} of {len(rows)} records"
+        f"Archive folder #{row.id} was forgotten: restored {len(restored)} of {len(rows)} records"
         + ("" if returned else " (not the same folder; the records are left as missing)")
     )
 
@@ -613,11 +590,9 @@ def forget_archive(session, archive_id: int) -> int:
         .filter(ArchiveFile.archive_id == archive_id, ArchiveFile.status == STATUS_STORED)
         .all()
     )
-    shared = _ids_stored_elsewhere(session, archive_id, [STATUS_STORED])
     for f in rows:
-        # 消したのではなく外れていただけなら、開き直したときに戻す（_settle_forgotten）。
-        # この時点で別の保存フォルダにもあった内容は印を分けておく（戻すときに降格しない）
-        f.status = STATUS_FORGOTTEN_SHARED if f.id in shared else STATUS_FORGOTTEN
+        # 消したのではなく外れていただけなら、開き直したときに戻す（_settle_forgotten）
+        f.status = STATUS_FORGOTTEN
     session.commit()
     logger.info(
         f"Forgot archive folder #{archive_id} ({row.root_abs}): "

@@ -115,6 +115,17 @@ def owner_location(session, row: ArchiveFile, config=None, lookup=None) -> str:
     lookup = lookup or archives.ArchiveLookup()
     available, _reason = lookup.available(archive)
     if not available:
+        # 同じ内容がつながっている別の保存フォルダにもあれば（#6 以前のデータ等）、そちらを示す。
+        # 「そこにしか無い」「消したなら forget」と案内すると、外していただけの保存フォルダを forget させてしまう
+        for other in owning_query(session, row.filehash, row.hash_algo, config.archive_id, stored_only=True):
+            other_archive = session.get(Archive, other.archive_id)
+            if other.id != row.id and other_archive is not None and (
+                other.archive_id == config.archive_id or lookup.available(other_archive)[0]
+            ):
+                return (
+                    f"Same content already in archive folder {other_archive.root_abs}: "
+                    f"{other.stored_path_rel}"
+                )
         lookup.unavailable_duplicates[row.archive_id] = (
             lookup.unavailable_duplicates.get(row.archive_id, 0) + 1
         )

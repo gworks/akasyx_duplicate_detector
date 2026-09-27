@@ -92,23 +92,27 @@ def check_item(
     ).all()
     if not rows:
         return CHECK_ARCHIVE_MISSING, "No matching record in any archive folder"
-    # 判定時に参照した行を先に試す。どれか 1 つで検証できればよい（今の保存フォルダを優先 — #6）
-    rows.sort(key=lambda r: r.id != item.archive_file_id)
+    # どれか 1 つで検証できればよい（#6）
+    # 今の保存フォルダ（確認の I/O が要らない）→ 判定時に参照した行 → その他の順
+    rows.sort(key=lambda r: (r.archive_id != config.archive_id, r.id != item.archive_file_id))
 
     # 消す対象のパスが、どれかの保存物のパスそのものなら消さない（前の候補で検証が通っても）。
     # 今の判定順では source_in_archive が先に止めるので通常はここに来ないが、目印の判定をすり抜けたときに
     # 唯一の実物を消さないための二重の守りとして残す（test_same_file_is_checked_against_every_copy）。
+    # 登録上の場所との文字列の比較だけなので、つながっていない保存フォルダに I/O をかけない。
     # 最後の要素は解かない（ハードリンクや保存物を指すシンボリックリンクは、消えるのがリンクだけなので消してよい）
     src_key = path_key(
         os.path.join(os.path.realpath(os.path.dirname(src)), os.path.basename(src)), real=False
     )
-    located = [(row, *_owner_root(session, config, row, lookup)) for row in rows]
-    for row, root, unavailable in located:
-        if not unavailable and path_key(from_posix(root, row.stored_path_rel)) == src_key:
-            return CHECK_SAME_FILE, f"The source is the archived file itself: {from_posix(root, row.stored_path_rel)}"
+    for row in rows:
+        registered = _registered_root(session, config, row)
+        if registered and path_key(from_posix(registered, row.stored_path_rel)) == src_key:
+            return CHECK_SAME_FILE, f"The source is the archived file itself: {from_posix(registered, row.stored_path_rel)}"
 
+    # 実物で検証する。別の保存フォルダがつながっているかは、その候補の番が来たときに初めて確かめる
     failures = []
-    for row, root, unavailable in located:
+    for row in rows:
+        root, unavailable = _owner_root(session, config, row, lookup)
         if unavailable:
             failures.append((CHECK_ARCHIVE_UNAVAILABLE, unavailable))
             continue
@@ -118,6 +122,14 @@ def check_item(
         failures.append((verdict, message))
     # 検証できる実物が無い。つながっていない保存フォルダがあればそれを理由にする（つないで実行し直せば消せる）
     return next((f for f in failures if f[0] == CHECK_ARCHIVE_UNAVAILABLE), failures[0])
+
+
+def _registered_root(session, config, row) -> str | None:
+    """行の保存フォルダの場所（今の保存フォルダは起動時に確かめた場所、別の保存フォルダは登録上の場所）。I/O なし。"""
+    if row.archive_id == config.archive_id:
+        return config.archive_root
+    archive = session.get(Archive, row.archive_id)
+    return archive.root_abs if archive is not None else None
 
 
 def _check_copy(dst, filehash) -> tuple[str, str | None]:
