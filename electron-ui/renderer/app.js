@@ -6,9 +6,10 @@ const LOG_TRIM = 1000;
 
 // 進捗チップの並び順（detector の result 値そのまま届く）。表示名は辞書の result_<値>
 const RESULT_ORDER = [
-  'moved', 'duplicate', 'skipped_empty', 'skipped_nohash', 'skipped_own_data', 'failed',
+  'moved', 'duplicate', 'skipped_empty', 'skipped_nohash', 'skipped_own_data', 'skipped_in_archive', 'failed',
   'ok', 'missing', 'unregistered', 'archive_duplicate', 'hash_mismatch',
   'check_ok', 'deleted', 'moved_to_trash',
+  'verified', 'gone', 'source_changed', 'archive_missing', 'archive_unavailable', 'source_in_archive', 'same_file',
 ];
 
 const el = (id) => document.getElementById(id);

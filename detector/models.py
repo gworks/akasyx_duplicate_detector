@@ -35,6 +35,7 @@ STATUS_MISSING = "missing"            # DB にはあるが実体が無い（削�
 STATUS_UNREGISTERED = "unregistered"  # 実体はあるが DB に無かった（verify が事後登録）
 STATUS_QUARANTINED = "quarantined"    # 隔離フォルダへ移動済み（将来拡張）
 STATUS_FAILED = "failed"              # 復旧で判断がつかなかった（人の確認待ち）
+STATUS_FORGOTTEN = "forgotten"        # archives --forget で外した stored（#6）。同じ保存フォルダが戻れば stored に戻す
 
 # 内容を「保持している」状態。重複判定と部分 UNIQUE 索引の対象（設計書 §8）。
 # missing / unregistered を外すことで、消えたファイルと同内容のものを後から再登録できる。
@@ -56,6 +57,7 @@ RESULT_DUPLICATE = "duplicate"                # add: 内容重複のため投入
 RESULT_SKIPPED_EMPTY = "skipped_empty"        # add: 0 バイト（min_size 未満）
 RESULT_SKIPPED_NOHASH = "skipped_nohash"      # add: ハッシュが無く判定不能
 RESULT_SKIPPED_OWN_DATA = "skipped_own_data"  # add: detector 自身のデータ（投入元の中にあった）
+RESULT_SKIPPED_IN_ARCHIVE = "skipped_in_archive"  # add: 実体が保存フォルダの中（シンボリックリンクを辿った先）
 RESULT_FAILED = "failed"                      # add / 復旧: 処理に失敗した
 RESULT_ARCHIVE_DUPLICATE = "archive_duplicate"  # verify: 保存フォルダ内の重複
 RESULT_HASH_MISMATCH = "hash_mismatch"        # verify: DB と実体のハッシュが違う

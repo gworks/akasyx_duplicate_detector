@@ -44,10 +44,10 @@ def test_resolve_rewrites_missing_id_file_by_path(session, archive):
     assert os.path.exists(archive_id_path(archive))
 
 
-def test_two_archives_do_not_share_duplicates(
+def test_two_archives_share_duplicates(
     make_config, tmp_path, fake_crawler
 ):
-    """同じ内容でも保存フォルダが違えば別々に保存される（重複判定は保存フォルダ単位）。"""
+    """保存フォルダが違っても同じ内容は 1 つだけ保存される（重複判定は全保存フォルダ共通 — #6）。"""
     a = tmp_path / "archive_a"; a.mkdir()
     b = tmp_path / "archive_b"; b.mkdir()
     src_a = tmp_path / "in_a"; src_a.mkdir()
@@ -59,9 +59,9 @@ def test_two_archives_do_not_share_duplicates(
     sess, engine = get_session(archive_db_path(tmp_path))
     try:
         rows = sess.query(ArchiveFile).filter_by(status=STATUS_STORED).all()
-        assert len(rows) == 2
-        assert len({r.archive_id for r in rows}) == 2
-        assert sess.query(Archive).count() >= 2
+        assert len(rows) == 1
+        assert sess.query(Archive).count() == 2
+        assert os.path.exists(os.path.join(str(src_b), "y.txt"))  # 重複として投入元に残る
     finally:
         sess.close(); engine.dispose()
 

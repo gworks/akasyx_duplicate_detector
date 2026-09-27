@@ -3,9 +3,13 @@ import logging
 import os
 from datetime import datetime
 
+from sqlalchemy import and_, case, or_
+
+import archives
 import crawler_client
 import mover
 from config import OS_JUNK_FILES, OWN_DATA_DB, own_data_dirs, own_data_locations
+from database import META_DIRNAME
 from models import (
     OWNING_STATUSES,
     RESULT_DUPLICATE,
@@ -13,7 +17,10 @@ from models import (
     RESULT_MOVED,
     RESULT_SKIPPED_EMPTY,
     RESULT_SKIPPED_NOHASH,
+    RESULT_SKIPPED_IN_ARCHIVE,
     RESULT_SKIPPED_OWN_DATA,
+    STATUS_STORED,
+    Archive,
     ArchiveFile,
     IngestItem,
 )
@@ -25,23 +32,40 @@ logger = logging.getLogger(__name__)
 COMMIT_INTERVAL = 100
 
 
-def find_owning(session, archive_id: int, filehash: str, hash_algo: str) -> ArchiveFile | None:
-    """同一内容を保持している行を返します（同じ保存フォルダ・同一 hash_algo 同士でのみ照合）。"""
+def find_owning(session, filehash: str, hash_algo: str, archive_id: int) -> ArchiveFile | None:
+    """同一内容を保持している行を返します（同一 hash_algo 同士でのみ照合）。
+
+    正本 DB に登録された全保存フォルダが対象（#6）。どこかの保存フォルダに同じ内容があれば重複。
+    ただし pending は今の保存フォルダのもの（= この実行の予約。前回の中断分は起動時に復旧済み）だけ数える。
+    別の保存フォルダの pending は中断の残りで、実体がどこにも無いかもしれず、その保存フォルダの復旧で
+    消されると参照している判定記録が FK 違反で復旧を止めるため。
+    複数あれば今の保存フォルダの行を優先する（delete-duplicates で、つながっている実物で検証できるように）。
+    """
+    return owning_query(session, filehash, hash_algo, archive_id).first()
+
+
+def owning_query(
+    session, filehash: str, hash_algo: str, archive_id: int, stored_only: bool = False
+):
+    """同一内容の持ち主の候補（今の保存フォルダ → id 順）。add の判定と delete-duplicates の検証で共用する。
+
+    stored_only=True は実体が確定した行だけ（delete-duplicates の検証用）。
+    """
+    owning = ArchiveFile.status == STATUS_STORED
+    if not stored_only:
+        owning = or_(
+            owning,
+            and_(ArchiveFile.status.in_(OWNING_STATUSES), ArchiveFile.archive_id == archive_id),
+        )
     return (
         session.query(ArchiveFile)
-        .filter(
-            ArchiveFile.archive_id == archive_id,
-            ArchiveFile.filehash == filehash,
-            ArchiveFile.hash_algo == hash_algo,
-            ArchiveFile.status.in_(OWNING_STATUSES),
-        )
-        .order_by(ArchiveFile.id)
-        .first()
+        .filter(ArchiveFile.filehash == filehash, ArchiveFile.hash_algo == hash_algo, owning)
+        .order_by(case((ArchiveFile.archive_id == archive_id, 0), else_=1), ArchiveFile.id)
     )
 
 
 def judge(
-    session, scanned, config, virtual_hashes: set | None = None
+    session, scanned, config, virtual_hashes: set | None = None, lookup=None
 ) -> tuple[str, ArchiveFile | None, str | None]:
     """1ファイルの判定（設計書 §7.1 の判定表）。上から順に評価する。
 
@@ -64,7 +88,7 @@ def judge(
         # dry-run で、同じ実行内の先行ファイルが取り込み対象になっている
         return RESULT_DUPLICATE, None, "Same content as an earlier file in this run"
 
-    existing = find_owning(session, config.archive_id, *key)
+    existing = find_owning(session, *key, config.archive_id)
     if existing is not None:
         if existing.size != scanned.size:
             return (
@@ -72,12 +96,47 @@ def judge(
                 existing,
                 f"Hash matches but size differs (DB {existing.size} / actual {scanned.size})",
             )
-        return RESULT_DUPLICATE, existing, None
+        return RESULT_DUPLICATE, existing, owner_location(session, existing, config, lookup)
 
     return RESULT_MOVED, None, None
 
 
-_SQLITE_SIDECARS = ("", "-wal", "-shm", "-journal")
+def owner_location(session, row: ArchiveFile, config=None, lookup=None) -> str:
+    """同じ内容がどの保存フォルダのどこにあるかを表す文字列（CSV・ログ用）。
+
+    別の保存フォルダが今つながっていなければそう書き、消した保存フォルダなら登録を外す方法を示す
+    （消えた保存フォルダの記録が重複判定を塞ぎ続けないように — #6）。確認は保存フォルダごとに 1 回。
+    """
+    archive = session.get(Archive, row.archive_id)
+    root = archive.root_abs if archive is not None else f"#{row.archive_id}"
+    message = f"Same content already in archive folder {root}: {row.stored_path_rel}"
+    if archive is None or config is None or row.archive_id == config.archive_id:
+        return message
+    lookup = lookup or archives.ArchiveLookup()
+    available, _reason = lookup.available(archive)
+    if not available:
+        # 同じ内容がつながっている別の保存フォルダにもあれば（#6 以前のデータ等）、そちらを示す。
+        # 「そこにしか無い」「消したなら forget」と案内すると、外していただけの保存フォルダを forget させてしまう
+        for other in owning_query(session, row.filehash, row.hash_algo, config.archive_id, stored_only=True):
+            other_archive = session.get(Archive, other.archive_id)
+            # 今の保存フォルダの行は find_owning が先に返すので、ここに来るのは別の保存フォルダの行だけ
+            if other.id != row.id and other_archive is not None and lookup.available(other_archive)[0]:
+                return (
+                    f"Same content already in archive folder {other_archive.root_abs}: "
+                    f"{other.stored_path_rel}"
+                )
+        lookup.unavailable_duplicates[row.archive_id] = (
+            lookup.unavailable_duplicates.get(row.archive_id, 0) + 1
+        )
+        message += (
+            " (this archive folder is not available now; if it no longer exists, "
+            f"run `archives --forget {row.archive_id}`)"
+        )
+    return message
+
+
+# 正本 DB と一緒に扱うファイル（SQLite の付随ファイルと、正本 DB 単位のロック database.master_db_lock）
+_DB_SIDECARS = ("", "-wal", "-shm", "-journal", ".lock")
 
 
 def own_data_matcher(config, source: str | None = None):
@@ -108,7 +167,7 @@ def own_data_matcher(config, source: str | None = None):
         for kind, _label, path, _movable in own_data_locations(config)
         if kind == OWN_DATA_DB
         for k in keys(path)
-        for sfx in _SQLITE_SIDECARS
+        for sfx in _DB_SIDECARS
     }
 
     def matches(p):
@@ -167,6 +226,8 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
     csv_file = create_csv(config.log_dir, "add_result", ts_start)
     processed = 0
     is_own = own_data_matcher(config)
+    lookup = archives.ArchiveLookup()
+    in_archive = archive_matcher(config, lookup)
 
     try:
         for scanned in files:
@@ -177,9 +238,14 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
                 message = "The detector's own data (master DB / work DB / logs / UI data); not ingested"
                 logger.warning(f"Skipped the detector's own data inside the source: {scanned.path_abs}")
                 _record_item(session, config, ingest, scanned, result, None, None, message)
+            elif (message := in_archive(scanned.path_abs)) is not None:
+                # 保存フォルダの管理用フォルダ・保存フォルダの中のファイルは動かさない（#6）
+                result, stored_rel = RESULT_SKIPPED_IN_ARCHIVE, None
+                logger.warning(f"Skipped: {message}: {scanned.path_abs}")
+                _record_item(session, config, ingest, scanned, result, None, None, message)
             else:
                 result, stored_rel, message = _process_one(
-                    session, config, ingest, scanned, planner, reserved, virtual_hashes
+                    session, config, ingest, scanned, planner, reserved, virtual_hashes, lookup
                 )
             counters[result] = counters.get(result, 0) + 1
             csv_update(
@@ -203,6 +269,8 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
         if not config.dry_run:
             session.commit()
 
+    _report_unavailable_owners(session, lookup)
+
     if config.prune_empty_dirs and not config.dry_run and os.path.isdir(config.source_path):
         removed = mover.prune_empty_dirs(config.source_path, keep=is_own)
         if removed:
@@ -212,8 +280,53 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
     return status, counters
 
 
+def _report_unavailable_owners(session, lookup) -> None:
+    """つながっていない保存フォルダにしか無い重複を知らせます（#6）。
+
+    保存フォルダを消したのに登録を外していないと、その内容はどこにも保存されないまま duplicate として
+    投入元に残り続ける。サマリの duplicate 件数だけでは正常な重複除去と見分けられないので、分けて出す。
+    """
+    for archive_id, count in sorted(lookup.unavailable_duplicates.items()):
+        archive = session.get(Archive, archive_id)
+        line = (
+            f"Note: {count} duplicates are only in archive folder #{archive_id} "
+            f"({archive.root_abs if archive else '?'}), which is not available now. "
+            f"If it was deleted, run `archives --forget {archive_id}` and add again."
+        )
+        logger.warning(line)
+        print(line)
+
+
+def archive_matcher(config, lookup: "archives.ArchiveLookup | None" = None):
+    """保存フォルダのものを動かさないための判定関数を返します。該当すれば理由（CSV 用）、しなければ None。
+
+    - 投入元の中の `.akasyx/`（識別子の無いロック・作業ファイルの残り）: 保存物ではない。投入元より上位の
+      フォルダ名は見ない（投入元自体が .akasyx の下でも中身は取り込む）
+    - --follow-symlinks でリンクを辿った先が保存フォルダの中: 動かすとその保存フォルダの保存物を失う。
+      辿らないときは、投入元が保存フォルダと重ならないことを事前チェックで確かめてあるので見ない
+    """
+    src_abs = os.path.abspath(config.source_path)
+    lookup = lookup or archives.ArchiveLookup()
+
+    def check(path):
+        try:
+            parts = os.path.relpath(os.path.abspath(path), src_abs).split(os.sep)
+        except ValueError:  # Windows で別ドライブ
+            parts = []
+        if parts and parts[0] != os.pardir and META_DIRNAME in parts[:-1]:
+            return f"Archive folder management data ({META_DIRNAME}); not ingested"
+        if config.follow_symlinks:
+            # ファイル自体がリンクのこともあるので、最後の要素まで解いた実体の位置で見る
+            inside = lookup.enclosing(os.path.dirname(os.path.realpath(path)))
+            if inside is not None:
+                return f"The file is inside an archive folder: {inside}"
+        return None
+
+    return check
+
+
 def _process_one(
-    session, config, ingest, scanned, planner, reserved, virtual_hashes
+    session, config, ingest, scanned, planner, reserved, virtual_hashes, lookup=None
 ) -> tuple[str, str | None, str | None]:
     """1ファイルを判定し、必要なら移動して記録します。
 
@@ -221,7 +334,7 @@ def _process_one(
     """
     try:
         result, existing, message = judge(
-            session, scanned, config, virtual_hashes if config.dry_run else None
+            session, scanned, config, virtual_hashes if config.dry_run else None, lookup
         )
     except Exception as e:  # 1件の失敗で実行全体を止めない（設計書 §12）
         session.rollback()
@@ -248,10 +361,12 @@ def _process_one(
                 # 予約が UNIQUE で弾かれた = 直前に同一内容が登録された
                 result = RESULT_DUPLICATE
                 owner = find_owning(
-                    session, config.archive_id, scanned.filehash, scanned.hash_algo
+                    session, scanned.filehash, scanned.hash_algo, config.archive_id
                 )
                 archive_file_id = owner.id if owner is not None else None
-                message = "Identical content was registered just before"
+                message = "Identical content was registered just before" + (
+                    f" ({owner_location(session, owner, config, lookup)})" if owner is not None else ""
+                )
             else:
                 result = RESULT_FAILED
                 message = move.message

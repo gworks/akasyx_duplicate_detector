@@ -1,5 +1,6 @@
 # database.py - archive.db の接続・セッション管理（設計書 §6.3）
 import contextlib
+import errno
 import logging
 import os
 
@@ -127,3 +128,102 @@ def archive_lock(archive_root: str):
     finally:
         with contextlib.suppress(OSError):
             os.unlink(path)
+
+
+def master_db_lock_path(archive_db: str) -> str:
+    # 実体の位置に置く。正本 DB ファイルへのシンボリックリンクで指す実行とも同じロックにするため
+    return os.path.realpath(archive_db) + ".lock"
+
+
+@contextlib.contextmanager
+def master_db_lock(archive_db: str):
+    """正本 DB 単位の多重起動を防ぐロック（#6）。
+
+    重複判定は全保存フォルダ共通だが、部分 UNIQUE 索引は保存フォルダ単位のまま。
+    別の保存フォルダへの実行が同時に走ると、判定と予約の隙間で同じ内容が両方に入るため、
+    同じ正本 DB を使う実行は 1 本に限る。
+
+    この排他が二重登録を防ぐ唯一の仕組みなので、PID ファイルの引き継ぎ（死んだ PID を読んで消して作り直す間に
+    別のプロセスが割り込める）ではなく OS のロック（flock / Windows は msvcrt.locking）を使う。
+    プロセスが落ちれば OS が外すので、引き継ぎの処理が要らない。正本 DB はローカルディスクに置く前提。
+    ロックファイルは消さずに残す（消すと、開いたままの別プロセスと別の実体をロックし合う隙間ができる）。
+    """
+    path = master_db_lock_path(archive_db)
+    try:
+        nlink = os.stat(archive_db).st_nlink
+    except FileNotFoundError:
+        nlink = 1  # 初回（これから作る）
+    except OSError as e:
+        raise PreflightError(f"Cannot access the master DB: {archive_db}: {e}") from e
+    if nlink > 1:
+        # 別のハードリンクのパスで開く実行とはロックファイルが分かれて排他が効かない。
+        # SQLite もハードリンクの DB は -wal / -journal の名前がずれて壊れうるとしている
+        raise PreflightError(
+            f"The master DB has other hard links ({nlink} links); use a single path: {archive_db}"
+        )
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as e:
+        raise PreflightError(f"Cannot create the master DB lock file: {path}: {e}") from e
+    try:
+        try:
+            locked = _try_os_lock(fd)
+        except OSError as e:
+            # ロックに対応しない場所（ネットワーク FS 等）。正本 DB はローカルディスクに置く
+            raise PreflightError(
+                f"Cannot lock the master DB lock file: {path}: {e}\n"
+                "  Put the master DB on a local disk (--archive-db)."
+            ) from e
+        if not locked:
+            holder = ""
+            with contextlib.suppress(OSError):
+                holder = os.pread(fd, 32, 0).decode(errors="replace").strip() if hasattr(os, "pread") else ""
+            raise PreflightError(
+                "The master DB is in use by another process (possibly for another archive folder)"
+                f" (PID {holder or 'unknown'}): {path}"
+            )
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, str(os.getpid()).encode())
+        try:
+            yield path
+        finally:
+            with contextlib.suppress(OSError):
+                os.ftruncate(fd, 0)
+            _os_unlock(fd)
+    finally:
+        os.close(fd)
+
+
+def _try_os_lock(fd: int) -> bool:
+    if os.name == "nt":  # pragma: no cover - Windows
+        import msvcrt
+
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError as e:
+            if e.errno in (errno.EACCES, errno.EDEADLK):  # 他のプロセスが持っている
+                return False
+            raise
+    import fcntl
+
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+
+
+def _os_unlock(fd: int) -> None:
+    with contextlib.suppress(OSError):
+        if os.name == "nt":  # pragma: no cover - Windows
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)

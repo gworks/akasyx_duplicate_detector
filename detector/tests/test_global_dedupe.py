@@ -1,0 +1,1251 @@
+# test_global_dedupe.py - 重複判定を全保存フォルダ共通にする（#6）
+#
+# 正本 DB 1 つに登録された保存フォルダのどこかに同じ内容があれば、add は duplicate として投入元に残す。
+# delete-duplicates は、実物がある保存フォルダ（別の保存フォルダでもよい）で 2 点検証してから消す。
+import os
+import shutil
+
+import pytest
+
+import dedupe
+import ingest
+import main
+from conftest import archive_db_path, write_file
+from database import get_session, master_db_lock
+from errors import PreflightError
+from models import (
+    MODE_DELETE_DUPLICATES,
+    MODE_REPORT,
+    RESOLUTION_DELETED,
+    RESULT_DUPLICATE,
+    STATUS_STORED,
+    ArchiveFile,
+    IngestItem,
+)
+
+
+def _add(make_config, root, source, tmp_path, fake_crawler, **kwargs):
+    fake_crawler(source, str(tmp_path / f"crawl_{os.path.basename(source)}.db"))
+    return main.run(make_config(archive_root=root, source_path=source, **kwargs))
+
+
+def _dirs(tmp_path, *names):
+    paths = []
+    for n in names:
+        p = tmp_path / n
+        p.mkdir()
+        paths.append(str(p))
+    return paths
+
+
+def _db(tmp_path):
+    return get_session(archive_db_path(tmp_path))
+
+
+def _seed_cross(make_config, tmp_path, fake_crawler):
+    """保存フォルダ A に x.txt を保存し、同じ内容の y.txt を B への add で重複として残します。"""
+    a, b, src_a, src_b = _dirs(tmp_path, "archive_a", "archive_b", "in_a", "in_b")
+    write_file(os.path.join(src_a, "x.txt"), b"SAME")
+    assert _add(make_config, a, src_a, tmp_path, fake_crawler) == main.EXIT_OK
+    leftover = write_file(os.path.join(src_b, "y.txt"), b"SAME")
+    assert _add(make_config, b, src_b, tmp_path, fake_crawler) == main.EXIT_OK
+    return a, b, leftover
+
+
+def test_content_in_other_archive_is_duplicate(make_config, tmp_path, fake_crawler):
+    a, b, leftover = _seed_cross(make_config, tmp_path, fake_crawler)
+    assert os.path.exists(leftover)  # 投入元に残る
+    sess, engine = _db(tmp_path)
+    try:
+        stored = sess.query(ArchiveFile).filter_by(status=STATUS_STORED).all()
+        assert len(stored) == 1  # B には入っていない
+        item = sess.query(IngestItem).filter_by(result=RESULT_DUPLICATE).one()
+        assert item.archive_file_id == stored[0].id
+        # どの保存フォルダにあるかをメッセージ（CSV）に出す
+        assert a in (item.message or "")
+    finally:
+        sess.close(); engine.dispose()
+
+
+def test_dry_run_sees_other_archive(make_config, tmp_path, fake_crawler, capsys):
+    a, b, src_a, src_b = _dirs(tmp_path, "archive_a", "archive_b", "in_a", "in_b")
+    write_file(os.path.join(src_a, "x.txt"), b"SAME")
+    assert _add(make_config, a, src_a, tmp_path, fake_crawler) == main.EXIT_OK
+    write_file(os.path.join(src_b, "y.txt"), b"SAME")
+    assert _add(make_config, b, src_b, tmp_path, fake_crawler, dry_run=True) == main.EXIT_OK
+    assert "duplicates (left in place): 1" in capsys.readouterr().out
+
+
+def test_find_owning_is_global(session, archive, tmp_path):
+    from models import Archive
+    other = Archive(uid="other", root_abs=str(tmp_path / "other"))
+    session.add(other)
+    session.commit()
+    row = ArchiveFile(
+        archive_id=other.id, filehash="h", hash_algo="sha256", size=1, name="n",
+        stored_path_rel="n", status=STATUS_STORED,
+    )
+    session.add(row)
+    session.commit()
+    assert ingest.find_owning(session, "h", "sha256", archive_id=1).id == row.id
+
+
+def test_delete_duplicates_verifies_in_owner_archive(make_config, tmp_path, fake_crawler):
+    a, b, leftover = _seed_cross(make_config, tmp_path, fake_crawler)
+    cfg = make_config(mode=MODE_DELETE_DUPLICATES, archive_root=b, assume_yes=True)
+    assert main.run(cfg) == main.EXIT_OK
+    assert not os.path.exists(leftover)
+    sess, engine = _db(tmp_path)
+    try:
+        item = sess.query(IngestItem).filter_by(result=RESULT_DUPLICATE).one()
+        assert item.resolution == RESOLUTION_DELETED
+    finally:
+        sess.close(); engine.dispose()
+
+
+def test_delete_duplicates_keeps_when_owner_archive_unavailable(
+    make_config, tmp_path, fake_crawler
+):
+    """実物のある保存フォルダがつながっていなければ消さずに残し、理由を出す。"""
+    a, b, leftover = _seed_cross(make_config, tmp_path, fake_crawler)
+    shutil.move(a, str(tmp_path / "unplugged"))  # NAS が外れた状態を模す
+    cfg = make_config(mode=MODE_DELETE_DUPLICATES, archive_root=b, assume_yes=True)
+    assert main.run(cfg) == main.EXIT_OK
+    assert os.path.exists(leftover)
+    sess, engine = _db(tmp_path)
+    try:
+        item = sess.query(IngestItem).filter_by(result=RESULT_DUPLICATE).one()
+        assert item.resolution is None
+        verdict, message = dedupe.check_item(sess, cfg, item)
+        assert verdict == dedupe.CHECK_ARCHIVE_UNAVAILABLE
+        assert a in message
+    finally:
+        sess.close(); engine.dispose()
+
+
+def test_delete_duplicates_never_deletes_the_archived_file_itself(
+    make_config, tmp_path, fake_crawler
+):
+    """消す対象が保存済みの実物そのもの（同じファイル）なら消さない。"""
+    a, b, leftover = _seed_cross(make_config, tmp_path, fake_crawler)
+    sess, engine = _db(tmp_path)
+    try:
+        item = sess.query(IngestItem).filter_by(result=RESULT_DUPLICATE).one()
+        owner = sess.get(ArchiveFile, item.archive_file_id)
+        stored = os.path.join(a, *owner.stored_path_rel.split("/"))
+        item.source_path_abs = stored  # 投入元が保存フォルダ A の中だった場合と同じ状態
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    cfg = make_config(mode=MODE_DELETE_DUPLICATES, archive_root=b, assume_yes=True)
+    assert main.run(cfg) == main.EXIT_OK
+    assert os.path.exists(stored)
+
+
+def _stored_files(root):
+    return sorted(
+        os.path.join(d, f) for d, _, fs in os.walk(root) for f in fs if ".akasyx" not in d
+    )
+
+
+@pytest.mark.parametrize("inside", [True, False])
+def test_add_refuses_source_overlapping_other_archive(
+    make_config, tmp_path, fake_crawler, inside
+):
+    """投入元が登録済みの別の保存フォルダと重なる（中にある／中に含む）なら断る。
+
+    通すと、A の保存済みファイルが自分自身の重複と判定され、delete-duplicates で消されうる。
+    """
+    (outer, b, src_a) = _dirs(tmp_path, "outer", "archive_b", "in_a")
+    a = os.path.join(outer, "archive_a")
+    os.makedirs(a)
+    write_file(os.path.join(src_a, "x.txt"), b"SAME")
+    assert _add(make_config, a, src_a, tmp_path, fake_crawler) == main.EXIT_OK
+    before = _stored_files(a)
+    assert before
+    source = a if inside else outer
+    fake_crawler(source, str(tmp_path / "crawl_overlap.db"))
+    with pytest.raises(PreflightError, match="archive folder"):
+        main.run(make_config(archive_root=b, source_path=source))
+    assert _stored_files(a) == before
+
+
+def test_runs_are_exclusive_per_master_db(make_config, tmp_path, fake_crawler):
+    """別の保存フォルダでも、同じ正本 DB を使う実行は同時に 1 本だけ。"""
+    a, b, src_b = _dirs(tmp_path, "archive_a", "archive_b", "in_b")
+    write_file(os.path.join(src_b, "y.txt"), b"SAME")
+    fake_crawler(src_b, str(tmp_path / "crawl.db"))
+    cfg = make_config(archive_root=b, source_path=src_b)
+    with master_db_lock(cfg.archive_db):  # 保存フォルダ A への add が実行中の状態
+        with pytest.raises(PreflightError, match="in use"):
+            main.run(cfg)
+    assert os.path.exists(os.path.join(src_b, "y.txt"))
+    assert main.run(cfg) == main.EXIT_OK  # 終われば実行できる
+
+
+def test_every_command_takes_the_master_db_lock(make_config, tmp_path):
+    """report も起動時に中断分の復旧（書き込み）をするので、ロックを取る。"""
+    (a,) = _dirs(tmp_path, "archive_a")
+    cfg = make_config(mode=MODE_REPORT, archive_root=a)
+    with master_db_lock(cfg.archive_db):
+        with pytest.raises(PreflightError, match="in use"):
+            main.run(cfg)
+
+
+# --- レビュー指摘（2026-09-27）------------------------------------------------
+
+
+def test_pending_row_of_other_archive_is_not_an_owner(make_config, tmp_path, fake_crawler):
+    """別の保存フォルダで中断したまま残った pending 行は持ち主にしない。
+
+    参照すると、その保存フォルダの起動時復旧が pending 行を消すときに FK 違反で止まり、
+    内容もどこにも保存されないまま「重複」扱いになる。
+    """
+    from models import STATUS_PENDING, Archive
+    a, b, src_a, src_b = _dirs(tmp_path, "archive_a", "archive_b", "in_a", "in_b")
+    write_file(os.path.join(src_a, "seed.txt"), b"SEED")
+    assert _add(make_config, a, src_a, tmp_path, fake_crawler) == main.EXIT_OK
+    crashed = write_file(os.path.join(src_a, "x.txt"), b"SAME")
+    sess, engine = _db(tmp_path)
+    try:
+        aid = sess.query(Archive).filter_by(root_abs=os.path.realpath(a)).one().id
+        sess.add(ArchiveFile(  # A への add が予約直後に落ちた状態
+            archive_id=aid, filehash=__import__("utl.hashing", fromlist=["x"]).file_hash(crashed),
+            hash_algo="sha256", size=4, name="x.txt", stored_path_rel="2026-09/x.txt",
+            origin_path_abs=crashed, status=STATUS_PENDING,
+        ))
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    write_file(os.path.join(src_b, "y.txt"), b"SAME")
+    assert _add(make_config, b, src_b, tmp_path, fake_crawler) == main.EXIT_OK
+    assert not os.path.exists(os.path.join(src_b, "y.txt"))  # B に保存された
+    # A の復旧（pending 行の削除）が FK 違反で止まらない
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=a)) == main.EXIT_OK
+
+
+def test_moved_current_archive_is_not_checked_against_its_old_location(
+    make_config, tmp_path, fake_crawler
+):
+    """保存フォルダを移動した直後の add が、移動前の登録上の場所と比べられて断られない。"""
+    pics, nas = _dirs(tmp_path, "pictures", "nas")
+    old = os.path.join(pics, "archive")
+    os.makedirs(old)
+    src0 = os.path.join(tmp_path, "in0")
+    write_file(os.path.join(src0, "seed.txt"), b"SEED")
+    assert _add(make_config, old, src0, tmp_path, fake_crawler) == main.EXIT_OK
+    new = os.path.join(nas, "archive")
+    shutil.move(old, new)
+    write_file(os.path.join(pics, "p.jpg"), b"PHOTO")
+    assert _add(make_config, new, pics, tmp_path, fake_crawler) == main.EXIT_OK
+
+
+def test_deleted_registered_archive_does_not_block_its_parent(
+    make_config, tmp_path, fake_crawler
+):
+    """実体を消した（試しに使っただけの）保存フォルダの登録は、上位フォルダを投入元にするのを妨げない。"""
+    desk, real = _dirs(tmp_path, "desktop", "real_archive")
+    trial = os.path.join(desk, "trial_archive")
+    os.makedirs(trial)
+    src0 = os.path.join(tmp_path, "in0")
+    write_file(os.path.join(src0, "seed.txt"), b"SEED")
+    assert _add(make_config, trial, src0, tmp_path, fake_crawler) == main.EXIT_OK
+    shutil.rmtree(trial)
+    write_file(os.path.join(desk, "d.txt"), b"DESK")
+    assert _add(make_config, real, desk, tmp_path, fake_crawler) == main.EXIT_OK
+
+
+def test_owner_in_current_archive_is_preferred(make_config, tmp_path, fake_crawler):
+    """同じ内容が複数の保存フォルダにあるとき（#6 より前のデータ）、今の保存フォルダの行を優先する。"""
+    from models import Archive
+    a, b, src_a, src_b = _dirs(tmp_path, "archive_a", "archive_b", "in_a", "in_b")
+    write_file(os.path.join(src_a, "x.txt"), b"SAME")
+    assert _add(make_config, a, src_a, tmp_path, fake_crawler) == main.EXIT_OK
+    write_file(os.path.join(src_b, "seed.txt"), b"SEED")
+    assert _add(make_config, b, src_b, tmp_path, fake_crawler) == main.EXIT_OK
+    sess, engine = _db(tmp_path)
+    try:  # #6 より前に B にも同じ内容が保存されていた状態を作る
+        bid = sess.query(Archive).filter_by(root_abs=os.path.realpath(b)).one().id
+        write_file(os.path.join(b, "old", "x.txt"), b"SAME")
+        sess.add(ArchiveFile(
+            archive_id=bid, filehash=__import__("utl.hashing", fromlist=["x"]).file_hash(
+                os.path.join(b, "old", "x.txt")),
+            hash_algo="sha256", size=4, name="x.txt", stored_path_rel="old/x.txt",
+            status=STATUS_STORED,
+        ))
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    leftover = write_file(os.path.join(src_b, "again.txt"), b"SAME")
+    assert _add(make_config, b, src_b, tmp_path, fake_crawler) == main.EXIT_OK
+    shutil.move(a, str(tmp_path / "unplugged"))  # A（id が小さい）を外す
+    cfg = make_config(mode=MODE_DELETE_DUPLICATES, archive_root=b, assume_yes=True)
+    assert main.run(cfg) == main.EXIT_OK
+    assert not os.path.exists(leftover)  # B の実物で検証して消せた
+
+
+def test_master_db_lock_follows_symlinks(tmp_path):
+    """正本 DB ファイルへのシンボリックリンクで指しても、同じロックになる。
+
+    （フォルダのシンボリックリンクはロックファイルも同じ実体に解決されるので、問題になるのはファイルの別名）
+    """
+    real_db = tmp_path / "data" / "archive.db"
+    real_db.parent.mkdir()
+    real_db.write_bytes(b"")
+    link = tmp_path / "link.db"
+    os.symlink(real_db, link)
+    with master_db_lock(str(real_db)):
+        with pytest.raises(PreflightError, match="in use"):
+            with master_db_lock(str(link)):
+                pass
+
+
+def test_owner_location_checked_once_per_archive(
+    make_config, tmp_path, fake_crawler, monkeypatch
+):
+    """delete-duplicates は、実物のある保存フォルダの確認を保存フォルダごとに 1 回だけ行う。"""
+    import archives
+    a, b, src_a, src_b = _dirs(tmp_path, "archive_a", "archive_b", "in_a", "in_b")
+    for i in range(3):
+        write_file(os.path.join(src_a, f"x{i}.txt"), f"S{i}".encode())
+    assert _add(make_config, a, src_a, tmp_path, fake_crawler) == main.EXIT_OK
+    for i in range(3):
+        write_file(os.path.join(src_b, f"y{i}.txt"), f"S{i}".encode())
+    assert _add(make_config, b, src_b, tmp_path, fake_crawler) == main.EXIT_OK
+    calls = []
+    real = archives.read_uid
+    monkeypatch.setattr(archives, "read_uid", lambda root: calls.append(root) or real(root))
+    cfg = make_config(mode=MODE_DELETE_DUPLICATES, archive_root=b)
+    assert main.run(cfg) == main.EXIT_OK
+    assert calls.count(os.path.realpath(a)) == 1
+
+
+# --- レビュー指摘 2 回目（2026-09-27）: 保存フォルダの目印（.akasyx/archive.id）で判定する -----------
+
+
+def _file_hash(path):
+    from utl import hashing
+    return hashing.file_hash(path)
+
+
+def test_add_refuses_source_containing_unregistered_archive(make_config, tmp_path, fake_crawler):
+    """投入元の中に保存フォルダ（登録が古い・別の正本 DB のもの）があれば断り、何も動かさない。"""
+    a, src = _dirs(tmp_path, "archive_a", "inbox")
+    foreign = os.path.join(src, "moved_archive")
+    write_file(os.path.join(foreign, ".akasyx", "archive.id"), b"someone-else\n")
+    write_file(os.path.join(foreign, "2026-01", "x.jpg"), b"X")
+    fake_crawler(src, str(tmp_path / "crawl.db"))
+    with pytest.raises(PreflightError, match="archive folder"):
+        main.run(make_config(archive_root=a, source_path=src))
+    assert os.path.exists(os.path.join(foreign, ".akasyx", "archive.id"))
+    assert os.path.exists(os.path.join(foreign, "2026-01", "x.jpg"))
+
+
+def test_refused_add_does_not_register_the_target(make_config, tmp_path, fake_crawler):
+    """投入元が保存フォルダの中なら、取り込み先を登録する前に断る（登録だけ残さない）。"""
+    from models import Archive
+    a, c, src_a = _dirs(tmp_path, "archive_a", "archive_c", "in_a")
+    write_file(os.path.join(src_a, "x.txt"), b"SAME")
+    assert _add(make_config, a, src_a, tmp_path, fake_crawler) == main.EXIT_OK
+    inner = os.path.join(a, "sub")
+    os.makedirs(inner)
+    with pytest.raises(PreflightError, match="archive folder"):
+        main.run(make_config(archive_root=c, source_path=inner))
+    sess, engine = _db(tmp_path)
+    try:
+        assert sess.query(Archive).count() == 1
+    finally:
+        sess.close(); engine.dispose()
+    assert not os.path.exists(os.path.join(c, ".akasyx", "archive.id"))
+
+
+def test_folder_that_is_no_longer_an_archive_does_not_block(make_config, tmp_path, fake_crawler):
+    """誤って保存フォルダにして .akasyx を消したフォルダは、登録が残っていても投入元にできる。"""
+    docs, real, src0 = _dirs(tmp_path, "documents", "real_archive", "in0")
+    write_file(os.path.join(src0, "seed.txt"), b"SEED")
+    assert _add(make_config, docs, src0, tmp_path, fake_crawler) == main.EXIT_OK
+    shutil.rmtree(os.path.join(docs, ".akasyx"))
+    scans = os.path.join(docs, "scans")
+    write_file(os.path.join(scans, "s.pdf"), b"SCAN")
+    assert _add(make_config, real, scans, tmp_path, fake_crawler) == main.EXIT_OK
+
+
+def test_leftover_akasyx_folder_in_source_is_not_ingested(make_config, tmp_path, fake_crawler):
+    """識別子の無い .akasyx（ロック・作業ファイルの残り）は取り込まない。"""
+    a, src = _dirs(tmp_path, "archive_a", "inbox")
+    write_file(os.path.join(src, "old", ".akasyx", "tmp", "x.part"), b"PART")
+    write_file(os.path.join(src, "keep.txt"), b"KEEP")
+    assert _add(make_config, a, src, tmp_path, fake_crawler) == main.EXIT_OK
+    assert os.path.exists(os.path.join(src, "old", ".akasyx", "tmp", "x.part"))
+
+
+def test_delete_duplicates_keeps_source_inside_an_archive(make_config, tmp_path, fake_crawler):
+    """投入元のファイルが（あとから）保存フォルダの中になっていれば、実体が別でも消さない。"""
+    a, b, leftover = _seed_cross(make_config, tmp_path, fake_crawler)
+    src_b = os.path.dirname(leftover)
+    write_file(os.path.join(src_b, ".akasyx", "archive.id"), b"became-an-archive\n")
+    cfg = make_config(mode=MODE_DELETE_DUPLICATES, archive_root=b, assume_yes=True)
+    assert main.run(cfg) == main.EXIT_OK
+    assert os.path.exists(leftover)
+    sess, engine = _db(tmp_path)
+    try:
+        item = sess.query(IngestItem).filter_by(result=RESULT_DUPLICATE).one()
+        assert dedupe.check_item(sess, cfg, item)[0] == dedupe.CHECK_SOURCE_IN_ARCHIVE
+    finally:
+        sess.close(); engine.dispose()
+
+
+def test_delete_duplicates_tries_other_copies(make_config, tmp_path, fake_crawler):
+    """判定時に参照した実物が消えていても、別の保存フォルダに検証できる実物があれば消せる。"""
+    from models import Archive
+    a, b, leftover = _seed_cross(make_config, tmp_path, fake_crawler)
+    c, src_c = _dirs(tmp_path, "archive_c", "in_c")
+    write_file(os.path.join(src_c, "seed.txt"), b"SEED")
+    assert _add(make_config, c, src_c, tmp_path, fake_crawler) == main.EXIT_OK
+    sess, engine = _db(tmp_path)
+    try:
+        item = sess.query(IngestItem).filter_by(result=RESULT_DUPLICATE).one()
+        owner = sess.get(ArchiveFile, item.archive_file_id)
+        os.unlink(os.path.join(a, *owner.stored_path_rel.split("/")))  # A の実物を手で消した
+        cid = sess.query(Archive).filter_by(root_abs=os.path.realpath(c)).one().id
+        copy = write_file(os.path.join(c, "old", "x.txt"), b"SAME")  # #6 より前に C にもあった
+        sess.add(ArchiveFile(
+            archive_id=cid, filehash=_file_hash(copy), hash_algo="sha256", size=4,
+            name="x.txt", stored_path_rel="old/x.txt", status=STATUS_STORED,
+        ))
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    cfg = make_config(mode=MODE_DELETE_DUPLICATES, archive_root=b, assume_yes=True)
+    assert main.run(cfg) == main.EXIT_OK
+    assert not os.path.exists(leftover)
+
+
+def test_master_db_lock_left_by_dead_process_is_taken(tmp_path):
+    """落ちたプロセスが残したロックファイルは、そのまま取れる（OS のロックは終了で外れる）。"""
+    from database import master_db_lock_path
+    db = str(tmp_path / "archive.db")
+    write_file(master_db_lock_path(db), b"999999")
+    with master_db_lock(db):
+        pass
+    with master_db_lock(db):  # 解放後にもう一度取れる
+        pass
+
+
+# --- レビュー指摘 3 回目（2026-09-27）------------------------------------------
+
+
+def _archive_id_of(tmp_path, root):
+    from models import Archive
+    sess, engine = _db(tmp_path)
+    try:
+        return sess.query(Archive).filter_by(root_abs=os.path.realpath(root)).one().id
+    finally:
+        sess.close(); engine.dispose()
+
+
+def test_forget_lets_content_of_deleted_archive_be_stored_again(
+    make_config, tmp_path, fake_crawler, capsys
+):
+    """消した保存フォルダの登録を archives --forget で外せば、その内容を別の保存フォルダに保存できる。"""
+    t, r, src_t, src_r = _dirs(tmp_path, "trial", "real", "in_t", "in_r")
+    write_file(os.path.join(src_t, "x.txt"), b"SAME")
+    assert _add(make_config, t, src_t, tmp_path, fake_crawler) == main.EXIT_OK
+    tid = _archive_id_of(tmp_path, t)
+    shutil.rmtree(t)
+    write_file(os.path.join(src_r, "y.txt"), b"SAME")
+    assert _add(make_config, r, src_r, tmp_path, fake_crawler) == main.EXIT_OK
+    assert os.path.exists(os.path.join(src_r, "y.txt"))  # まだ T の重複扱い
+    sess, engine = _db(tmp_path)
+    try:  # つながっていない保存フォルダにあることを CSV のメッセージで知らせる
+        item = sess.query(IngestItem).filter_by(result=RESULT_DUPLICATE).one()
+        assert "not available" in item.message and "--forget" in item.message
+    finally:
+        sess.close(); engine.dispose()
+
+    argv = ["archives", "--forget", str(tid), "--archive-db", archive_db_path(tmp_path)]
+    assert main.main(argv) == main.EXIT_OK
+    assert _add(make_config, r, src_r, tmp_path, fake_crawler) == main.EXIT_OK
+    assert not os.path.exists(os.path.join(src_r, "y.txt"))  # 今度は R に保存された
+
+
+def test_forget_refuses_archive_that_is_present(make_config, tmp_path, fake_crawler):
+    t, src_t = _dirs(tmp_path, "trial", "in_t")
+    write_file(os.path.join(src_t, "x.txt"), b"SAME")
+    assert _add(make_config, t, src_t, tmp_path, fake_crawler) == main.EXIT_OK
+    tid = _archive_id_of(tmp_path, t)
+    argv = ["archives", "--forget", str(tid), "--archive-db", archive_db_path(tmp_path)]
+    assert main.main(argv) == main.EXIT_REJECTED
+    argv = ["archives", "--forget", "999", "--archive-db", archive_db_path(tmp_path)]
+    assert main.main(argv) == main.EXIT_REJECTED
+
+
+def test_add_skips_file_whose_real_location_is_in_an_archive(
+    make_config, tmp_path, monkeypatch
+):
+    """シンボリックリンクを辿って保存フォルダの下位フォルダに入っても、その保存物は動かさない。"""
+    import crawler_client
+    from conftest import build_crawler_db
+    a, x, src = _dirs(tmp_path, "archive_a", "foreign_x", "inbox")
+    write_file(os.path.join(x, ".akasyx", "archive.id"), b"other-db\n")
+    kept = write_file(os.path.join(x, "2024-01", "x.jpg"), b"XJPG")
+    os.symlink(os.path.join(x, "2024-01"), os.path.join(src, "link"))
+    write_file(os.path.join(src, "own.txt"), b"OWN")
+    crawl_db = str(tmp_path / "crawl.db")
+
+    def _run(target, config, extra_excludes=()):
+        scan_id = build_crawler_db(crawl_db, target)
+        import sqlite3
+        conn = sqlite3.connect(crawl_db)  # --follow-symlinks で辿った分を足す
+        conn.execute(
+            "INSERT INTO fs_files (scan_id, last_seen_scan_id, name, path_abs, path_rel, size,"
+            " filehash, hash_algo, status) VALUES (?, ?, 'x.jpg', ?, 'link/x.jpg', 4, ?, 'sha256', 'active')",
+            (scan_id, scan_id, os.path.join(src, "link", "x.jpg"), _file_hash(kept)),
+        )
+        conn.commit(); conn.close()
+        return crawler_client.CrawlerScan(db_path=crawl_db, scan_id=scan_id, status="completed", root_dir=target)
+
+    monkeypatch.setattr(crawler_client, "resolve_crawler_repo", lambda path: path)
+    monkeypatch.setattr(crawler_client, "run_crawler", _run)
+    cfg = make_config(archive_root=a, source_path=src, follow_symlinks=True)
+    assert main.run(cfg) == main.EXIT_OK
+    assert os.path.exists(kept)
+    assert not os.path.exists(os.path.join(src, "own.txt"))  # 普通のファイルは取り込まれる
+
+
+def test_lock_error_other_than_contention_is_reported(tmp_path, monkeypatch):
+    """ロックに対応しない場所などのエラーは、トレースバックではなく断りとして返す。"""
+    import errno
+    import fcntl
+
+    def _flock(fd, op):
+        raise OSError(errno.ENOTSUP, "Operation not supported")
+
+    monkeypatch.setattr(fcntl, "flock", _flock)
+    with pytest.raises(PreflightError, match="lock"):
+        with master_db_lock(str(tmp_path / "archive.db")):
+            pass
+
+
+def test_hardlinked_duplicate_can_be_deleted(make_config, tmp_path, fake_crawler):
+    """投入元が保存物のハードリンクなら、消してもリンクが 1 本減るだけなので消してよい。"""
+    a, b, leftover = _seed_cross(make_config, tmp_path, fake_crawler)
+    sess, engine = _db(tmp_path)
+    try:
+        item = sess.query(IngestItem).filter_by(result=RESULT_DUPLICATE).one()
+        stored = os.path.join(a, *sess.get(ArchiveFile, item.archive_file_id).stored_path_rel.split("/"))
+    finally:
+        sess.close(); engine.dispose()
+    os.unlink(leftover)
+    os.link(stored, leftover)
+    cfg = make_config(mode=MODE_DELETE_DUPLICATES, archive_root=b, assume_yes=True)
+    assert main.run(cfg) == main.EXIT_OK
+    assert not os.path.exists(leftover)
+    assert os.path.exists(stored)
+
+
+def test_source_containing_archive_is_refused_before_scan_and_registration(
+    make_config, tmp_path, monkeypatch
+):
+    """投入元の中に保存フォルダがあれば、走査（全ハッシュ）の前・取り込み先の登録の前に断る。"""
+    import crawler_client
+    from models import Archive
+    d, src = _dirs(tmp_path, "fresh_d", "inbox")
+    write_file(os.path.join(src, "old_archive", ".akasyx", "archive.id"), b"x\n")
+
+    def _never(*a, **k):
+        raise AssertionError("crawler must not run")
+
+    monkeypatch.setattr(crawler_client, "resolve_crawler_repo", lambda path: path)
+    monkeypatch.setattr(crawler_client, "run_crawler", _never)
+    with pytest.raises(PreflightError, match="archive folder"):
+        main.run(make_config(archive_root=d, source_path=src))
+    assert not os.path.exists(os.path.join(d, ".akasyx", "archive.id"))
+    sess, engine = _db(tmp_path)
+    try:
+        assert sess.query(Archive).count() == 0
+    finally:
+        sess.close(); engine.dispose()
+
+
+def test_source_under_folder_named_akasyx_is_ingested(make_config, tmp_path, fake_crawler):
+    """投入元より上位のフォルダ名が .akasyx でも、投入元の中のファイルは取り込む。"""
+    a, base = _dirs(tmp_path, "archive_a", "vol")
+    src = os.path.join(base, ".akasyx", "tmp", "restore")
+    write_file(os.path.join(src, "r.txt"), b"RESTORE")
+    assert _add(make_config, a, src, tmp_path, fake_crawler) == main.EXIT_OK
+    assert not os.path.exists(os.path.join(src, "r.txt"))
+
+
+def test_source_in_archive_is_decided_before_hashing(make_config, tmp_path, fake_crawler, monkeypatch):
+    a, b, leftover = _seed_cross(make_config, tmp_path, fake_crawler)
+    write_file(os.path.join(os.path.dirname(leftover), ".akasyx", "archive.id"), b"x\n")
+    from utl import hashing
+    calls = []
+    real = hashing.file_hash
+    monkeypatch.setattr(hashing, "file_hash", lambda p, *a, **k: calls.append(p) or real(p, *a, **k))
+    cfg = make_config(mode=MODE_DELETE_DUPLICATES, archive_root=b)
+    assert main.run(cfg) == main.EXIT_OK
+    assert leftover not in calls
+
+
+def test_trash_dir_inside_another_archive_is_refused(make_config, tmp_path, fake_crawler):
+    a, b, leftover = _seed_cross(make_config, tmp_path, fake_crawler)
+    cfg = make_config(
+        mode=MODE_DELETE_DUPLICATES, archive_root=b, assume_yes=True,
+        trash_dir=os.path.join(a, "trash"),
+    )
+    with pytest.raises(PreflightError, match="archive folder"):
+        main.run(cfg)
+    assert os.path.exists(leftover)
+
+
+def test_archive_scan_survives_symlink_loop(tmp_path):
+    """--follow-symlinks の事前チェックが、シンボリックリンクの循環で止まらない。"""
+    import archives
+    src = tmp_path / "inbox"
+    (src / "a").mkdir(parents=True)
+    os.symlink(src, src / "a" / "loop")
+    assert archives.archives_below(str(src), follow_symlinks=True) == []
+
+
+# --- レビュー指摘 4 回目（2026-09-27）: 同じ内容の stored は全保存フォルダで 1 つ ---------------------
+
+
+def _stored_count(tmp_path, content: bytes):
+    import hashlib
+    h = hashlib.sha256(content).hexdigest()
+    sess, engine = _db(tmp_path)
+    try:
+        return sess.query(ArchiveFile).filter_by(filehash=h, status=STATUS_STORED).count()
+    finally:
+        sess.close(); engine.dispose()
+
+
+def test_recovery_does_not_store_content_already_stored_elsewhere(
+    make_config, tmp_path, fake_crawler
+):
+    """B で中断した予約（移動は済み）を復旧するとき、同じ内容が別の保存フォルダに stored なら stored にしない。"""
+    from models import STATUS_PENDING
+    a, b, src_a, src_b = _dirs(tmp_path, "archive_a", "archive_b", "in_a", "in_b")
+    write_file(os.path.join(src_b, "seed.txt"), b"SEED")
+    assert _add(make_config, b, src_b, tmp_path, fake_crawler) == main.EXIT_OK
+    moved = write_file(os.path.join(b, "2026-09", "x.txt"), b"SAME")  # Phase 2 の後に落ちた
+    bid = _archive_id_of(tmp_path, b)
+    sess, engine = _db(tmp_path)
+    try:
+        sess.add(ArchiveFile(
+            archive_id=bid, filehash=_file_hash(moved), hash_algo="sha256", size=4,
+            name="x.txt", stored_path_rel="2026-09/x.txt", status=STATUS_PENDING,
+        ))
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    write_file(os.path.join(src_a, "x.txt"), b"SAME")
+    assert _add(make_config, a, src_a, tmp_path, fake_crawler) == main.EXIT_OK
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=b)) == main.EXIT_OK  # B の復旧
+    assert _stored_count(tmp_path, b"SAME") == 1
+    assert os.path.exists(moved)  # 実体は消さない
+
+
+def test_verify_does_not_revive_content_stored_elsewhere(make_config, tmp_path, fake_crawler):
+    """missing の行を verify が戻すとき、同じ内容が別の保存フォルダに stored なら戻さない。"""
+    from models import MODE_VERIFY, STATUS_MISSING
+    a, b, src_a, src_b = _dirs(tmp_path, "archive_a", "archive_b", "in_a", "in_b")
+    write_file(os.path.join(src_a, "x.txt"), b"SAME")
+    assert _add(make_config, a, src_a, tmp_path, fake_crawler) == main.EXIT_OK
+    sess, engine = _db(tmp_path)
+    try:  # A を外している間に A の記録が missing になった（forget 等）
+        for r in sess.query(ArchiveFile).all():
+            r.status = STATUS_MISSING
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    write_file(os.path.join(src_b, "y.txt"), b"SAME")
+    assert _add(make_config, b, src_b, tmp_path, fake_crawler) == main.EXIT_OK
+    fake_crawler(a, str(tmp_path / "verify_a.db"))
+    assert main.run(make_config(mode=MODE_VERIFY, archive_root=a)) == main.EXIT_OK
+    assert _stored_count(tmp_path, b"SAME") == 1
+
+
+def test_same_file_is_checked_against_every_copy(make_config, tmp_path, fake_crawler, monkeypatch):
+    """前の候補で検証が通っても、消す対象が後ろの候補の保存物そのものなら消さない。"""
+    a, b, leftover = _seed_cross(make_config, tmp_path, fake_crawler)
+    bid = _archive_id_of(tmp_path, b)
+    sess, engine = _db(tmp_path)
+    try:
+        item = sess.query(IngestItem).filter_by(result=RESULT_DUPLICATE).one()
+        a_stored = os.path.join(a, *sess.get(ArchiveFile, item.archive_file_id).stored_path_rel.split("/"))
+        copy = write_file(os.path.join(b, "old", "x.txt"), b"SAME")  # B（今の保存フォルダ）にもある
+        b_row = ArchiveFile(
+            archive_id=bid, filehash=_file_hash(copy), hash_algo="sha256", size=4,
+            name="x.txt", stored_path_rel="old/x.txt", status=STATUS_STORED,
+        )
+        sess.add(b_row)
+        sess.flush()
+        item.archive_file_id = b_row.id  # B の実物が先に検証される
+        item.source_path_abs = a_stored
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    # A の目印が消えていて「保存フォルダの中」の確認をすり抜けた場合。check_item は ArchiveLookup.enclosing を
+    # 直接呼ぶので、そちらを差し替える（モジュール関数 enclosing_archive の差し替えでは効かない）
+    monkeypatch.setattr(dedupe.archives.ArchiveLookup, "enclosing", lambda self, p: None)
+    cfg = make_config(mode=MODE_DELETE_DUPLICATES, archive_root=b, assume_yes=True)
+    assert main.run(cfg) == main.EXIT_OK
+    assert os.path.exists(a_stored)
+    sess, engine = _db(tmp_path)
+    try:  # 止めたのが same_file の判定であること（source_in_archive ではない）
+        item = sess.query(IngestItem).filter_by(result=RESULT_DUPLICATE).one()
+        cfg.archive_id = bid
+        assert dedupe.check_item(sess, cfg, item)[0] == dedupe.CHECK_SAME_FILE
+    finally:
+        sess.close(); engine.dispose()
+
+
+def test_legacy_archive_folder_is_treated_as_archive(make_config, tmp_path, fake_crawler):
+    """v0.1.x の保存フォルダ（.akasyx/archive.db だけ）も保存フォルダとして断る。"""
+    a, src = _dirs(tmp_path, "archive_a", "inbox")
+    write_file(os.path.join(src, "old_v01", ".akasyx", "archive.db"), b"legacy")
+    write_file(os.path.join(src, "old_v01", "2020", "x.jpg"), b"X")
+    fake_crawler(src, str(tmp_path / "crawl.db"))
+    with pytest.raises(PreflightError, match="archive folder"):
+        main.run(make_config(archive_root=a, source_path=src))
+    with pytest.raises(PreflightError, match="archive folder"):
+        main.run(make_config(archive_root=a, source_path=os.path.join(src, "old_v01", "2020")))
+
+
+def test_forgotten_archive_is_restored_when_it_comes_back(make_config, tmp_path, fake_crawler):
+    """つながっていないだけの保存フォルダを forget しても、つなぎ直せば記録が戻り、重複は入らない。"""
+    n, src_n, src_n2 = _dirs(tmp_path, "nas_archive", "in_n", "in_n2")
+    write_file(os.path.join(src_n, "x.txt"), b"SAME")
+    assert _add(make_config, n, src_n, tmp_path, fake_crawler) == main.EXIT_OK
+    nid = _archive_id_of(tmp_path, n)
+    unplugged = str(tmp_path / "unplugged")
+    shutil.move(n, unplugged)
+    argv = ["archives", "--forget", str(nid), "--archive-db", archive_db_path(tmp_path)]
+    assert main.main(argv) == main.EXIT_OK
+    shutil.move(unplugged, n)  # つなぎ直した
+    write_file(os.path.join(src_n2, "again.txt"), b"SAME")
+    assert _add(make_config, n, src_n2, tmp_path, fake_crawler) == main.EXIT_OK
+    assert os.path.exists(os.path.join(src_n2, "again.txt"))  # 重複として残る
+    assert _stored_count(tmp_path, b"SAME") == 1
+
+
+def test_archive_check_per_file_only_when_following_symlinks(
+    make_config, tmp_path, fake_crawler, monkeypatch
+):
+    import archives
+    a, src = _dirs(tmp_path, "archive_a", "inbox")
+    for i in range(3):
+        write_file(os.path.join(src, f"d{i}", "f.txt"), f"F{i}".encode())
+    calls = []
+    real = archives.ArchiveLookup.enclosing
+    # モジュール関数 enclosing_archive もファイルごとの判定もこのメソッドを通る
+    monkeypatch.setattr(
+        archives.ArchiveLookup, "enclosing", lambda self, p: calls.append(p) or real(self, p)
+    )
+    assert _add(make_config, a, src, tmp_path, fake_crawler) == main.EXIT_OK
+    file_dirs = {os.path.realpath(os.path.join(src, f"d{i}")) for i in range(3)}
+    # 事前チェック（投入元・保存フォルダの上位）では呼ぶが、ファイルごと（そのフォルダ）には呼ばない
+    assert not [p for p in calls if os.path.realpath(p) in file_dirs]
+    assert calls  # 計測が効いていること
+
+
+def test_leftover_akasyx_is_not_reported_as_own_data(make_config, tmp_path, fake_crawler):
+    from models import RESULT_SKIPPED_IN_ARCHIVE
+    a, src = _dirs(tmp_path, "archive_a", "inbox")
+    write_file(os.path.join(src, "old", ".akasyx", "tmp", "x.part"), b"PART")
+    assert _add(make_config, a, src, tmp_path, fake_crawler) == main.EXIT_OK
+    sess, engine = _db(tmp_path)
+    try:
+        item = sess.query(IngestItem).filter_by(name="x.part").one()
+        assert item.result == RESULT_SKIPPED_IN_ARCHIVE
+        assert "own data" not in (item.message or "")
+    finally:
+        sess.close(); engine.dispose()
+
+
+# --- レビュー指摘 5 回目（2026-09-27）------------------------------------------
+
+
+def test_forget_is_not_undone_by_new_folder_at_same_path(make_config, tmp_path, fake_crawler):
+    """消した保存フォルダと同じパスに作り直した空フォルダでは、forget した記録を戻さない。"""
+    t, src_t, src2 = _dirs(tmp_path, "trial", "in_t", "in2")
+    write_file(os.path.join(src_t, "x.txt"), b"SAME")
+    assert _add(make_config, t, src_t, tmp_path, fake_crawler) == main.EXIT_OK
+    tid = _archive_id_of(tmp_path, t)
+    shutil.rmtree(t)
+    argv = ["archives", "--forget", str(tid), "--archive-db", archive_db_path(tmp_path)]
+    assert main.main(argv) == main.EXIT_OK
+    os.makedirs(t)  # 同じパスに空フォルダを作り直した
+    write_file(os.path.join(src2, "y.txt"), b"SAME")
+    assert _add(make_config, t, src2, tmp_path, fake_crawler) == main.EXIT_OK
+    assert not os.path.exists(os.path.join(src2, "y.txt"))  # 保存された
+    assert _stored_count(tmp_path, b"SAME") == 1
+    # 次に開いても（識別子が一致しても）古い記録は戻らない
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=t)) == main.EXIT_OK
+    assert _stored_count(tmp_path, b"SAME") == 1
+
+
+def test_file_symlink_into_archive_is_skipped(make_config, tmp_path, monkeypatch):
+    """--follow-symlinks で、ファイル単位のリンクが保存フォルダの中を指していても動かさない。"""
+    import crawler_client
+    from conftest import build_crawler_db
+    a, x, src = _dirs(tmp_path, "archive_a", "foreign_x", "inbox")
+    write_file(os.path.join(x, ".akasyx", "archive.id"), b"other-db\n")
+    target = write_file(os.path.join(x, "2024-01", "a.jpg"), b"AJPG")
+    os.symlink(target, os.path.join(src, "a.jpg"))
+    crawl_db = str(tmp_path / "crawl.db")
+
+    def _run(t, config, extra_excludes=()):
+        scan_id = build_crawler_db(crawl_db, t)
+        return crawler_client.CrawlerScan(db_path=crawl_db, scan_id=scan_id, status="completed", root_dir=t)
+
+    monkeypatch.setattr(crawler_client, "resolve_crawler_repo", lambda path: path)
+    monkeypatch.setattr(crawler_client, "run_crawler", _run)
+    assert main.run(make_config(archive_root=a, source_path=src, follow_symlinks=True)) == main.EXIT_OK
+    assert os.path.islink(os.path.join(src, "a.jpg"))
+    assert os.path.isfile(target) and not os.path.islink(target)
+
+
+def test_forget_keeps_disposition_flags(make_config, tmp_path, fake_crawler):
+    from models import DISPOSITION_QUARANTINE
+    n, src_n = _dirs(tmp_path, "nas_archive", "in_n")
+    write_file(os.path.join(src_n, "x.txt"), b"SAME")
+    assert _add(make_config, n, src_n, tmp_path, fake_crawler) == main.EXIT_OK
+    nid = _archive_id_of(tmp_path, n)
+    sess, engine = _db(tmp_path)
+    try:
+        sess.query(ArchiveFile).one().disposition = DISPOSITION_QUARANTINE
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    unplugged = str(tmp_path / "unplugged")
+    shutil.move(n, unplugged)
+    argv = ["archives", "--forget", str(nid), "--archive-db", archive_db_path(tmp_path)]
+    assert main.main(argv) == main.EXIT_OK
+    shutil.move(unplugged, n)
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=n)) == main.EXIT_OK
+    sess, engine = _db(tmp_path)
+    try:
+        row = sess.query(ArchiveFile).one()
+        assert row.status == STATUS_STORED
+        assert row.disposition == DISPOSITION_QUARANTINE
+    finally:
+        sess.close(); engine.dispose()
+
+
+def test_prune_does_not_touch_archive_folders(make_config, tmp_path, fake_crawler):
+    """delete-duplicates の空フォルダ掃除は、投入元ルートの中にある保存フォルダの中に入らない。"""
+    a, b, leftover = _seed_cross(make_config, tmp_path, fake_crawler)
+    src_b = os.path.dirname(leftover)
+    inner = os.path.join(src_b, "archive_c")  # #6 の事前チェックより前の取り込みで、投入元の中にあった
+    write_file(os.path.join(inner, ".akasyx", "archive.id"), b"c\n")
+    empty = os.path.join(inner, "2026-01", "empty")
+    os.makedirs(empty)
+    cfg = make_config(
+        mode=MODE_DELETE_DUPLICATES, archive_root=b, assume_yes=True, prune_empty_dirs=True
+    )
+    assert main.run(cfg) == main.EXIT_OK
+    assert os.path.isdir(empty)
+
+
+# --- レビュー指摘 6 回目（2026-09-27）------------------------------------------
+
+
+def test_forget_refuses_folder_present_without_id(make_config, tmp_path, fake_crawler):
+    """識別子ファイルだけ消えて保存フォルダ自体がその場所にあるなら forget を断る。"""
+    t, src_t = _dirs(tmp_path, "trial", "in_t")
+    write_file(os.path.join(src_t, "x.txt"), b"SAME")
+    assert _add(make_config, t, src_t, tmp_path, fake_crawler) == main.EXIT_OK
+    tid = _archive_id_of(tmp_path, t)
+    os.unlink(os.path.join(t, ".akasyx", "archive.id"))
+    argv = ["archives", "--forget", str(tid), "--archive-db", archive_db_path(tmp_path)]
+    assert main.main(argv) == main.EXIT_REJECTED
+    assert _stored_count(tmp_path, b"SAME") == 1
+
+
+def test_restore_keeps_one_stored_even_for_duplicates_from_before_forget(
+    make_config, tmp_path, fake_crawler
+):
+    """forget より前から別の保存フォルダにも stored だった内容（#6 以前のデータ）も、戻すときは全体で 1 つに寄せる。
+
+    規則は「今、別の保存フォルダに stored があれば stored にしない」の 1 つだけ（2026-09-27 レビュー 8 回目で単純化）。
+    外れた記録は missing になるだけで、ファイルは消えない（次の verify で未登録として拾われる）。
+    """
+    n, b, src_n, src_b = _dirs(tmp_path, "nas_archive", "archive_b", "in_n", "in_b")
+    write_file(os.path.join(src_n, "x.txt"), b"SAME")
+    assert _add(make_config, n, src_n, tmp_path, fake_crawler) == main.EXIT_OK
+    write_file(os.path.join(src_b, "seed.txt"), b"SEED")
+    assert _add(make_config, b, src_b, tmp_path, fake_crawler) == main.EXIT_OK
+    bid = _archive_id_of(tmp_path, b)
+    sess, engine = _db(tmp_path)
+    try:  # #6 以前の保存フォルダ単位の判定で B にも保存されていた
+        copy = write_file(os.path.join(b, "old", "x.txt"), b"SAME")
+        sess.add(ArchiveFile(
+            archive_id=bid, filehash=_file_hash(copy), hash_algo="sha256", size=4,
+            name="x.txt", stored_path_rel="old/x.txt", status=STATUS_STORED,
+        ))
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    nid = _archive_id_of(tmp_path, n)
+    unplugged = str(tmp_path / "unplugged")
+    shutil.move(n, unplugged)
+    argv = ["archives", "--forget", str(nid), "--archive-db", archive_db_path(tmp_path)]
+    assert main.main(argv) == main.EXIT_OK
+    shutil.move(unplugged, n)
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=n)) == main.EXIT_OK
+    assert _stored_count(tmp_path, b"SAME") == 1
+    assert os.path.exists(os.path.join(n, *_stored_rel_in(tmp_path, n, b"SAME")))  # ファイルは残る
+
+
+def test_duplicates_in_unavailable_archive_are_reported(make_config, tmp_path, fake_crawler, capsys):
+    """持ち主の保存フォルダにつながっていない重複は、サマリで分けて知らせる。"""
+    t, r, src_t, src_r = _dirs(tmp_path, "trial", "real", "in_t", "in_r")
+    write_file(os.path.join(src_t, "x.txt"), b"SAME")
+    assert _add(make_config, t, src_t, tmp_path, fake_crawler) == main.EXIT_OK
+    shutil.rmtree(t)
+    write_file(os.path.join(src_r, "y.txt"), b"SAME")
+    capsys.readouterr()
+    assert _add(make_config, r, src_r, tmp_path, fake_crawler) == main.EXIT_OK
+    out = capsys.readouterr().out
+    assert "not available" in out and "--forget" in out
+
+
+# --- レビュー指摘 7 回目（2026-09-27）------------------------------------------
+
+
+def test_restore_does_not_duplicate_content_revived_elsewhere_after_forget(
+    make_config, tmp_path, fake_crawler
+):
+    """forget の後に（forget より前に作られた）別の保存フォルダの行が stored に戻っても、二重にしない。"""
+    from models import STATUS_MISSING
+    n, b, src_n, src_b = _dirs(tmp_path, "nas_archive", "archive_b", "in_n", "in_b")
+    write_file(os.path.join(src_b, "seed.txt"), b"SEED")
+    assert _add(make_config, b, src_b, tmp_path, fake_crawler) == main.EXIT_OK
+    bid = _archive_id_of(tmp_path, b)
+    copy = write_file(os.path.join(b, "old", "x.txt"), b"SAME")
+    sess, engine = _db(tmp_path)
+    try:  # B の行は forget より前に作られたが、この時点では missing
+        sess.add(ArchiveFile(
+            archive_id=bid, filehash=_file_hash(copy), hash_algo="sha256", size=4,
+            name="x.txt", stored_path_rel="old/x.txt", status=STATUS_MISSING,
+        ))
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    write_file(os.path.join(src_n, "x.txt"), b"SAME")
+    assert _add(make_config, n, src_n, tmp_path, fake_crawler) == main.EXIT_OK
+    nid = _archive_id_of(tmp_path, n)
+    unplugged = str(tmp_path / "unplugged")
+    shutil.move(n, unplugged)
+    argv = ["archives", "--forget", str(nid), "--archive-db", archive_db_path(tmp_path)]
+    assert main.main(argv) == main.EXIT_OK
+    sess, engine = _db(tmp_path)
+    try:  # forget の後に B の行が stored に戻った（verify の復活など）
+        sess.query(ArchiveFile).filter_by(archive_id=bid, name="x.txt").one().status = STATUS_STORED
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    shutil.move(unplugged, n)
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=n)) == main.EXIT_OK
+    assert _stored_count(tmp_path, b"SAME") == 1
+
+
+def test_legacy_import_does_not_duplicate_stored_content(session, tmp_path):
+    """v0.1.x の DB の取り込みでも、別の保存フォルダに stored がある内容は stored にしない。"""
+    import archives
+    from models import Archive
+    from test_archives import _make_legacy_db
+    from database import legacy_db_path
+    other = Archive(uid="other", root_abs=str(tmp_path / "other"))
+    session.add(other)
+    session.commit()
+    session.add(ArchiveFile(
+        archive_id=other.id, filehash="a" * 64, hash_algo="sha256", size=3, name="a.txt",
+        stored_path_rel="a.txt", status=STATUS_STORED,
+    ))
+    session.commit()
+    legacy_root = str(tmp_path / "legacy")
+    os.makedirs(legacy_root)
+    _make_legacy_db(legacy_db_path(legacy_root), legacy_root)
+    archives.resolve_archive(session, legacy_root)
+    assert session.query(ArchiveFile).filter_by(filehash="a" * 64, status=STATUS_STORED).count() == 1
+
+
+@pytest.mark.parametrize("inside", [True, False])
+def test_archive_folder_nested_with_another_is_refused(make_config, tmp_path, fake_crawler, inside):
+    """保存フォルダが別の保存フォルダの中にある、または中に含む場合は断る。"""
+    outer, src, src2 = _dirs(tmp_path, "outer", "in_a", "in2")
+    a = os.path.join(outer, "archive_a")
+    os.makedirs(a)
+    write_file(os.path.join(src, "x.txt"), b"SAME")
+    assert _add(make_config, a, src, tmp_path, fake_crawler) == main.EXIT_OK
+    write_file(os.path.join(src2, "y.txt"), b"OTHER")
+    target = os.path.join(a, "sub") if inside else outer
+    os.makedirs(target, exist_ok=True)
+    fake_crawler(src2, str(tmp_path / "c.db"))
+    with pytest.raises(PreflightError, match="(inside|contains) an(other)? archive folder"):
+        main.run(make_config(archive_root=target, source_path=src2))
+    assert os.path.exists(os.path.join(src2, "y.txt"))
+
+
+def test_conflict_path_reports_unavailable_owner(make_config, tmp_path, monkeypatch):
+    """予約の衝突で重複になった経路でも、持ち主がつながっていなければ案内と件数に出す。"""
+    import archives
+    import ingest as ingest_mod
+    from models import Archive
+    sess, engine = _db(tmp_path)
+    try:
+        gone = Archive(uid="gone", root_abs=str(tmp_path / "gone"))
+        sess.add(gone)
+        sess.commit()
+        row = ArchiveFile(archive_id=gone.id, filehash="h", hash_algo="sha256", size=1, name="n",
+                          stored_path_rel="n", status=STATUS_STORED)
+        sess.add(row)
+        sess.commit()
+        lookup = archives.ArchiveLookup()
+        cfg = make_config(archive_id=gone.id + 100)  # 今の保存フォルダは別
+        msg = ingest_mod.owner_location(sess, row, cfg, lookup)
+        assert "--forget" in msg and lookup.unavailable_duplicates == {gone.id: 1}
+    finally:
+        sess.close(); engine.dispose()
+    # 衝突経路が config と lookup を渡していること
+    import inspect
+    src = inspect.getsource(ingest_mod._process_one)
+    assert "owner_location(session, owner, config, lookup)" in src
+
+
+def test_restore_path_check_matches_sqlite_lower(session, tmp_path):
+    """戻すときのパス衝突は SQLite の lower() と同じ比べ方（ASCII だけ）で判定する。"""
+    import archives
+    from models import STATUS_FORGOTTEN, STATUS_UNREGISTERED
+    root = str(tmp_path / "n")
+    os.makedirs(root)
+    arch = archives.resolve_archive(session, root)
+    session.add_all([
+        ArchiveFile(archive_id=arch.id, filehash="h1", hash_algo="sha256", size=1, name="a",
+                    stored_path_rel="x/Straße.jpg", status=STATUS_FORGOTTEN),
+        ArchiveFile(archive_id=arch.id, filehash="h2", hash_algo="sha256", size=1, name="b",
+                    stored_path_rel="x/STRASSE.jpg", status=STATUS_UNREGISTERED),
+    ])
+    session.commit()
+    archives.resolve_archive(session, root)
+    assert session.query(ArchiveFile).filter_by(filehash="h1").one().status == STATUS_STORED
+
+
+def _stored_rel_in(tmp_path, root, content: bytes):
+    import hashlib
+    aid = _archive_id_of(tmp_path, root)
+    sess, engine = _db(tmp_path)
+    try:
+        row = sess.query(ArchiveFile).filter_by(
+            archive_id=aid, filehash=hashlib.sha256(content).hexdigest()
+        ).one()
+        return row.stored_path_rel.split("/")
+    finally:
+        sess.close(); engine.dispose()
+
+
+# --- レビュー指摘 8 回目（2026-09-27）: stored への遷移を 1 か所に集める ---------------------------
+
+
+def test_promote_is_the_single_rule(session, tmp_path):
+    """promote_many は「今、別の保存フォルダに stored があれば stored にしない」だけで決める。"""
+    import archives
+    from models import STATUS_MISSING, Archive
+    other = Archive(uid="o", root_abs=str(tmp_path / "o"))
+    session.add(other)
+    session.commit()
+    session.add(ArchiveFile(archive_id=other.id, filehash="h1", hash_algo="sha256", size=1,
+                            name="a", stored_path_rel="a", status=STATUS_STORED))
+    mine = [
+        ArchiveFile(archive_id=1, filehash="h1", hash_algo="sha256", size=1, name="a",
+                    stored_path_rel="a", status=STATUS_MISSING),
+        ArchiveFile(archive_id=1, filehash="h2", hash_algo="sha256", size=1, name="b",
+                    stored_path_rel="b", status=STATUS_MISSING),
+    ]
+    session.add_all(mine)
+    session.commit()
+    promoted = archives.promote_many(session, mine)
+    assert [r.filehash for r in promoted] == ["h2"]
+    assert mine[0].status == STATUS_MISSING and mine[1].status == STATUS_STORED
+
+
+def test_unavailable_owner_note_prefers_connected_copy(make_config, tmp_path, fake_crawler, capsys):
+    """同じ内容がつながっている別の保存フォルダにもあれば、「そこにしか無い」とも forget とも案内しない。"""
+    b, c, a, src_b, src_c, src_a = _dirs(tmp_path, "archive_b", "archive_c", "archive_a", "in_b", "in_c", "in_a")
+    write_file(os.path.join(src_b, "x.txt"), b"SAME")
+    assert _add(make_config, b, src_b, tmp_path, fake_crawler) == main.EXIT_OK
+    write_file(os.path.join(src_c, "seed.txt"), b"SEED")
+    assert _add(make_config, c, src_c, tmp_path, fake_crawler) == main.EXIT_OK
+    cid = _archive_id_of(tmp_path, c)
+    copy = write_file(os.path.join(c, "old", "x.txt"), b"SAME")
+    sess, engine = _db(tmp_path)
+    try:  # #6 以前のデータで C にもあった
+        sess.add(ArchiveFile(archive_id=cid, filehash=_file_hash(copy), hash_algo="sha256", size=4,
+                             name="x.txt", stored_path_rel="old/x.txt", status=STATUS_STORED))
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    shutil.move(b, str(tmp_path / "unplugged"))  # B（id が小さい）が外れている
+    write_file(os.path.join(src_a, "y.txt"), b"SAME")
+    capsys.readouterr()
+    assert _add(make_config, a, src_a, tmp_path, fake_crawler) == main.EXIT_OK
+    assert "--forget" not in capsys.readouterr().out
+    sess, engine = _db(tmp_path)
+    try:
+        item = sess.query(IngestItem).filter_by(name="y.txt").one()
+        assert "--forget" not in item.message and c in item.message
+    finally:
+        sess.close(); engine.dispose()
+
+
+def test_dedupe_checks_other_archives_only_when_needed(make_config, tmp_path, fake_crawler, monkeypatch):
+    """今の保存フォルダの実物で検証できれば、別の保存フォルダがつながっているかは確かめない。"""
+    import archives
+    a, b, leftover = _seed_cross(make_config, tmp_path, fake_crawler)
+    bid = _archive_id_of(tmp_path, b)
+    copy = write_file(os.path.join(b, "old", "x.txt"), b"SAME")
+    sess, engine = _db(tmp_path)
+    try:
+        sess.add(ArchiveFile(archive_id=bid, filehash=_file_hash(copy), hash_algo="sha256", size=4,
+                             name="x.txt", stored_path_rel="old/x.txt", status=STATUS_STORED))
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    calls = []
+    real = archives.ArchiveLookup.available
+    monkeypatch.setattr(archives.ArchiveLookup, "available", lambda self, row: calls.append(row.id) or real(self, row))
+    cfg = make_config(mode=MODE_DELETE_DUPLICATES, archive_root=b, assume_yes=True)
+    assert main.run(cfg) == main.EXIT_OK
+    assert not os.path.exists(leftover)
+    assert calls == []
+
+
+def test_archives_below_limit_excludes_root(tmp_path):
+    import archives
+    root = tmp_path / "root"
+    write_file(str(root / ".akasyx" / "archive.db"), b"legacy")
+    for i in range(5):
+        write_file(str(root / f"n{i}" / ".akasyx" / "archive.id"), b"x\n")
+    found = archives.archives_below(str(root), exclude_root=True)
+    assert len(found) == 5 and str(root) not in found
+
+
+def test_dedupe_verdicts_have_ui_labels():
+    import json
+    import pathlib
+    loc = pathlib.Path(__file__).resolve().parents[2] / "electron-ui" / "locales"
+    for f in loc.glob("*.json"):
+        d = json.loads(f.read_text(encoding="utf-8"))
+        for v in ("verified", "gone", "source_changed", "archive_missing",
+                  "archive_unavailable", "source_in_archive", "same_file", "skipped_in_archive"):
+            assert f"result_{v}" in d, (f.name, v)
+
+
+# --- レビュー指摘 9 回目（2026-09-28）------------------------------------------
+
+
+def test_same_file_check_does_not_touch_other_archive_location(
+    make_config, tmp_path, fake_crawler, monkeypatch
+):
+    """same_file の確認は登録上の場所との文字列比較だけで、別の保存フォルダに I/O をかけない。"""
+    a, b, leftover = _seed_cross(make_config, tmp_path, fake_crawler)
+    unplugged = str(tmp_path / "unplugged")
+    shutil.move(a, unplugged)  # A（持ち主）が外れている
+    real_a = os.path.realpath(a)
+    orig = os.path.realpath
+
+    def _realpath(p, *args, **kwargs):
+        assert not str(p).startswith(real_a), f"touched the unavailable archive: {p}"
+        return orig(p, *args, **kwargs)
+
+    cfg = make_config(mode=MODE_DELETE_DUPLICATES, archive_root=b)
+    import dedupe as dedupe_mod
+    from utl import helpers
+    sess, engine = _db(tmp_path)
+    try:
+        item = sess.query(IngestItem).filter_by(result=RESULT_DUPLICATE).one()
+        cfg.archive_id = _archive_id_of(tmp_path, b)
+        monkeypatch.setattr(helpers.os.path, "realpath", _realpath)
+        monkeypatch.setattr(dedupe_mod.archives, "is_at_registered_location", lambda row: False)
+        verdict, _ = dedupe_mod.check_item(sess, cfg, item)
+        assert verdict == dedupe_mod.CHECK_ARCHIVE_UNAVAILABLE
+    finally:
+        sess.close(); engine.dispose()
+
+
+def test_nested_archive_registered_before_6_still_opens(make_config, tmp_path, fake_crawler):
+    """#6 より前に登録済みの入れ子の保存フォルダは、これまでどおり開ける（断るのは新しく登録するときだけ）。"""
+    from models import Archive
+    outer = str(tmp_path / "photos")
+    inner = os.path.join(outer, "2024")
+    os.makedirs(inner)
+    sess, engine = _db(tmp_path)
+    try:  # v0.2.0 で両方登録済み
+        for uid, root in (("outer-uid", outer), ("inner-uid", inner)):
+            sess.add(Archive(uid=uid, root_abs=os.path.realpath(root)))
+            write_file(os.path.join(root, ".akasyx", "archive.id"), f"{uid}\n".encode())
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=inner)) == main.EXIT_OK
+    # 新しく入れ子を作るのは断る
+    new_inner = os.path.join(outer, "2025")
+    os.makedirs(new_inner)
+    with pytest.raises(PreflightError, match="inside another archive folder"):
+        main.run(make_config(mode=MODE_REPORT, archive_root=new_inner))
+
+
+def test_hard_linked_master_db_is_refused(tmp_path):
+    """ハードリンクの別パスで同じ正本 DB を開くとロックファイルが分かれるので、ハードリンクされた正本 DB は断る。
+
+    （SQLite もハードリンクの DB は -wal / -journal の名前がずれて壊れうるとしている）
+    """
+    db = tmp_path / "data" / "archive.db"
+    db.parent.mkdir()
+    db.write_bytes(b"")
+    os.link(db, tmp_path / "alias.db")
+    with pytest.raises(PreflightError, match="hard link"):
+        with master_db_lock(str(db)):
+            pass
+
+
+def test_drive_root_archive_is_not_nested_in_itself(monkeypatch):
+    """ドライブのルート（dirname がそれ自身）を保存フォルダにしても、自分の目印で「入れ子」と断らない。"""
+    import archives
+    monkeypatch.setattr(archives, "has_archive_marker", lambda d: d == os.sep)
+    monkeypatch.setattr(archives, "archives_below", lambda *a, **k: [])
+    archives.check_new_archive_placement(os.sep)  # 断らない
+
+
+def test_master_db_inside_akasyx_folder_is_refused(make_config, tmp_path):
+    """正本 DB を <フォルダ>/.akasyx/archive.db に置くと、そのフォルダが v0.1.x の保存フォルダに見えるので断る。"""
+    home = tmp_path / "home"
+    argv = ["archives", "--archive-db", str(home / ".akasyx" / "archive.db")]
+    assert main.main(argv) == main.EXIT_REJECTED
+
+
+@pytest.mark.parametrize("variant", ["symlink", "case"])
+def test_master_db_in_akasyx_via_symlink_or_case_is_refused(tmp_path, variant):
+    from utl import helpers
+    if variant == "case" and not helpers._CASE_INSENSITIVE:
+        pytest.skip("大文字小文字を区別する FS では .AKASYX は別のフォルダ（目印にならない）")
+    real = tmp_path / "home" / ".akasyx"
+    real.mkdir(parents=True)
+    if variant == "symlink":
+        link = tmp_path / "dbdir"
+        os.symlink(real, link)
+        db = link / "archive.db"
+    else:
+        db = tmp_path / "home" / ".AKASYX" / "archive.db"
+    assert main.main(["archives", "--archive-db", str(db)]) == main.EXIT_REJECTED
+
+
+def test_master_db_in_akasyx_with_other_name_is_allowed(tmp_path):
+    """目印になるのは .akasyx/archive.db だけなので、別の名前の DB は断らない。"""
+    db = tmp_path / "data" / ".akasyx" / "custom.db"
+    assert main.main(["archives", "--archive-db", str(db)]) == main.EXIT_OK
