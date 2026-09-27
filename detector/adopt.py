@@ -1,0 +1,140 @@
+# adopt.py - 中身のある保存フォルダを実体から登録する（#4 / #5）
+#
+# 中身があるのに記録が 1 件も無い保存フォルダ（既存の写真フォルダを初めて保存フォルダにした、
+# 正本 DB を失った 等）の実体を走査し、stored として登録する。ファイルは動かさない。
+# 同じ内容は全保存フォルダで 1 つだけ stored にし（archives.promote_many）、2 つ目以降は
+# unregistered にして archive_duplicate として報告する。
+#
+# 途中で落ちても半端な記録を残さないよう、走査が終わってから全件を 1 トランザクションで書く。
+# 落ちたら登録だけ残るが、記録が 0 件なので adopt 以外のコマンドは断ったまま（やり直せる）。
+import logging
+from datetime import datetime
+
+import archives
+import crawler_client
+from config import OS_JUNK_FILES
+from database import META_DIRNAME
+from models import (
+    RESULT_ADOPTED,
+    RESULT_ARCHIVE_DUPLICATE,
+    RESULT_FAILED,
+    RESULT_SKIPPED_EMPTY,
+    STATUS_UNREGISTERED,
+    Archive,
+    ArchiveFile,
+    IngestItem,
+)
+from utl.result_csv import create_csv, csv_update
+
+logger = logging.getLogger(__name__)
+
+
+def run_adopt(session, config, ingest) -> tuple[str, dict]:
+    """保存フォルダの実体を登録します。戻り値は (実行ステータス, result 別件数)。"""
+    scan = crawler_client.run_crawler(
+        config.archive_root, config, extra_excludes=(f"{META_DIRNAME}/", *OS_JUNK_FILES)
+    )
+    crawler_client.ensure_completed(scan)
+    ingest.crawler_db_path = scan.db_path
+    ingest.crawler_scan_id = scan.scan_id
+    session.commit()
+
+    scanned = sorted(
+        crawler_client.read_files(scan.db_path, scan.scan_id), key=lambda f: f.path_rel
+    )
+    counters: dict[str, int] = {}
+    decisions: list[tuple[object, str, ArchiveFile | None, str | None]] = []
+    first_of: dict[tuple[str, str], ArchiveFile] = {}
+
+    try:
+        for f in scanned:
+            if f.size < config.min_size:
+                # 0 バイトのファイルは add でも取り込まない（保存価値が無く、全部が同じハッシュになる）
+                decisions.append((f, RESULT_SKIPPED_EMPTY, None, f"size {f.size} is below min_size"))
+                continue
+            if not f.filehash or not f.hash_algo:
+                # 読めなかった。登録すると重複判定に使えない行になるので登録せず、失敗として数える
+                decisions.append((f, RESULT_FAILED, None, "Cannot register: hash unavailable"))
+                continue
+            row = ArchiveFile(
+                archive_id=config.archive_id,
+                filehash=f.filehash,
+                hash_algo=f.hash_algo,
+                size=f.size,
+                name=f.name,
+                stored_path_rel=f.path_rel,
+                origin_modified_at=f.modified_at,
+                mime_type=f.mime_type,
+                ingest_id=ingest.id,
+                status=STATUS_UNREGISTERED,
+            )
+            session.add(row)
+            key = (f.filehash, f.hash_algo)
+            if key in first_of:
+                first = first_of[key]
+                decisions.append(
+                    (f, RESULT_ARCHIVE_DUPLICATE, row, f"Same content as {first.stored_path_rel}")
+                )
+            else:
+                first_of[key] = row
+                decisions.append((f, RESULT_ADOPTED, row, None))
+
+        promoted = {id(r) for r in archives.promote_many(session, list(first_of.values()))}
+        for i, (f, result, row, message) in enumerate(decisions):
+            if result == RESULT_ADOPTED and id(row) not in promoted:
+                # 同じ内容が別の保存フォルダに stored（全体で 1 つ — #6）
+                decisions[i] = (f, RESULT_ARCHIVE_DUPLICATE, row, _elsewhere(session, row))
+        session.flush()
+
+        ts_start = f"{datetime.now():%Y%m%d_%H%M%S}"
+        csv_file = create_csv(config.log_dir, "adopt_result", ts_start)
+        for f, result, row, message in decisions:
+            counters[result] = counters.get(result, 0) + 1
+            session.add(
+                IngestItem(
+                    ingest_id=ingest.id,
+                    source_path_abs=f.path_abs,
+                    source_path_rel=f.path_rel,
+                    name=f.name,
+                    size=f.size,
+                    filehash=f.filehash,
+                    hash_algo=f.hash_algo,
+                    result=result,
+                    archive_file_id=row.id if row is not None else None,
+                    planned_path_rel=f.path_rel,
+                    message=message,
+                )
+            )
+            csv_update(csv_file, [f.name, f.path_abs, result, f.size, f.path_rel, message or ""])
+        session.commit()
+    except KeyboardInterrupt:
+        session.rollback()
+        logger.warning("Interrupted by user; nothing was registered (run adopt again)")
+        return "interrupted", {}
+
+    logger.info(f"CSV report: {csv_file}")
+    if counters.get(RESULT_FAILED):
+        logger.warning(
+            f"{counters[RESULT_FAILED]} files could not be read and were not registered "
+            "(they are not used for duplicate detection). See the CSV report"
+        )
+    return "completed", counters
+
+
+def _elsewhere(session, row: ArchiveFile) -> str:
+    other = (
+        session.query(ArchiveFile)
+        .filter(
+            ArchiveFile.filehash == row.filehash,
+            ArchiveFile.hash_algo == row.hash_algo,
+            ArchiveFile.archive_id != row.archive_id,
+            ArchiveFile.status == "stored",
+        )
+        .order_by(ArchiveFile.id)
+        .first()
+    )
+    if other is None:  # pragma: no cover - promote_many が断った以上、通常は見つかる
+        return "Same content is stored in another archive folder"
+    archive = session.get(Archive, other.archive_id)
+    root = archive.root_abs if archive is not None else f"#{other.archive_id}"
+    return f"Same content already in archive folder {root}: {other.stored_path_rel}"

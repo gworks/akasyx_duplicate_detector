@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from models import (
+    MODE_ADOPT,
     MODE_ADD,
     MODE_ARCHIVES,
     MODE_DELETE_DUPLICATES,
@@ -269,6 +270,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--follow-symlinks", action="store_true", help="follow symbolic links"
     )
     _add_common_args(p_ver)
+
+    # --- adopt -----------------------------------------------------------------
+    p_adp = sub.add_parser(
+        MODE_ADOPT,
+        help="register the files already in an archive folder (a folder with content and no records, "
+        "or one whose master DB was lost)",
+    )
+    p_adp.add_argument("archive_root", help="archive folder")
+    _add_common_args(p_adp)
 
     # --- delete-duplicates ---------------------------------------------------
     p_del = sub.add_parser(

@@ -5,6 +5,7 @@
 import logging
 import os
 import sqlite3
+import stat
 import uuid
 from datetime import datetime
 
@@ -55,8 +56,11 @@ def _write_uid(archive_root: str, uid: str) -> None:
 
 
 def _has_stored_content(root: str) -> bool:
-    """保存フォルダに実ファイルがあるか（.akasyx/ と OS のゴミファイルは数えない）。
+    """保存フォルダに、adopt が登録する実ファイルがあるか（#4 / #5）。
 
+    adopt と同じ条件で数える: `.akasyx/`・OS のゴミファイル・シンボリックリンク（crawler は既定で辿らない）・
+    0 バイトのファイル（min_size 未満。add でも取り込まない）は数えない。条件がずれると、adopt が何も登録しない
+    フォルダを「中身あり」として断り続けたり、逆に登録すべきファイルを見逃したりする。
     読めない配下があれば「空」とは言えないので断る（os.walk は既定で黙って飛ばす）。
     """
 
@@ -66,8 +70,15 @@ def _has_stored_content(root: str) -> bool:
     for dirpath, dirs, names in os.walk(root, onerror=_unreadable):
         if dirpath == root:
             dirs[:] = [d for d in dirs if d != META_DIRNAME]
-        if any(n not in OS_JUNK_FILES for n in names):
-            return True
+        for n in names:
+            if n in OS_JUNK_FILES:
+                continue
+            try:
+                st = os.lstat(os.path.join(dirpath, n))
+            except OSError as e:
+                _unreadable(e)
+            if stat.S_ISREG(st.st_mode) and st.st_size > 0:
+                return True
     return False
 
 
@@ -314,7 +325,7 @@ def check_new_archive_placement(root: str) -> None:
         )
 
 
-def resolve_archive(session, archive_root: str) -> Archive:
+def resolve_archive(session, archive_root: str, adopting: bool = False) -> Archive:
     """保存フォルダに対応する ar_archives 行を返します（無ければ登録）。
 
     1. `.akasyx/archive.id` があれば uid で探す。見つかれば、パスが変わっていれば更新する
@@ -334,7 +345,6 @@ def resolve_archive(session, archive_root: str) -> Archive:
     # 登録には実体のパスを記録する（シンボリックリンク等の一時的な別名を記録すると、別名が消えたあとに
     # 場所で見つけられなくなる）。新規登録・移動・別表記のどの分岐でもこの形を使う
     root = os.path.realpath(archive_root)
-    os.makedirs(tmp_dir(root), exist_ok=True)
     uid = read_uid(root)
 
     row = None
@@ -347,20 +357,31 @@ def resolve_archive(session, archive_root: str) -> Archive:
         if row is not None and uid and row.uid != uid:
             row = None  # 同じ場所に別の保存フォルダが置かれた。パス一致では同一視しない
 
-    if row is None and uid and _has_stored_content(root):
-        raise PreflightError(
-            "This archive folder is not registered in the master DB, but it already contains files:\n"
-            f"  archive folder: {root} (ID {uid})\n"
-            "  It may have been used with a different master DB (e.g. development vs. packaged app,\n"
-            "  another computer). Using it as a new archive could store duplicates of files\n"
-            "  already in it. Specify the master DB it was used with via --archive-db."
-        )
-    if row is None and uid:
-        logger.warning(f"ID {uid} is not in the DB; the archive folder is empty, registering it as new")
     if row is None:
         # 新しく登録する保存フォルダの中に別の保存フォルダがあれば断る（#6）。中の保存物を verify が
         # 未登録として拾い、同じ実体を 2 つの保存フォルダが持つことになる。歩くのは初回の登録時だけ
         check_new_archive_placement(root)
+        # v0.1.x の DB がある保存フォルダは移行で記録ができるので、移行後の確認（_check_records_match_content）に任せる
+        if not adopting and not os.path.isfile(legacy_db_path(root)) and _has_stored_content(root):
+            # 中身があるのに記録が無いまま登録すると、中にある内容と同じファイルまで取り込んで重複を作る（#4 / #5）。
+            # 識別子を書く前に断る（断るだけの実行で利用者のフォルダに登録の跡を残さない）
+            if uid:
+                raise PreflightError(
+                    "This archive folder is not registered in the master DB, but it already contains files:\n"
+                    f"  archive folder: {root} (ID {uid})\n"
+                    "  It may have been used with a different master DB (e.g. development vs. packaged app,\n"
+                    "  another computer). Specify the master DB it was used with via --archive-db.\n"
+                    f"  If that master DB is lost, register the files in it again: adopt {root}"
+                )
+            raise PreflightError(
+                "This folder already contains files, but has no records in the master DB:\n"
+                f"  folder: {root}\n"
+                "  Using it as is could store duplicates of files already in it.\n"
+                f"  Register the files in it first: adopt {root}"
+            )
+        if uid:
+            state = "registering the files in it (adopt)" if adopting else "the archive folder is empty"
+            logger.warning(f"ID {uid} is not in the DB; {state}; registering it with this ID")
         row = Archive(uid=uid or uuid.uuid4().hex, root_abs=root, last_used_at=utcnow())
         session.add(row)
         session.commit()
@@ -394,7 +415,31 @@ def resolve_archive(session, archive_root: str) -> Archive:
     migrated = import_legacy_db(session, row, legacy_db_path(root))
     if migrated:
         logger.info(f"Imported from legacy DB: {migrated}")
+    _check_records_match_content(session, row, root, adopting)
+    os.makedirs(tmp_dir(root), exist_ok=True)
     return row
+
+
+def _check_records_match_content(session, row: Archive, root: str, adopting: bool) -> None:
+    """「中身があるのに記録が 1 件も無い保存フォルダ」は adopt 以外で使わせません（#4 / #5）。
+
+    新しく登録するときは resolve_archive が識別子を書く前に断る。ここで拾うのは、空で登録したあとに
+    手でファイルを入れた場合と、adopt が途中で落ちた場合（登録だけ残る）。adopt は記録が既にあれば断る
+    （登録済みの保存フォルダの実体の変化は verify で扱う）。
+    """
+    has_records = (
+        session.query(ArchiveFile.id).filter(ArchiveFile.archive_id == row.id).first() is not None
+    )
+    if adopting and has_records:
+        raise PreflightError(
+            f"This archive folder already has records; use verify to check it: {root}"
+        )
+    if not adopting and not has_records and _has_stored_content(root):
+        raise PreflightError(
+            "This archive folder contains files, but has no records in the master DB:\n"
+            f"  archive folder: {root}\n"
+            f"  Register the files in it first: adopt {root}"
+        )
 
 
 # --- v0.1.x → v0.2.0 移行 ---------------------------------------------------
