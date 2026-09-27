@@ -13,7 +13,7 @@ import mover
 import report
 import verify
 from config import DetectorConfig
-from database import archive_lock, get_session, master_db_lock
+from database import META_DIRNAME, archive_lock, get_session, legacy_db_path, master_db_lock
 from errors import DetectorError, PreflightError
 from models import (
     MODE_ADD,
@@ -30,7 +30,7 @@ from models import (
     RESULT_SKIPPED_OWN_DATA,
     Ingest,
 )
-from utl.helpers import is_nested, json_dumps
+from utl.helpers import is_nested, json_dumps, path_key
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +54,24 @@ def check_own_data_placement(config: DetectorConfig) -> None:
     main() はログのフォルダ作成・ログファイルの初期化より前にこれを呼ぶ（断る前に保存フォルダの中へ
     ログを作ると、それ自体を verify が保存物として拾ってしまう）。
     """
-    if not config.archive_root:
-        return
+    if config.archive_root:
+        _check_overlap_with_archive(config)
+    # 保存フォルダと重なる場合は上の具体的な案内を先に出す
+    # 正本 DB が v0.1.x の保存フォルダの目印（<フォルダ>/.akasyx/archive.db）と同じ場所になるなら断る。
+    # 判定は archives.has_archive_marker と同じ規則（ファイル名・大文字小文字の扱い）で、親がシンボリックリンクでも
+    # 実体の位置で見る。目印にならない名前（.akasyx/custom.db 等）は断らない
+    if any(
+        path_key(legacy_db_path(os.path.dirname(os.path.dirname(p))), real=False) == path_key(p, real=False)
+        for p in (os.path.abspath(config.archive_db), os.path.realpath(config.archive_db))
+    ):
+        raise PreflightError(
+            f"The master DB cannot be placed at <folder>/{META_DIRNAME}/archive.db "
+            f"(the marker of a v0.1.x archive folder): {config.archive_db}\n"
+            "  Choose another location or file name (--archive-db)."
+        )
+
+
+def _check_overlap_with_archive(config: DetectorConfig) -> None:
     # 重なると verify が更新中の UI データ・DB・ログを保存物として記録し、
     # 正本 DB が .akasyx/archive.db だと旧 DB として取り込んで改名してしまう
     for _kind, label, path, movable in config_module.own_data_locations(config):

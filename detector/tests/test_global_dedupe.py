@@ -688,11 +688,19 @@ def test_same_file_is_checked_against_every_copy(make_config, tmp_path, fake_cra
         sess.commit()
     finally:
         sess.close(); engine.dispose()
-    # A の目印が消えていて「保存フォルダの中」の確認をすり抜けた場合
-    monkeypatch.setattr(dedupe.archives, "enclosing_archive", lambda d: None)
+    # A の目印が消えていて「保存フォルダの中」の確認をすり抜けた場合。check_item は ArchiveLookup.enclosing を
+    # 直接呼ぶので、そちらを差し替える（モジュール関数 enclosing_archive の差し替えでは効かない）
+    monkeypatch.setattr(dedupe.archives.ArchiveLookup, "enclosing", lambda self, p: None)
     cfg = make_config(mode=MODE_DELETE_DUPLICATES, archive_root=b, assume_yes=True)
     assert main.run(cfg) == main.EXIT_OK
     assert os.path.exists(a_stored)
+    sess, engine = _db(tmp_path)
+    try:  # 止めたのが same_file の判定であること（source_in_archive ではない）
+        item = sess.query(IngestItem).filter_by(result=RESULT_DUPLICATE).one()
+        cfg.archive_id = bid
+        assert dedupe.check_item(sess, cfg, item)[0] == dedupe.CHECK_SAME_FILE
+    finally:
+        sess.close(); engine.dispose()
 
 
 def test_legacy_archive_folder_is_treated_as_archive(make_config, tmp_path, fake_crawler):
@@ -732,10 +740,16 @@ def test_archive_check_per_file_only_when_following_symlinks(
     for i in range(3):
         write_file(os.path.join(src, f"d{i}", "f.txt"), f"F{i}".encode())
     calls = []
-    real = archives.enclosing_archive
-    monkeypatch.setattr(archives, "enclosing_archive", lambda p: calls.append(p) or real(p))
+    real = archives.ArchiveLookup.enclosing
+    # モジュール関数 enclosing_archive もファイルごとの判定もこのメソッドを通る
+    monkeypatch.setattr(
+        archives.ArchiveLookup, "enclosing", lambda self, p: calls.append(p) or real(self, p)
+    )
     assert _add(make_config, a, src, tmp_path, fake_crawler) == main.EXIT_OK
-    assert len(calls) <= 2  # 事前チェックの投入元と保存フォルダの上位、各 1 回だけ（ファイルごとには呼ばない）
+    file_dirs = {os.path.realpath(os.path.join(src, f"d{i}")) for i in range(3)}
+    # 事前チェック（投入元・保存フォルダの上位）では呼ぶが、ファイルごと（そのフォルダ）には呼ばない
+    assert not [p for p in calls if os.path.realpath(p) in file_dirs]
+    assert calls  # 計測が効いていること
 
 
 def test_leftover_akasyx_is_not_reported_as_own_data(make_config, tmp_path, fake_crawler):
@@ -1184,3 +1198,54 @@ def test_nested_archive_registered_before_6_still_opens(make_config, tmp_path, f
     os.makedirs(new_inner)
     with pytest.raises(PreflightError, match="inside another archive folder"):
         main.run(make_config(mode=MODE_REPORT, archive_root=new_inner))
+
+
+def test_hard_linked_master_db_is_refused(tmp_path):
+    """ハードリンクの別パスで同じ正本 DB を開くとロックファイルが分かれるので、ハードリンクされた正本 DB は断る。
+
+    （SQLite もハードリンクの DB は -wal / -journal の名前がずれて壊れうるとしている）
+    """
+    db = tmp_path / "data" / "archive.db"
+    db.parent.mkdir()
+    db.write_bytes(b"")
+    os.link(db, tmp_path / "alias.db")
+    with pytest.raises(PreflightError, match="hard link"):
+        with master_db_lock(str(db)):
+            pass
+
+
+def test_drive_root_archive_is_not_nested_in_itself(monkeypatch):
+    """ドライブのルート（dirname がそれ自身）を保存フォルダにしても、自分の目印で「入れ子」と断らない。"""
+    import archives
+    monkeypatch.setattr(archives, "has_archive_marker", lambda d: d == os.sep)
+    monkeypatch.setattr(archives, "archives_below", lambda *a, **k: [])
+    archives.check_new_archive_placement(os.sep)  # 断らない
+
+
+def test_master_db_inside_akasyx_folder_is_refused(make_config, tmp_path):
+    """正本 DB を <フォルダ>/.akasyx/archive.db に置くと、そのフォルダが v0.1.x の保存フォルダに見えるので断る。"""
+    home = tmp_path / "home"
+    argv = ["archives", "--archive-db", str(home / ".akasyx" / "archive.db")]
+    assert main.main(argv) == main.EXIT_REJECTED
+
+
+@pytest.mark.parametrize("variant", ["symlink", "case"])
+def test_master_db_in_akasyx_via_symlink_or_case_is_refused(tmp_path, variant):
+    from utl import helpers
+    if variant == "case" and not helpers._CASE_INSENSITIVE:
+        pytest.skip("大文字小文字を区別する FS では .AKASYX は別のフォルダ（目印にならない）")
+    real = tmp_path / "home" / ".akasyx"
+    real.mkdir(parents=True)
+    if variant == "symlink":
+        link = tmp_path / "dbdir"
+        os.symlink(real, link)
+        db = link / "archive.db"
+    else:
+        db = tmp_path / "home" / ".AKASYX" / "archive.db"
+    assert main.main(["archives", "--archive-db", str(db)]) == main.EXIT_REJECTED
+
+
+def test_master_db_in_akasyx_with_other_name_is_allowed(tmp_path):
+    """目印になるのは .akasyx/archive.db だけなので、別の名前の DB は断らない。"""
+    db = tmp_path / "data" / ".akasyx" / "custom.db"
+    assert main.main(["archives", "--archive-db", str(db)]) == main.EXIT_OK

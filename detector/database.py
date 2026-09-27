@@ -150,6 +150,18 @@ def master_db_lock(archive_db: str):
     """
     path = master_db_lock_path(archive_db)
     try:
+        nlink = os.stat(archive_db).st_nlink
+    except FileNotFoundError:
+        nlink = 1  # 初回（これから作る）
+    except OSError as e:
+        raise PreflightError(f"Cannot access the master DB: {archive_db}: {e}") from e
+    if nlink > 1:
+        # 別のハードリンクのパスで開く実行とはロックファイルが分かれて排他が効かない。
+        # SQLite もハードリンクの DB は -wal / -journal の名前がずれて壊れうるとしている
+        raise PreflightError(
+            f"The master DB has other hard links ({nlink} links); use a single path: {archive_db}"
+        )
+    try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
     except OSError as e:

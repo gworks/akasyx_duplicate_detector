@@ -291,6 +291,29 @@ def _is_live_copy_source(row: Archive, root: str) -> bool:
         return False
 
 
+def check_new_archive_placement(root: str) -> None:
+    """新しく登録する保存フォルダが、別の保存フォルダの中にも、中に別の保存フォルダを含む位置にもないこと（#6）。
+
+    どちらも新しく登録するときだけ見る（#6 より前に登録済みの入れ子の保存フォルダは、これまでどおり開ける）。
+    中に含むと、中の保存物を verify が未登録として拾い、同じ実体を 2 つの保存フォルダが持つことになる。
+    """
+    parent = os.path.dirname(root)
+    # ドライブのルート（E:\ や /）は親が自分自身。自分の目印を「上位の保存フォルダ」と取り違えない
+    outer = enclosing_archive(parent) if parent != root else None
+    if outer is not None:
+        raise PreflightError(
+            "This folder is inside another archive folder, so it cannot be an archive folder:\n"
+            f"  folder            : {root}\n"
+            f"  enclosing archive : {outer}"
+        )
+    nested = archives_below(root, exclude_root=True)
+    if nested:
+        listed = "\n".join(f"  {d}" for d in nested)
+        raise PreflightError(
+            f"This folder contains another archive folder, so it cannot be an archive folder:\n{listed}"
+        )
+
+
 def resolve_archive(session, archive_root: str) -> Archive:
     """保存フォルダに対応する ar_archives 行を返します（無ければ登録）。
 
@@ -337,21 +360,7 @@ def resolve_archive(session, archive_root: str) -> Archive:
     if row is None:
         # 新しく登録する保存フォルダの中に別の保存フォルダがあれば断る（#6）。中の保存物を verify が
         # 未登録として拾い、同じ実体を 2 つの保存フォルダが持つことになる。歩くのは初回の登録時だけ
-        # 別の保存フォルダの中に作るのも断る。どちらも新しく登録するときだけ見る（#6 より前に登録済みの
-        # 入れ子の保存フォルダは、これまでどおり開ける）
-        outer = enclosing_archive(os.path.dirname(root))
-        if outer is not None:
-            raise PreflightError(
-                "This folder is inside another archive folder, so it cannot be an archive folder:\n"
-                f"  folder            : {root}\n"
-                f"  enclosing archive : {outer}"
-            )
-        nested = archives_below(root, exclude_root=True)
-        if nested:
-            listed = "\n".join(f"  {d}" for d in nested)
-            raise PreflightError(
-                f"This folder contains another archive folder, so it cannot be an archive folder:\n{listed}"
-            )
+        check_new_archive_placement(root)
         row = Archive(uid=uid or uuid.uuid4().hex, root_abs=root, last_used_at=utcnow())
         session.add(row)
         session.commit()
