@@ -750,3 +750,88 @@ def test_leftover_akasyx_is_not_reported_as_own_data(make_config, tmp_path, fake
         assert "own data" not in (item.message or "")
     finally:
         sess.close(); engine.dispose()
+
+
+# --- レビュー指摘 5 回目（2026-09-27）------------------------------------------
+
+
+def test_forget_is_not_undone_by_new_folder_at_same_path(make_config, tmp_path, fake_crawler):
+    """消した保存フォルダと同じパスに作り直した空フォルダでは、forget した記録を戻さない。"""
+    t, src_t, src2 = _dirs(tmp_path, "trial", "in_t", "in2")
+    write_file(os.path.join(src_t, "x.txt"), b"SAME")
+    assert _add(make_config, t, src_t, tmp_path, fake_crawler) == main.EXIT_OK
+    tid = _archive_id_of(tmp_path, t)
+    shutil.rmtree(t)
+    argv = ["archives", "--forget", str(tid), "--archive-db", archive_db_path(tmp_path)]
+    assert main.main(argv) == main.EXIT_OK
+    os.makedirs(t)  # 同じパスに空フォルダを作り直した
+    write_file(os.path.join(src2, "y.txt"), b"SAME")
+    assert _add(make_config, t, src2, tmp_path, fake_crawler) == main.EXIT_OK
+    assert not os.path.exists(os.path.join(src2, "y.txt"))  # 保存された
+    assert _stored_count(tmp_path, b"SAME") == 1
+    # 次に開いても（識別子が一致しても）古い記録は戻らない
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=t)) == main.EXIT_OK
+    assert _stored_count(tmp_path, b"SAME") == 1
+
+
+def test_file_symlink_into_archive_is_skipped(make_config, tmp_path, monkeypatch):
+    """--follow-symlinks で、ファイル単位のリンクが保存フォルダの中を指していても動かさない。"""
+    import crawler_client
+    from conftest import build_crawler_db
+    a, x, src = _dirs(tmp_path, "archive_a", "foreign_x", "inbox")
+    write_file(os.path.join(x, ".akasyx", "archive.id"), b"other-db\n")
+    target = write_file(os.path.join(x, "2024-01", "a.jpg"), b"AJPG")
+    os.symlink(target, os.path.join(src, "a.jpg"))
+    crawl_db = str(tmp_path / "crawl.db")
+
+    def _run(t, config, extra_excludes=()):
+        scan_id = build_crawler_db(crawl_db, t)
+        return crawler_client.CrawlerScan(db_path=crawl_db, scan_id=scan_id, status="completed", root_dir=t)
+
+    monkeypatch.setattr(crawler_client, "resolve_crawler_repo", lambda path: path)
+    monkeypatch.setattr(crawler_client, "run_crawler", _run)
+    assert main.run(make_config(archive_root=a, source_path=src, follow_symlinks=True)) == main.EXIT_OK
+    assert os.path.islink(os.path.join(src, "a.jpg"))
+    assert os.path.isfile(target) and not os.path.islink(target)
+
+
+def test_forget_keeps_disposition_flags(make_config, tmp_path, fake_crawler):
+    from models import DISPOSITION_QUARANTINE
+    n, src_n = _dirs(tmp_path, "nas_archive", "in_n")
+    write_file(os.path.join(src_n, "x.txt"), b"SAME")
+    assert _add(make_config, n, src_n, tmp_path, fake_crawler) == main.EXIT_OK
+    nid = _archive_id_of(tmp_path, n)
+    sess, engine = _db(tmp_path)
+    try:
+        sess.query(ArchiveFile).one().disposition = DISPOSITION_QUARANTINE
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    unplugged = str(tmp_path / "unplugged")
+    shutil.move(n, unplugged)
+    argv = ["archives", "--forget", str(nid), "--archive-db", archive_db_path(tmp_path)]
+    assert main.main(argv) == main.EXIT_OK
+    shutil.move(unplugged, n)
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=n)) == main.EXIT_OK
+    sess, engine = _db(tmp_path)
+    try:
+        row = sess.query(ArchiveFile).one()
+        assert row.status == STATUS_STORED
+        assert row.disposition == DISPOSITION_QUARANTINE
+    finally:
+        sess.close(); engine.dispose()
+
+
+def test_prune_does_not_touch_archive_folders(make_config, tmp_path, fake_crawler):
+    """delete-duplicates の空フォルダ掃除は、投入元ルートの中にある保存フォルダの中に入らない。"""
+    a, b, leftover = _seed_cross(make_config, tmp_path, fake_crawler)
+    src_b = os.path.dirname(leftover)
+    inner = os.path.join(src_b, "archive_c")  # #6 の事前チェックより前の取り込みで、投入元の中にあった
+    write_file(os.path.join(inner, ".akasyx", "archive.id"), b"c\n")
+    empty = os.path.join(inner, "2026-01", "empty")
+    os.makedirs(empty)
+    cfg = make_config(
+        mode=MODE_DELETE_DUPLICATES, archive_root=b, assume_yes=True, prune_empty_dirs=True
+    )
+    assert main.run(cfg) == main.EXIT_OK
+    assert os.path.isdir(empty)

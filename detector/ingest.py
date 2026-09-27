@@ -283,7 +283,8 @@ def archive_matcher(config, lookup: "archives.ArchiveLookup | None" = None):
         if parts and parts[0] != os.pardir and META_DIRNAME in parts[:-1]:
             return f"Archive folder management data ({META_DIRNAME}); not ingested"
         if config.follow_symlinks:
-            inside = lookup.enclosing(os.path.dirname(path))
+            # ファイル自体がリンクのこともあるので、最後の要素まで解いた実体の位置で見る
+            inside = lookup.enclosing(os.path.dirname(os.path.realpath(path)))
             if inside is not None:
                 return f"The file is inside an archive folder: {inside}"
         return None

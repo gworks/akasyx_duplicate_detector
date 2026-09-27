@@ -12,7 +12,8 @@ from config import OS_JUNK_FILES
 from database import META_DIRNAME, archive_id_path, legacy_db_path, meta_dir, tmp_dir
 from errors import PreflightError
 from models import (
-    DISPOSITION_FORGOTTEN,
+    PATH_HOLDING_STATUSES,
+    STATUS_FORGOTTEN,
     STATUS_MISSING,
     STATUS_STORED,
     Archive,
@@ -204,14 +205,31 @@ class ArchiveLookup:
     """
 
     def __init__(self):
-        self._enclosing: dict[str, str | None] = {}
+        self._enclosing: dict[str, str | None] = {}  # 実体のパス → それを含む保存フォルダ
         self._available: dict[int, tuple[bool, str | None]] = {}
 
-    def enclosing(self, directory: str) -> str | None:
-        """directory を含む保存フォルダ（enclosing_archive）。"""
-        if directory not in self._enclosing:
-            self._enclosing[directory] = enclosing_archive(directory)
-        return self._enclosing[directory]
+    def enclosing(self, path: str) -> str | None:
+        """path を含む保存フォルダ（enclosing_archive と同じ判定）。上位フォルダごとの結果を使い回す。"""
+        d = os.path.realpath(path)
+        if not os.path.isdir(d):
+            d = os.path.dirname(d)
+        chain = []
+        result = None
+        while d not in self._enclosing:
+            chain.append(d)
+            if has_archive_marker(d):
+                result = d
+                break
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+        else:
+            result = self._enclosing[d]
+        for c in chain:
+            # 目印のあるフォルダより下は、その保存フォルダの中
+            self._enclosing[c] = result
+        return result
 
     def available(self, row: Archive) -> tuple[bool, str | None]:
         """保存フォルダが登録上の場所に今あるか。戻り値は (ある, 無い理由)。識別子を読めなければ無い扱い。"""
@@ -292,6 +310,8 @@ def resolve_archive(session, archive_root: str) -> Archive:
     row = None
     if uid:
         row = session.query(Archive).filter(Archive.uid == uid).first()
+    # 識別子で見つかった = forget した保存フォルダそのものが戻ってきた（場所の一致だけでは同じとは言えない）
+    returned = row is not None
     if row is None:
         row = _find_by_location(session, root)
         if row is not None and uid and row.uid != uid:
@@ -336,7 +356,7 @@ def resolve_archive(session, archive_root: str) -> Archive:
         row.last_used_at = utcnow()
         session.commit()
 
-    _restore_forgotten(session, row)
+    _settle_forgotten(session, row, returned)
     # v0.1.x の DB が保存フォルダに残っていれば取り込む（登録済みかどうかに関係なく）
     migrated = import_legacy_db(session, row, legacy_db_path(root))
     if migrated:
@@ -486,29 +506,46 @@ def _fix_datetimes(data: dict) -> None:
                 data[key] = None
 
 
-def _restore_forgotten(session, row: Archive) -> None:
-    """archives --forget で外した記録を、保存フォルダを開き直したときに stored へ戻します（#6）。
+def _settle_forgotten(session, row: Archive, returned: bool) -> None:
+    """archives --forget で外した記録（forgotten）を、保存フォルダを開いたときに片付けます（#6）。
 
-    外している間に同じ内容が別の保存フォルダに stored になったものは戻さない（全体で 1 つ）。
-    その実体は次の verify で未登録（保存フォルダ内の重複ではない）として拾われる。
-    実体が本当に無くなっていれば、次の verify が missing にする。
+    - 識別子（uid）で見つかった = 外していた保存フォルダそのものが戻った: stored に戻す。ただし外している間に
+      同じ内容が別の保存フォルダに stored になったもの、同じパスが別の行に使われているものは戻さず missing にする
+      （stored は全体で 1 つ。実体が本当に無くなっていれば次の verify が missing にする）
+    - 場所の一致だけ（消した跡に作り直したフォルダ等）: 元の保存物はもう無いので missing にする
     """
     rows = (
         session.query(ArchiveFile)
-        .filter(ArchiveFile.archive_id == row.id, ArchiveFile.disposition == DISPOSITION_FORGOTTEN)
+        .filter(ArchiveFile.archive_id == row.id, ArchiveFile.status == STATUS_FORGOTTEN)
         .all()
     )
     if not rows:
         return
     restored = 0
+    if returned:
+        stored_elsewhere = set(
+            session.query(ArchiveFile.filehash, ArchiveFile.hash_algo)
+            .filter(ArchiveFile.status == STATUS_STORED, ArchiveFile.archive_id != row.id)
+            .distinct()
+            .all()
+        )
+        taken = {
+            p.casefold()
+            for (p,) in session.query(ArchiveFile.stored_path_rel).filter(
+                ArchiveFile.archive_id == row.id, ArchiveFile.status.in_(PATH_HOLDING_STATUSES)
+            )
+        }
     for f in rows:
-        f.disposition = None
-        if stored_in_other_archive(session, f.filehash, f.hash_algo, row.id) is None:
+        if returned and (f.filehash, f.hash_algo) not in stored_elsewhere and f.stored_path_rel.casefold() not in taken:
             f.status = STATUS_STORED
+            taken.add(f.stored_path_rel.casefold())
             restored += 1
+        else:
+            f.status = STATUS_MISSING
     session.commit()
     logger.info(
-        f"Archive folder #{row.id} is back after being forgotten: restored {restored} of {len(rows)} records"
+        f"Archive folder #{row.id} was forgotten: restored {restored} of {len(rows)} records"
+        + ("" if returned else " (not the same folder; the records are left as missing)")
     )
 
 
@@ -516,9 +553,9 @@ def forget_archive(session, archive_id: int) -> int:
     """消した保存フォルダの登録を外します（#6）。戻り値は重複判定の対象から外した行数。
 
     重複判定は全保存フォルダ共通なので、消した保存フォルダの保存記録が残ると、その内容は二度と
-    どこにも保存されない。保存記録は missing にして重複判定から外す（行と履歴は消さない）。
+    どこにも保存されない。stored の保存記録を forgotten にして重複判定から外す（行と履歴は消さない）。
     保存フォルダがその場所にある（つながっている）なら断る。NAS を外していただけ・移動しただけの
-    保存フォルダを外してしまっても、次に開いたとき resolve_archive が記録を stored に戻す（_restore_forgotten）。
+    保存フォルダを外してしまっても、次に開いたとき resolve_archive が記録を stored に戻す（_settle_forgotten）。
     pending（中断の残り）は別の保存フォルダの判定に使われないので触らない（開いたときの復旧に任せる）。
     """
     row = session.get(Archive, archive_id)
@@ -535,9 +572,8 @@ def forget_archive(session, archive_id: int) -> int:
         .all()
     )
     for f in rows:
-        f.status = STATUS_MISSING
-        # 消したのではなく外れていただけなら、開き直したときに戻す（_restore_forgotten）
-        f.disposition = DISPOSITION_FORGOTTEN
+        # 消したのではなく外れていただけなら、開き直したときに戻す（_settle_forgotten）
+        f.status = STATUS_FORGOTTEN
     session.commit()
     logger.info(
         f"Forgot archive folder #{archive_id} ({row.root_abs}): "
@@ -550,7 +586,6 @@ def forget_archive(session, archive_id: int) -> int:
 def list_archives(session) -> list[tuple[Archive, int, int]]:
     """report/archives 用: (保存フォルダ, stored 件数, 合計サイズ) の一覧。"""
     from sqlalchemy import func
-    from models import STATUS_STORED
 
     rows = session.query(Archive).order_by(Archive.id).all()
     out = []

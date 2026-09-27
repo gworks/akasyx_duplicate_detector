@@ -208,9 +208,14 @@ def run_delete_duplicates(session, config, ingest) -> tuple[str, dict]:
         ingest_ids = {i.ingest_id for i in items}
         roots = session.query(Ingest.source_root).filter(Ingest.id.in_(ingest_ids)).all()
         for (root,) in roots:
-            if root:
-                # 投入元の中にある detector 自身のデータフォルダ（ui/ 等）の空フォルダは消さない
-                mover.prune_empty_dirs(root, keep=own_data_matcher(config, root))
+            if not root or lookup.enclosing(root) is not None:
+                # 投入元ルートが保存フォルダの中なら掃除しない（#6 の事前チェックより前の取り込み）
+                continue
+            is_own = own_data_matcher(config, root)
+            # 投入元の中にある detector 自身のデータフォルダ（ui/ 等）と、保存フォルダの中は消さない
+            mover.prune_empty_dirs(
+                root, keep=lambda p, is_own=is_own: is_own(p) or lookup.enclosing(p) is not None
+            )
 
     if not config.assume_yes:
         print(

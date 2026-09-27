@@ -35,6 +35,7 @@ STATUS_MISSING = "missing"            # DB にはあるが実体が無い（削�
 STATUS_UNREGISTERED = "unregistered"  # 実体はあるが DB に無かった（verify が事後登録）
 STATUS_QUARANTINED = "quarantined"    # 隔離フォルダへ移動済み（将来拡張）
 STATUS_FAILED = "failed"              # 復旧で判断がつかなかった（人の確認待ち）
+STATUS_FORGOTTEN = "forgotten"        # archives --forget で外した stored（#6）。同じ保存フォルダが戻れば stored に戻す
 
 # 内容を「保持している」状態。重複判定と部分 UNIQUE 索引の対象（設計書 §8）。
 # missing / unregistered を外すことで、消えたファイルと同内容のものを後から再登録できる。
@@ -49,8 +50,6 @@ _PATH_HOLDING_SQL = "status IN ('pending','stored','unregistered')"
 DISPOSITION_QUARANTINE = "quarantine"  # 別フォルダ（隔離先）へ移動する予定
 DISPOSITION_ADOPT = "adopt"            # unregistered を正式登録する予定
 DISPOSITION_DELETE = "delete"          # 削除する予定
-# archives --forget で missing にした行（#6）。その保存フォルダを開き直したら stored に戻す
-DISPOSITION_FORGOTTEN = "forgotten"
 
 # --- ar_ingest_items.result --------------------------------------------------
 RESULT_MOVED = "moved"                        # add: 保存フォルダへ移動した
