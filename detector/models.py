@@ -49,6 +49,8 @@ _PATH_HOLDING_SQL = "status IN ('pending','stored','unregistered')"
 DISPOSITION_QUARANTINE = "quarantine"  # 別フォルダ（隔離先）へ移動する予定
 DISPOSITION_ADOPT = "adopt"            # unregistered を正式登録する予定
 DISPOSITION_DELETE = "delete"          # 削除する予定
+# archives --forget で missing にした行（#6）。その保存フォルダを開き直したら stored に戻す
+DISPOSITION_FORGOTTEN = "forgotten"
 
 # --- ar_ingest_items.result --------------------------------------------------
 RESULT_MOVED = "moved"                        # add: 保存フォルダへ移動した

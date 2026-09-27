@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
+import archives
 from config import OS_JUNK_FILES
 from database import tmp_dir
 from errors import DetectorError
@@ -21,6 +22,7 @@ from models import (
     STATUS_FAILED,
     STATUS_PENDING,
     STATUS_STORED,
+    STATUS_UNREGISTERED,
     ArchiveFile,
     utcnow,
 )
@@ -409,6 +411,19 @@ def recover_pending(session, config) -> dict:
                 # 移動は完了していた。別FS コピー後に中断していれば元が残っている
                 if src and os.path.lexists(src):
                     _remove_source_if_same(src, row.filehash)
+                owner = archives.stored_in_other_archive(
+                    session, row.filehash, row.hash_algo, config.archive_id
+                )
+                if owner is not None:
+                    # 中断している間に同じ内容が別の保存フォルダに保存された。stored は全体で 1 つにする（#6）。
+                    # 実体は消さず、未登録（保存物として数えない）にして人に見せる
+                    row.status = STATUS_UNREGISTERED
+                    counts["failed"] += 1
+                    logger.warning(
+                        "Recovery: the same content is already stored in another archive folder "
+                        f"(#{owner.archive_id}: {owner.stored_path_rel}); left as unregistered: {dst}"
+                    )
+                    continue
                 row.status = STATUS_STORED
                 row.verified_at = utcnow()
                 counts["stored"] += 1

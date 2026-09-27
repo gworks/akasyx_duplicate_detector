@@ -105,7 +105,7 @@ def preflight(config: DetectorConfig) -> None:
             )
         # 投入元が別の保存フォルダの中なら断る（#6）。中の保存物が自分自身の重複と判定され、
         # delete-duplicates の対象になるため。登録ではなく実物の目印で見る（移動したまま開いていない・
-        # 別の正本 DB の保存フォルダも含む）。投入元の中にある保存フォルダは走査の後に ingest が断る
+        # 別の正本 DB・v0.1.x の保存フォルダも含む）。投入元の中にある保存フォルダも、すぐ下で走査の前に断る
         enclosing = archives.enclosing_archive(config.source_path)
         if enclosing is not None:
             raise PreflightError(

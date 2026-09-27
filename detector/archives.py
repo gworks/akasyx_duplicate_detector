@@ -12,8 +12,9 @@ from config import OS_JUNK_FILES
 from database import META_DIRNAME, archive_id_path, legacy_db_path, meta_dir, tmp_dir
 from errors import PreflightError
 from models import (
-    OWNING_STATUSES,
+    DISPOSITION_FORGOTTEN,
     STATUS_MISSING,
+    STATUS_STORED,
     Archive,
     ArchiveFile,
     Base,
@@ -144,8 +145,13 @@ def _find_by_location(session, root: str) -> Archive | None:
     return matches[0]
 
 
+def has_archive_marker(directory: str) -> bool:
+    """保存フォルダの目印があるか。v0.2 の `.akasyx/archive.id` と、まだ開いていない v0.1.x の `.akasyx/archive.db`。"""
+    return os.path.isfile(archive_id_path(directory)) or os.path.isfile(legacy_db_path(directory))
+
+
 def enclosing_archive(path: str) -> str | None:
-    """path 自身か、その上位にある保存フォルダ（`.akasyx/archive.id` がある）を返します。無ければ None。
+    """path 自身か、その上位にある保存フォルダ（目印 has_archive_marker がある）を返します。無ければ None。
 
     正本 DB の登録ではなく実物の目印で見る。移動したまま開いていない保存フォルダ、別の正本 DB の
     保存フォルダも拾い、目印を消した（もう保存フォルダではない）フォルダは拾わない（#6）。
@@ -154,7 +160,7 @@ def enclosing_archive(path: str) -> str | None:
     if not os.path.isdir(d):
         d = os.path.dirname(d)
     while True:
-        if os.path.isfile(archive_id_path(d)):
+        if has_archive_marker(d):
             return d
         parent = os.path.dirname(d)
         if parent == d:
@@ -183,12 +189,59 @@ def archives_below(root: str, follow_symlinks: bool = False, limit: int = 5) -> 
                 continue
             seen.add((st.st_dev, st.st_ino))
         if META_DIRNAME in dirnames:
-            if os.path.isfile(archive_id_path(dirpath)):
+            if has_archive_marker(dirpath):
                 found.append(dirpath)
                 if len(found) >= limit:
                     break
             dirnames.remove(META_DIRNAME)
     return found
+
+
+class ArchiveLookup:
+    """1 回の実行で共有する保存フォルダの確認結果（add と delete-duplicates で共用）。
+
+    ネットワーク上の場所を 1 件ごとに問い合わせないよう、フォルダ・保存フォルダごとに 1 回だけ確かめる。
+    """
+
+    def __init__(self):
+        self._enclosing: dict[str, str | None] = {}
+        self._available: dict[int, tuple[bool, str | None]] = {}
+
+    def enclosing(self, directory: str) -> str | None:
+        """directory を含む保存フォルダ（enclosing_archive）。"""
+        if directory not in self._enclosing:
+            self._enclosing[directory] = enclosing_archive(directory)
+        return self._enclosing[directory]
+
+    def available(self, row: Archive) -> tuple[bool, str | None]:
+        """保存フォルダが登録上の場所に今あるか。戻り値は (ある, 無い理由)。識別子を読めなければ無い扱い。"""
+        if row.id not in self._available:
+            try:
+                ok = is_at_registered_location(row)
+                reason = None if ok else f"The archive folder is not available: {row.root_abs}"
+            except PreflightError as e:
+                ok, reason = False, f"Cannot read the archive folder: {e}"
+            self._available[row.id] = (ok, reason)
+        return self._available[row.id]
+
+
+def stored_in_other_archive(session, filehash: str, hash_algo: str, archive_id: int):
+    """同じ内容を stored で持つ別の保存フォルダの行（無ければ None）。
+
+    重複判定は全保存フォルダ共通なので、同じ内容の stored は全体で 1 つにする（#6）。add 以外で行を
+    stored にする経路（中断の復旧・verify の復活・forget の取り消し）はこれで確かめる。
+    """
+    return (
+        session.query(ArchiveFile)
+        .filter(
+            ArchiveFile.filehash == filehash,
+            ArchiveFile.hash_algo == hash_algo,
+            ArchiveFile.status == STATUS_STORED,
+            ArchiveFile.archive_id != archive_id,
+        )
+        .order_by(ArchiveFile.id)
+        .first()
+    )
 
 
 def is_at_registered_location(row: Archive) -> bool:
@@ -283,6 +336,7 @@ def resolve_archive(session, archive_root: str) -> Archive:
         row.last_used_at = utcnow()
         session.commit()
 
+    _restore_forgotten(session, row)
     # v0.1.x の DB が保存フォルダに残っていれば取り込む（登録済みかどうかに関係なく）
     migrated = import_legacy_db(session, row, legacy_db_path(root))
     if migrated:
@@ -432,13 +486,40 @@ def _fix_datetimes(data: dict) -> None:
                 data[key] = None
 
 
+def _restore_forgotten(session, row: Archive) -> None:
+    """archives --forget で外した記録を、保存フォルダを開き直したときに stored へ戻します（#6）。
+
+    外している間に同じ内容が別の保存フォルダに stored になったものは戻さない（全体で 1 つ）。
+    その実体は次の verify で未登録（保存フォルダ内の重複ではない）として拾われる。
+    実体が本当に無くなっていれば、次の verify が missing にする。
+    """
+    rows = (
+        session.query(ArchiveFile)
+        .filter(ArchiveFile.archive_id == row.id, ArchiveFile.disposition == DISPOSITION_FORGOTTEN)
+        .all()
+    )
+    if not rows:
+        return
+    restored = 0
+    for f in rows:
+        f.disposition = None
+        if stored_in_other_archive(session, f.filehash, f.hash_algo, row.id) is None:
+            f.status = STATUS_STORED
+            restored += 1
+    session.commit()
+    logger.info(
+        f"Archive folder #{row.id} is back after being forgotten: restored {restored} of {len(rows)} records"
+    )
+
+
 def forget_archive(session, archive_id: int) -> int:
     """消した保存フォルダの登録を外します（#6）。戻り値は重複判定の対象から外した行数。
 
     重複判定は全保存フォルダ共通なので、消した保存フォルダの保存記録が残ると、その内容は二度と
     どこにも保存されない。保存記録は missing にして重複判定から外す（行と履歴は消さない）。
-    保存フォルダがその場所にある（つながっている）なら断る。外したあとに同じ保存フォルダを開くと、
-    verify が実体から missing を復活させる。
+    保存フォルダがその場所にある（つながっている）なら断る。NAS を外していただけ・移動しただけの
+    保存フォルダを外してしまっても、次に開いたとき resolve_archive が記録を stored に戻す（_restore_forgotten）。
+    pending（中断の残り）は別の保存フォルダの判定に使われないので触らない（開いたときの復旧に任せる）。
     """
     row = session.get(Archive, archive_id)
     if row is None:
@@ -450,11 +531,13 @@ def forget_archive(session, archive_id: int) -> int:
         )
     rows = (
         session.query(ArchiveFile)
-        .filter(ArchiveFile.archive_id == archive_id, ArchiveFile.status.in_(OWNING_STATUSES))
+        .filter(ArchiveFile.archive_id == archive_id, ArchiveFile.status == STATUS_STORED)
         .all()
     )
     for f in rows:
         f.status = STATUS_MISSING
+        # 消したのではなく外れていただけなら、開き直したときに戻す（_restore_forgotten）
+        f.disposition = DISPOSITION_FORGOTTEN
     session.commit()
     logger.info(
         f"Forgot archive folder #{archive_id} ({row.root_abs}): "

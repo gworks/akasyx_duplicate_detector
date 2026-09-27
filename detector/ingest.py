@@ -10,7 +10,6 @@ import crawler_client
 import mover
 from config import OS_JUNK_FILES, OWN_DATA_DB, own_data_dirs, own_data_locations
 from database import META_DIRNAME
-from errors import PreflightError
 from models import (
     OWNING_STATUSES,
     RESULT_DUPLICATE,
@@ -66,7 +65,7 @@ def owning_query(
 
 
 def judge(
-    session, scanned, config, virtual_hashes: set | None = None, availability: dict | None = None
+    session, scanned, config, virtual_hashes: set | None = None, lookup=None
 ) -> tuple[str, ArchiveFile | None, str | None]:
     """1ファイルの判定（設計書 §7.1 の判定表）。上から順に評価する。
 
@@ -97,12 +96,12 @@ def judge(
                 existing,
                 f"Hash matches but size differs (DB {existing.size} / actual {scanned.size})",
             )
-        return RESULT_DUPLICATE, existing, owner_location(session, existing, config, availability)
+        return RESULT_DUPLICATE, existing, owner_location(session, existing, config, lookup)
 
     return RESULT_MOVED, None, None
 
 
-def owner_location(session, row: ArchiveFile, config=None, availability: dict | None = None) -> str:
+def owner_location(session, row: ArchiveFile, config=None, lookup=None) -> str:
     """同じ内容がどの保存フォルダのどこにあるかを表す文字列（CSV・ログ用）。
 
     別の保存フォルダが今つながっていなければそう書き、消した保存フォルダなら登録を外す方法を示す
@@ -113,13 +112,8 @@ def owner_location(session, row: ArchiveFile, config=None, availability: dict | 
     message = f"Same content already in archive folder {root}: {row.stored_path_rel}"
     if archive is None or config is None or row.archive_id == config.archive_id:
         return message
-    cache = availability if availability is not None else {}
-    if row.archive_id not in cache:
-        try:
-            cache[row.archive_id] = archives.is_at_registered_location(archive)
-        except PreflightError:
-            cache[row.archive_id] = False
-    if not cache[row.archive_id]:
+    available, _reason = (lookup or archives.ArchiveLookup()).available(archive)
+    if not available:
         message += (
             " (this archive folder is not available now; if it no longer exists, "
             f"run `archives --forget {row.archive_id}`)"
@@ -166,14 +160,6 @@ def own_data_matcher(config, source: str | None = None):
         return p in db_files or any(key_within(d, p) for d in dirs)
 
     def is_own(path):
-        # 投入元の中にある保存フォルダの管理用フォルダ（識別子の無いロック・作業ファイルの残り）。保存物ではない。
-        # 投入元より上位のフォルダ名は見ない（投入元自体が .akasyx の下でも中身は取り込む）
-        try:
-            parts = os.path.relpath(os.path.abspath(path), src_abs).split(os.sep)
-        except ValueError:  # Windows で別ドライブ
-            parts = []
-        if parts and parts[0] != os.pardir and META_DIRNAME in parts[:-1]:
-            return True
         if matches(path_key(path, real=False)):
             return True
         # --follow-symlinks だと投入元の中の symlink（~/dd → データフォルダ等）越しに自データが
@@ -226,8 +212,8 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
     csv_file = create_csv(config.log_dir, "add_result", ts_start)
     processed = 0
     is_own = own_data_matcher(config)
-    in_archive = archive_matcher()
-    availability: dict = {}
+    in_archive = archive_matcher(config)
+    lookup = archives.ArchiveLookup()
 
     try:
         for scanned in files:
@@ -238,17 +224,14 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
                 message = "The detector's own data (master DB / work DB / logs / UI data); not ingested"
                 logger.warning(f"Skipped the detector's own data inside the source: {scanned.path_abs}")
                 _record_item(session, config, ingest, scanned, result, None, None, message)
-            elif (inside := in_archive(scanned.path_abs)) is not None:
-                # 投入元の中の保存フォルダは事前チェックで断っている。ここに来るのはシンボリックリンクを辿って
-                # 保存フォルダの下位へ入った場合。動かすとその保存フォルダの保存物を失う（#6）
+            elif (message := in_archive(scanned.path_abs)) is not None:
+                # 保存フォルダの管理用フォルダ・保存フォルダの中のファイルは動かさない（#6）
                 result, stored_rel = RESULT_SKIPPED_IN_ARCHIVE, None
-                message = f"The file is inside an archive folder: {inside}"
-                logger.warning(f"Skipped a file inside an archive folder: {scanned.path_abs}")
+                logger.warning(f"Skipped: {message}: {scanned.path_abs}")
                 _record_item(session, config, ingest, scanned, result, None, None, message)
             else:
                 result, stored_rel, message = _process_one(
-                    session, config, ingest, scanned, planner, reserved, virtual_hashes,
-                    availability,
+                    session, config, ingest, scanned, planner, reserved, virtual_hashes, lookup
                 )
             counters[result] = counters.get(result, 0) + 1
             csv_update(
@@ -281,21 +264,35 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
     return status, counters
 
 
-def archive_matcher():
-    """ファイルの実体が保存フォルダの中にあれば、その保存フォルダを返す関数を返します（フォルダごとにキャッシュ）。"""
-    cache: dict[str, str | None] = {}
+def archive_matcher(config, lookup: "archives.ArchiveLookup | None" = None):
+    """保存フォルダのものを動かさないための判定関数を返します。該当すれば理由（CSV 用）、しなければ None。
 
-    def inside(path):
-        d = os.path.dirname(path)
-        if d not in cache:
-            cache[d] = archives.enclosing_archive(d)
-        return cache[d]
+    - 投入元の中の `.akasyx/`（識別子の無いロック・作業ファイルの残り）: 保存物ではない。投入元より上位の
+      フォルダ名は見ない（投入元自体が .akasyx の下でも中身は取り込む）
+    - --follow-symlinks でリンクを辿った先が保存フォルダの中: 動かすとその保存フォルダの保存物を失う。
+      辿らないときは、投入元が保存フォルダと重ならないことを事前チェックで確かめてあるので見ない
+    """
+    src_abs = os.path.abspath(config.source_path)
+    lookup = lookup or archives.ArchiveLookup()
 
-    return inside
+    def check(path):
+        try:
+            parts = os.path.relpath(os.path.abspath(path), src_abs).split(os.sep)
+        except ValueError:  # Windows で別ドライブ
+            parts = []
+        if parts and parts[0] != os.pardir and META_DIRNAME in parts[:-1]:
+            return f"Archive folder management data ({META_DIRNAME}); not ingested"
+        if config.follow_symlinks:
+            inside = lookup.enclosing(os.path.dirname(path))
+            if inside is not None:
+                return f"The file is inside an archive folder: {inside}"
+        return None
+
+    return check
 
 
 def _process_one(
-    session, config, ingest, scanned, planner, reserved, virtual_hashes, availability=None
+    session, config, ingest, scanned, planner, reserved, virtual_hashes, lookup=None
 ) -> tuple[str, str | None, str | None]:
     """1ファイルを判定し、必要なら移動して記録します。
 
@@ -303,7 +300,7 @@ def _process_one(
     """
     try:
         result, existing, message = judge(
-            session, scanned, config, virtual_hashes if config.dry_run else None, availability
+            session, scanned, config, virtual_hashes if config.dry_run else None, lookup
         )
     except Exception as e:  # 1件の失敗で実行全体を止めない（設計書 §12）
         session.rollback()

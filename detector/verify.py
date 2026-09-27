@@ -5,6 +5,7 @@
 import logging
 from datetime import datetime
 
+import archives
 import crawler_client
 from config import OS_JUNK_FILES
 from database import META_DIRNAME
@@ -183,6 +184,9 @@ def _revive_missing(session, archive_id, found, key, owning_hashes) -> ArchiveFi
     （部分 UNIQUE 索引に抵触するため。その実体は保存フォルダ内の重複として扱う）。
     """
     if not found.filehash or key in owning_hashes:
+        return None
+    if archives.stored_in_other_archive(session, found.filehash, found.hash_algo, archive_id):
+        # 別の保存フォルダに stored がある（forget の後・外していた間に保存された等）。stored は全体で 1 つ（#6）
         return None
     row = (
         session.query(ArchiveFile)
