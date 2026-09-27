@@ -337,6 +337,15 @@ def resolve_archive(session, archive_root: str) -> Archive:
     if row is None:
         # 新しく登録する保存フォルダの中に別の保存フォルダがあれば断る（#6）。中の保存物を verify が
         # 未登録として拾い、同じ実体を 2 つの保存フォルダが持つことになる。歩くのは初回の登録時だけ
+        # 別の保存フォルダの中に作るのも断る。どちらも新しく登録するときだけ見る（#6 より前に登録済みの
+        # 入れ子の保存フォルダは、これまでどおり開ける）
+        outer = enclosing_archive(os.path.dirname(root))
+        if outer is not None:
+            raise PreflightError(
+                "This folder is inside another archive folder, so it cannot be an archive folder:\n"
+                f"  folder            : {root}\n"
+                f"  enclosing archive : {outer}"
+            )
         nested = archives_below(root, exclude_root=True)
         if nested:
             listed = "\n".join(f"  {d}" for d in nested)
@@ -604,8 +613,6 @@ def forget_archive(session, archive_id: int) -> int:
 
 def list_archives(session) -> list[tuple[Archive, int, int]]:
     """report/archives 用: (保存フォルダ, stored 件数, 合計サイズ) の一覧。"""
-    from sqlalchemy import func
-
     rows = session.query(Archive).order_by(Archive.id).all()
     out = []
     for a in rows:

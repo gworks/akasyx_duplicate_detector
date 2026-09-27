@@ -1130,3 +1130,57 @@ def test_dedupe_verdicts_have_ui_labels():
         for v in ("verified", "gone", "source_changed", "archive_missing",
                   "archive_unavailable", "source_in_archive", "same_file", "skipped_in_archive"):
             assert f"result_{v}" in d, (f.name, v)
+
+
+# --- レビュー指摘 9 回目（2026-09-28）------------------------------------------
+
+
+def test_same_file_check_does_not_touch_other_archive_location(
+    make_config, tmp_path, fake_crawler, monkeypatch
+):
+    """same_file の確認は登録上の場所との文字列比較だけで、別の保存フォルダに I/O をかけない。"""
+    a, b, leftover = _seed_cross(make_config, tmp_path, fake_crawler)
+    unplugged = str(tmp_path / "unplugged")
+    shutil.move(a, unplugged)  # A（持ち主）が外れている
+    real_a = os.path.realpath(a)
+    orig = os.path.realpath
+
+    def _realpath(p, *args, **kwargs):
+        assert not str(p).startswith(real_a), f"touched the unavailable archive: {p}"
+        return orig(p, *args, **kwargs)
+
+    cfg = make_config(mode=MODE_DELETE_DUPLICATES, archive_root=b)
+    import dedupe as dedupe_mod
+    from utl import helpers
+    sess, engine = _db(tmp_path)
+    try:
+        item = sess.query(IngestItem).filter_by(result=RESULT_DUPLICATE).one()
+        cfg.archive_id = _archive_id_of(tmp_path, b)
+        monkeypatch.setattr(helpers.os.path, "realpath", _realpath)
+        monkeypatch.setattr(dedupe_mod.archives, "is_at_registered_location", lambda row: False)
+        verdict, _ = dedupe_mod.check_item(sess, cfg, item)
+        assert verdict == dedupe_mod.CHECK_ARCHIVE_UNAVAILABLE
+    finally:
+        sess.close(); engine.dispose()
+
+
+def test_nested_archive_registered_before_6_still_opens(make_config, tmp_path, fake_crawler):
+    """#6 より前に登録済みの入れ子の保存フォルダは、これまでどおり開ける（断るのは新しく登録するときだけ）。"""
+    from models import Archive
+    outer = str(tmp_path / "photos")
+    inner = os.path.join(outer, "2024")
+    os.makedirs(inner)
+    sess, engine = _db(tmp_path)
+    try:  # v0.2.0 で両方登録済み
+        for uid, root in (("outer-uid", outer), ("inner-uid", inner)):
+            sess.add(Archive(uid=uid, root_abs=os.path.realpath(root)))
+            write_file(os.path.join(root, ".akasyx", "archive.id"), f"{uid}\n".encode())
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=inner)) == main.EXIT_OK
+    # 新しく入れ子を作るのは断る
+    new_inner = os.path.join(outer, "2025")
+    os.makedirs(new_inner)
+    with pytest.raises(PreflightError, match="inside another archive folder"):
+        main.run(make_config(mode=MODE_REPORT, archive_root=new_inner))

@@ -106,7 +106,10 @@ def check_item(
     )
     for row in rows:
         registered = _registered_root(session, config, row)
-        if registered and path_key(from_posix(registered, row.stored_path_rel)) == src_key:
+        # 今の保存フォルダは起動時に確かめた場所なので実体で比べる。別の保存フォルダの登録上の場所は
+        # 実体のパス（realpath）で記録済みなので、解かずに文字列で比べる（外れた NAS に問い合わせない）
+        current = row.archive_id == config.archive_id
+        if registered and path_key(from_posix(registered, row.stored_path_rel), real=current) == src_key:
             return CHECK_SAME_FILE, f"The source is the archived file itself: {from_posix(registered, row.stored_path_rel)}"
 
     # 実物で検証する。別の保存フォルダがつながっているかは、その候補の番が来たときに初めて確かめる
