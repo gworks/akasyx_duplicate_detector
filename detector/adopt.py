@@ -7,7 +7,10 @@
 #
 # 途中で落ちても半端な記録を残さないよう、走査が終わってから全件を 1 トランザクションで書く。
 # 落ちたら登録だけ残るが、記録が 0 件なので adopt 以外のコマンドは断ったまま（やり直せる）。
+import dataclasses
 import logging
+import shutil
+import tempfile
 from datetime import datetime
 
 import archives
@@ -37,17 +40,33 @@ def run_adopt(session, config, ingest) -> tuple[str, dict]:
     あとの add が重複として止めずに取り込む。直してから adopt をやり直せばよい。
     """
     archives.check_tree_readable(config.archive_root)
-    scan = crawler_client.run_crawler(
-        config.archive_root, config, extra_excludes=(f"{META_DIRNAME}/", *OS_JUNK_FILES)
-    )
-    crawler_client.ensure_completed(scan)
-    ingest.crawler_db_path = scan.db_path
+    # 使い捨ての作業用 DB で走査する。共有の作業用 DB だと、以前の走査で読めなかったファイルを crawler が
+    # 「同じ stat で 2 回失敗したので取り直さない」と覚えていて、権限を直しても adopt が断られ続ける
+    work_dir = tempfile.mkdtemp(prefix="adopt-", dir=config.db_dir)
+    try:
+        scan = crawler_client.run_crawler(
+            config.archive_root,
+            dataclasses.replace(config, db_dir=work_dir),
+            extra_excludes=(f"{META_DIRNAME}/", *OS_JUNK_FILES),
+        )
+        crawler_client.ensure_completed(scan)
+        scanned = sorted(
+            crawler_client.read_files(scan.db_path, scan.scan_id), key=lambda f: f.path_rel
+        )
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+    # 作業用 DB は消すので、実行記録には残さない（残すと存在しないパスを指す）
     ingest.crawler_scan_id = scan.scan_id
     session.commit()
 
-    scanned = sorted(
-        crawler_client.read_files(scan.db_path, scan.scan_id), key=lambda f: f.path_rel
-    )
+    # verify が未登録として登録した行は同じパスを占めている（パスの一意索引）。新しく作らずに使い回す
+    existing = {
+        r.stored_path_rel: r
+        for r in session.query(ArchiveFile).filter(
+            ArchiveFile.archive_id == config.archive_id,
+            ArchiveFile.status == STATUS_UNREGISTERED,
+        )
+    }
     counters: dict[str, int] = {}
     decisions: list[tuple[object, str, ArchiveFile | None, str | None]] = []
     first_of: dict[tuple[str, str], ArchiveFile] = {}
@@ -63,19 +82,18 @@ def run_adopt(session, config, ingest) -> tuple[str, dict]:
                 # 読めなかった。1 つでもあれば全体を断る（下で）
                 unreadable.append(f.path_abs)
                 continue
-            row = ArchiveFile(
-                archive_id=config.archive_id,
-                filehash=f.filehash,
-                hash_algo=f.hash_algo,
-                size=f.size,
-                name=f.name,
-                stored_path_rel=f.path_rel,
-                origin_modified_at=f.modified_at,
-                mime_type=f.mime_type,
-                ingest_id=ingest.id,
-                status=STATUS_UNREGISTERED,
-            )
-            session.add(row)
+            row = existing.get(f.path_rel)
+            if row is None:
+                row = ArchiveFile(archive_id=config.archive_id, stored_path_rel=f.path_rel)
+                session.add(row)
+            row.filehash = f.filehash
+            row.hash_algo = f.hash_algo
+            row.size = f.size
+            row.name = f.name
+            row.origin_modified_at = f.modified_at
+            row.mime_type = f.mime_type
+            row.ingest_id = ingest.id
+            row.status = STATUS_UNREGISTERED
             key = (f.filehash, f.hash_algo)
             if key in first_of:
                 first = first_of[key]

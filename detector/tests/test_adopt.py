@@ -309,3 +309,67 @@ def test_git_folder_is_not_counted_as_content(make_config, tmp_path):
     write_file(os.path.join(root, ".git", "objects", "ab", "cdef"), b"blob")
     write_file(os.path.join(root, "sub", ".git", "HEAD"), b"ref")
     assert main.run(make_config(mode=MODE_REPORT, archive_root=root)) == main.EXIT_OK
+
+
+def test_folder_with_only_non_owning_records_still_needs_adopt(make_config, tmp_path, fake_crawler):
+    """消した保存フォルダを forget した跡に写真フォルダを置いた場合（missing の行だけ残る）も adopt を求める。"""
+    old = str(tmp_path / "arch")
+    src0 = str(tmp_path / "in0")
+    write_file(os.path.join(src0, "seed.jpg"), b"SEED")
+    fake_crawler(src0, str(tmp_path / "c0.db"))
+    os.makedirs(old)
+    assert main.run(make_config(archive_root=old, source_path=src0)) == main.EXIT_OK
+    sess, engine = _db(tmp_path)
+    try:
+        aid = sess.query(Archive).one().id
+    finally:
+        sess.close(); engine.dispose()
+    shutil.rmtree(old)
+    argv = ["archives", "--forget", str(aid), "--archive-db", archive_db_path(tmp_path)]
+    assert main.main(argv) == main.EXIT_OK
+    write_file(os.path.join(old, "2020", "p.jpg"), b"PHOTO")  # 同じパスに識別子の無い写真フォルダ
+    src = str(tmp_path / "inbox")
+    write_file(os.path.join(src, "p_copy.jpg"), b"PHOTO")
+    fake_crawler(src, str(tmp_path / "c1.db"))
+    with pytest.raises(PreflightError, match="adopt"):
+        main.run(make_config(archive_root=old, source_path=src))
+    assert _adopt(make_config, old, tmp_path, fake_crawler) == main.EXIT_OK
+    assert ("2020/p.jpg", STATUS_STORED) in _rows(tmp_path)
+
+
+def test_adopt_reuses_unregistered_rows_at_same_path(make_config, tmp_path, fake_crawler):
+    """verify が未登録として登録した行しか無い保存フォルダも adopt でき、同じパスの行を使い回す。"""
+    arch = str(tmp_path / "arch")
+    os.makedirs(arch)
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=arch)) == main.EXIT_OK  # 空で登録
+    sess, engine = _db(tmp_path)
+    try:
+        aid = sess.query(Archive).one().id
+        f = write_file(os.path.join(arch, "x.jpg"), b"XXXX")
+        from utl import hashing
+        sess.add(ArchiveFile(archive_id=aid, filehash=hashing.file_hash(f), hash_algo="sha256", size=4,
+                             name="x.jpg", stored_path_rel="x.jpg", status=STATUS_UNREGISTERED))
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    assert _adopt(make_config, arch, tmp_path, fake_crawler) == main.EXIT_OK
+    assert _rows(tmp_path) == [("x.jpg", STATUS_STORED)]  # 行は 1 つのまま
+
+
+def test_adopt_uses_a_fresh_crawler_db(make_config, tmp_path, monkeypatch, photos):
+    """前回の走査の「ハッシュの取り直しをやめた」記録に引きずられないよう、使い捨ての作業用 DB で走査する。"""
+    from conftest import build_crawler_db
+    seen = []
+
+    def _run(target, config, extra_excludes=()):
+        seen.append(config.db_dir)
+        db = os.path.join(config.db_dir, "file_inventory.db")
+        scan_id = build_crawler_db(db, target, excludes=tuple(extra_excludes))
+        return crawler_client.CrawlerScan(db_path=db, scan_id=scan_id, status="completed", root_dir=target)
+
+    monkeypatch.setattr(crawler_client, "resolve_crawler_repo", lambda path: path)
+    monkeypatch.setattr(crawler_client, "run_crawler", _run)
+    cfg = make_config(mode=MODE_ADOPT, archive_root=photos)
+    assert main.run(cfg) == main.EXIT_OK
+    assert seen and seen[0] != cfg.db_dir
+    assert not os.path.exists(seen[0])  # 終わったら消す

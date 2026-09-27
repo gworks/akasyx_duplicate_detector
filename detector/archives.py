@@ -15,6 +15,7 @@ from config import OS_JUNK_FILES
 from database import META_DIRNAME, archive_id_path, legacy_db_path, meta_dir, tmp_dir
 from errors import PreflightError
 from models import (
+    OWNING_STATUSES,
     PATH_HOLDING_STATUSES,
     STATUS_FORGOTTEN,
     STATUS_UNREGISTERED,
@@ -423,6 +424,14 @@ def resolve_archive(session, archive_root: str, adopting: bool = False) -> Archi
         _write_uid(root, row.uid)
         logger.info(f"Registered archive folder: #{row.id} {root}")
     else:
+        if not returned and not adopting and _has_forgotten(session, row) and _has_stored_content(root):
+            # forget した保存フォルダの跡（同じ場所）に、識別子の無い別のフォルダが置かれた。forget した記録は
+            # この中身と無関係なので（_settle_forgotten が missing にする）、記録が無いのと同じ。識別子を書く前に断る
+            raise PreflightError(
+                "This folder is where a forgotten archive folder was, and it contains files that have no records:\n"
+                f"  folder: {root}\n"
+                f"  Register the files in it first: adopt {root}"
+            )
         moved = row.root_abs != root and not _same_location(row.root_abs, root)
         if moved and _is_live_copy_source(row, root):
             raise PreflightError(
@@ -455,6 +464,18 @@ def resolve_archive(session, archive_root: str, adopting: bool = False) -> Archi
     return row
 
 
+RECORD_STATUSES = (*OWNING_STATUSES, STATUS_MISSING)
+
+
+def _has_forgotten(session, row: Archive) -> bool:
+    return (
+        session.query(ArchiveFile.id)
+        .filter(ArchiveFile.archive_id == row.id, ArchiveFile.status == STATUS_FORGOTTEN)
+        .first()
+        is not None
+    )
+
+
 def _check_records_match_content(session, row: Archive, root: str, adopting: bool) -> None:
     """「中身があるのに記録が 1 件も無い保存フォルダ」は adopt 以外で使わせません（#4 / #5）。
 
@@ -462,10 +483,20 @@ def _check_records_match_content(session, row: Archive, root: str, adopting: boo
     手でファイルを入れた場合と、adopt が途中で落ちた場合（登録だけ残る）。adopt は記録が既にあれば断る
     （登録済みの保存フォルダの実体の変化は verify で扱う）。
     """
-    has_records = (
-        session.query(ArchiveFile.id).filter(ArchiveFile.archive_id == row.id).first() is not None
-    )
-    if adopting and has_records:
+    # 保存記録（stored / pending）と missing を数える。missing は「保存していたが今は見えない」記録で、
+    # 実体が戻れば verify が stored に戻す（adopt の出番ではない）。unregistered・failed だけのときは
+    # 重複判定に使える記録が無いので、中身があれば adopt を求める（adopt は unregistered の行を使い回す）
+    def _exists(statuses) -> bool:
+        return (
+            session.query(ArchiveFile.id)
+            .filter(ArchiveFile.archive_id == row.id, ArchiveFile.status.in_(statuses))
+            .first()
+            is not None
+        )
+
+    has_records = _exists(RECORD_STATUSES)
+    # adopt を断るのは保存記録があるときだけ（missing だけなら、今の中身を登録してよい。forget の跡など）
+    if adopting and _exists(OWNING_STATUSES):
         raise PreflightError(
             f"This archive folder already has records; use verify to check it: {root}"
         )
