@@ -735,7 +735,7 @@ def test_archive_check_per_file_only_when_following_symlinks(
     real = archives.enclosing_archive
     monkeypatch.setattr(archives, "enclosing_archive", lambda p: calls.append(p) or real(p))
     assert _add(make_config, a, src, tmp_path, fake_crawler) == main.EXIT_OK
-    assert len(calls) <= 1  # 事前チェックの投入元 1 回だけ
+    assert len(calls) <= 2  # 事前チェックの投入元と保存フォルダの上位、各 1 回だけ（ファイルごとには呼ばない）
 
 
 def test_leftover_akasyx_is_not_reported_as_own_data(make_config, tmp_path, fake_crawler):
@@ -891,3 +891,125 @@ def test_duplicates_in_unavailable_archive_are_reported(make_config, tmp_path, f
     assert _add(make_config, r, src_r, tmp_path, fake_crawler) == main.EXIT_OK
     out = capsys.readouterr().out
     assert "not available" in out and "--forget" in out
+
+
+# --- レビュー指摘 7 回目（2026-09-27）------------------------------------------
+
+
+def test_restore_does_not_duplicate_content_revived_elsewhere_after_forget(
+    make_config, tmp_path, fake_crawler
+):
+    """forget の後に（forget より前に作られた）別の保存フォルダの行が stored に戻っても、二重にしない。"""
+    from models import STATUS_MISSING
+    n, b, src_n, src_b = _dirs(tmp_path, "nas_archive", "archive_b", "in_n", "in_b")
+    write_file(os.path.join(src_b, "seed.txt"), b"SEED")
+    assert _add(make_config, b, src_b, tmp_path, fake_crawler) == main.EXIT_OK
+    bid = _archive_id_of(tmp_path, b)
+    copy = write_file(os.path.join(b, "old", "x.txt"), b"SAME")
+    sess, engine = _db(tmp_path)
+    try:  # B の行は forget より前に作られたが、この時点では missing
+        sess.add(ArchiveFile(
+            archive_id=bid, filehash=_file_hash(copy), hash_algo="sha256", size=4,
+            name="x.txt", stored_path_rel="old/x.txt", status=STATUS_MISSING,
+        ))
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    write_file(os.path.join(src_n, "x.txt"), b"SAME")
+    assert _add(make_config, n, src_n, tmp_path, fake_crawler) == main.EXIT_OK
+    nid = _archive_id_of(tmp_path, n)
+    unplugged = str(tmp_path / "unplugged")
+    shutil.move(n, unplugged)
+    argv = ["archives", "--forget", str(nid), "--archive-db", archive_db_path(tmp_path)]
+    assert main.main(argv) == main.EXIT_OK
+    sess, engine = _db(tmp_path)
+    try:  # forget の後に B の行が stored に戻った（verify の復活など）
+        sess.query(ArchiveFile).filter_by(archive_id=bid, name="x.txt").one().status = STATUS_STORED
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    shutil.move(unplugged, n)
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=n)) == main.EXIT_OK
+    assert _stored_count(tmp_path, b"SAME") == 1
+
+
+def test_legacy_import_does_not_duplicate_stored_content(session, tmp_path):
+    """v0.1.x の DB の取り込みでも、別の保存フォルダに stored がある内容は stored にしない。"""
+    import archives
+    from models import Archive
+    from test_archives import _make_legacy_db
+    from database import legacy_db_path
+    other = Archive(uid="other", root_abs=str(tmp_path / "other"))
+    session.add(other)
+    session.commit()
+    session.add(ArchiveFile(
+        archive_id=other.id, filehash="a" * 64, hash_algo="sha256", size=3, name="a.txt",
+        stored_path_rel="a.txt", status=STATUS_STORED,
+    ))
+    session.commit()
+    legacy_root = str(tmp_path / "legacy")
+    os.makedirs(legacy_root)
+    _make_legacy_db(legacy_db_path(legacy_root), legacy_root)
+    archives.resolve_archive(session, legacy_root)
+    assert session.query(ArchiveFile).filter_by(filehash="a" * 64, status=STATUS_STORED).count() == 1
+
+
+@pytest.mark.parametrize("inside", [True, False])
+def test_archive_folder_nested_with_another_is_refused(make_config, tmp_path, fake_crawler, inside):
+    """保存フォルダが別の保存フォルダの中にある、または中に含む場合は断る。"""
+    outer, src, src2 = _dirs(tmp_path, "outer", "in_a", "in2")
+    a = os.path.join(outer, "archive_a")
+    os.makedirs(a)
+    write_file(os.path.join(src, "x.txt"), b"SAME")
+    assert _add(make_config, a, src, tmp_path, fake_crawler) == main.EXIT_OK
+    write_file(os.path.join(src2, "y.txt"), b"OTHER")
+    target = os.path.join(a, "sub") if inside else outer
+    os.makedirs(target, exist_ok=True)
+    fake_crawler(src2, str(tmp_path / "c.db"))
+    with pytest.raises(PreflightError, match="(inside|contains) an(other)? archive folder"):
+        main.run(make_config(archive_root=target, source_path=src2))
+    assert os.path.exists(os.path.join(src2, "y.txt"))
+
+
+def test_conflict_path_reports_unavailable_owner(make_config, tmp_path, monkeypatch):
+    """予約の衝突で重複になった経路でも、持ち主がつながっていなければ案内と件数に出す。"""
+    import archives
+    import ingest as ingest_mod
+    from models import Archive
+    sess, engine = _db(tmp_path)
+    try:
+        gone = Archive(uid="gone", root_abs=str(tmp_path / "gone"))
+        sess.add(gone)
+        sess.commit()
+        row = ArchiveFile(archive_id=gone.id, filehash="h", hash_algo="sha256", size=1, name="n",
+                          stored_path_rel="n", status=STATUS_STORED)
+        sess.add(row)
+        sess.commit()
+        lookup = archives.ArchiveLookup()
+        cfg = make_config(archive_id=gone.id + 100)  # 今の保存フォルダは別
+        msg = ingest_mod.owner_location(sess, row, cfg, lookup)
+        assert "--forget" in msg and lookup.unavailable_duplicates == {gone.id: 1}
+    finally:
+        sess.close(); engine.dispose()
+    # 衝突経路が config と lookup を渡していること
+    import inspect
+    src = inspect.getsource(ingest_mod._process_one)
+    assert "owner_location(session, owner, config, lookup)" in src
+
+
+def test_restore_path_check_matches_sqlite_lower(session, tmp_path):
+    """戻すときのパス衝突は SQLite の lower() と同じ比べ方（ASCII だけ）で判定する。"""
+    import archives
+    from models import STATUS_FORGOTTEN, STATUS_UNREGISTERED
+    root = str(tmp_path / "n")
+    os.makedirs(root)
+    arch = archives.resolve_archive(session, root)
+    session.add_all([
+        ArchiveFile(archive_id=arch.id, filehash="h1", hash_algo="sha256", size=1, name="a",
+                    stored_path_rel="x/Straße.jpg", status=STATUS_FORGOTTEN),
+        ArchiveFile(archive_id=arch.id, filehash="h2", hash_algo="sha256", size=1, name="b",
+                    stored_path_rel="x/STRASSE.jpg", status=STATUS_UNREGISTERED),
+    ])
+    session.commit()
+    archives.resolve_archive(session, root)
+    assert session.query(ArchiveFile).filter_by(filehash="h1").one().status == STATUS_STORED

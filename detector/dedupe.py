@@ -96,6 +96,8 @@ def check_item(
     rows.sort(key=lambda r: r.id != item.archive_file_id)
 
     # 消す対象のパスが、どれかの保存物のパスそのものなら消さない（前の候補で検証が通っても）。
+    # 今の判定順では source_in_archive が先に止めるので通常はここに来ないが、目印の判定をすり抜けたときに
+    # 唯一の実物を消さないための二重の守りとして残す（test_same_file_is_checked_against_every_copy）。
     # 最後の要素は解かない（ハードリンクや保存物を指すシンボリックリンクは、消えるのがリンクだけなので消してよい）
     src_key = path_key(
         os.path.join(os.path.realpath(os.path.dirname(src)), os.path.basename(src)), real=False

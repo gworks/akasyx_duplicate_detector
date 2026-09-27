@@ -216,8 +216,8 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
     csv_file = create_csv(config.log_dir, "add_result", ts_start)
     processed = 0
     is_own = own_data_matcher(config)
-    in_archive = archive_matcher(config)
     lookup = archives.ArchiveLookup()
+    in_archive = archive_matcher(config, lookup)
 
     try:
         for scanned in files:
@@ -355,7 +355,7 @@ def _process_one(
                 )
                 archive_file_id = owner.id if owner is not None else None
                 message = "Identical content was registered just before" + (
-                    f" ({owner_location(session, owner)})" if owner is not None else ""
+                    f" ({owner_location(session, owner, config, lookup)})" if owner is not None else ""
                 )
             else:
                 result = RESULT_FAILED

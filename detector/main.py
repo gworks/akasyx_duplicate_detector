@@ -88,6 +88,14 @@ def preflight(config: DetectorConfig) -> None:
     if not os.path.isdir(config.archive_root):
         raise PreflightError(f"Archive folder not found: {config.archive_root}")
     check_own_data_placement(config)
+    # 保存フォルダが別の保存フォルダの中にあれば断る（#6）。中に含む向きは初回の登録時に resolve_archive が見る
+    outer = archives.enclosing_archive(os.path.dirname(os.path.realpath(config.archive_root)))
+    if outer is not None:
+        raise PreflightError(
+            "The archive folder is inside another archive folder:\n"
+            f"  archive folder        : {config.archive_root}\n"
+            f"  enclosing archive     : {outer}"
+        )
     if not os.access(config.archive_root, os.W_OK):
         raise PreflightError(f"Archive folder is not writable: {config.archive_root}")
 
