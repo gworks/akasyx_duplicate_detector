@@ -430,3 +430,180 @@ def test_master_db_lock_left_by_dead_process_is_taken(tmp_path):
         pass
     with master_db_lock(db):  # 解放後にもう一度取れる
         pass
+
+
+# --- レビュー指摘 3 回目（2026-09-27）------------------------------------------
+
+
+def _archive_id_of(tmp_path, root):
+    from models import Archive
+    sess, engine = _db(tmp_path)
+    try:
+        return sess.query(Archive).filter_by(root_abs=os.path.realpath(root)).one().id
+    finally:
+        sess.close(); engine.dispose()
+
+
+def test_forget_lets_content_of_deleted_archive_be_stored_again(
+    make_config, tmp_path, fake_crawler, capsys
+):
+    """消した保存フォルダの登録を archives --forget で外せば、その内容を別の保存フォルダに保存できる。"""
+    t, r, src_t, src_r = _dirs(tmp_path, "trial", "real", "in_t", "in_r")
+    write_file(os.path.join(src_t, "x.txt"), b"SAME")
+    assert _add(make_config, t, src_t, tmp_path, fake_crawler) == main.EXIT_OK
+    tid = _archive_id_of(tmp_path, t)
+    shutil.rmtree(t)
+    write_file(os.path.join(src_r, "y.txt"), b"SAME")
+    assert _add(make_config, r, src_r, tmp_path, fake_crawler) == main.EXIT_OK
+    assert os.path.exists(os.path.join(src_r, "y.txt"))  # まだ T の重複扱い
+    sess, engine = _db(tmp_path)
+    try:  # つながっていない保存フォルダにあることを CSV のメッセージで知らせる
+        item = sess.query(IngestItem).filter_by(result=RESULT_DUPLICATE).one()
+        assert "not available" in item.message and "--forget" in item.message
+    finally:
+        sess.close(); engine.dispose()
+
+    argv = ["archives", "--forget", str(tid), "--archive-db", archive_db_path(tmp_path)]
+    assert main.main(argv) == main.EXIT_OK
+    assert _add(make_config, r, src_r, tmp_path, fake_crawler) == main.EXIT_OK
+    assert not os.path.exists(os.path.join(src_r, "y.txt"))  # 今度は R に保存された
+
+
+def test_forget_refuses_archive_that_is_present(make_config, tmp_path, fake_crawler):
+    t, src_t = _dirs(tmp_path, "trial", "in_t")
+    write_file(os.path.join(src_t, "x.txt"), b"SAME")
+    assert _add(make_config, t, src_t, tmp_path, fake_crawler) == main.EXIT_OK
+    tid = _archive_id_of(tmp_path, t)
+    argv = ["archives", "--forget", str(tid), "--archive-db", archive_db_path(tmp_path)]
+    assert main.main(argv) == main.EXIT_REJECTED
+    argv = ["archives", "--forget", "999", "--archive-db", archive_db_path(tmp_path)]
+    assert main.main(argv) == main.EXIT_REJECTED
+
+
+def test_add_skips_file_whose_real_location_is_in_an_archive(
+    make_config, tmp_path, monkeypatch
+):
+    """シンボリックリンクを辿って保存フォルダの下位フォルダに入っても、その保存物は動かさない。"""
+    import crawler_client
+    from conftest import build_crawler_db
+    a, x, src = _dirs(tmp_path, "archive_a", "foreign_x", "inbox")
+    write_file(os.path.join(x, ".akasyx", "archive.id"), b"other-db\n")
+    kept = write_file(os.path.join(x, "2024-01", "x.jpg"), b"XJPG")
+    os.symlink(os.path.join(x, "2024-01"), os.path.join(src, "link"))
+    write_file(os.path.join(src, "own.txt"), b"OWN")
+    crawl_db = str(tmp_path / "crawl.db")
+
+    def _run(target, config, extra_excludes=()):
+        scan_id = build_crawler_db(crawl_db, target)
+        import sqlite3
+        conn = sqlite3.connect(crawl_db)  # --follow-symlinks で辿った分を足す
+        conn.execute(
+            "INSERT INTO fs_files (scan_id, last_seen_scan_id, name, path_abs, path_rel, size,"
+            " filehash, hash_algo, status) VALUES (?, ?, 'x.jpg', ?, 'link/x.jpg', 4, ?, 'sha256', 'active')",
+            (scan_id, scan_id, os.path.join(src, "link", "x.jpg"), _file_hash(kept)),
+        )
+        conn.commit(); conn.close()
+        return crawler_client.CrawlerScan(db_path=crawl_db, scan_id=scan_id, status="completed", root_dir=target)
+
+    monkeypatch.setattr(crawler_client, "resolve_crawler_repo", lambda path: path)
+    monkeypatch.setattr(crawler_client, "run_crawler", _run)
+    cfg = make_config(archive_root=a, source_path=src, follow_symlinks=True)
+    assert main.run(cfg) == main.EXIT_OK
+    assert os.path.exists(kept)
+    assert not os.path.exists(os.path.join(src, "own.txt"))  # 普通のファイルは取り込まれる
+
+
+def test_lock_error_other_than_contention_is_reported(tmp_path, monkeypatch):
+    """ロックに対応しない場所などのエラーは、トレースバックではなく断りとして返す。"""
+    import errno
+    import fcntl
+
+    def _flock(fd, op):
+        raise OSError(errno.ENOTSUP, "Operation not supported")
+
+    monkeypatch.setattr(fcntl, "flock", _flock)
+    with pytest.raises(PreflightError, match="lock"):
+        with master_db_lock(str(tmp_path / "archive.db")):
+            pass
+
+
+def test_hardlinked_duplicate_can_be_deleted(make_config, tmp_path, fake_crawler):
+    """投入元が保存物のハードリンクなら、消してもリンクが 1 本減るだけなので消してよい。"""
+    a, b, leftover = _seed_cross(make_config, tmp_path, fake_crawler)
+    sess, engine = _db(tmp_path)
+    try:
+        item = sess.query(IngestItem).filter_by(result=RESULT_DUPLICATE).one()
+        stored = os.path.join(a, *sess.get(ArchiveFile, item.archive_file_id).stored_path_rel.split("/"))
+    finally:
+        sess.close(); engine.dispose()
+    os.unlink(leftover)
+    os.link(stored, leftover)
+    cfg = make_config(mode=MODE_DELETE_DUPLICATES, archive_root=b, assume_yes=True)
+    assert main.run(cfg) == main.EXIT_OK
+    assert not os.path.exists(leftover)
+    assert os.path.exists(stored)
+
+
+def test_source_containing_archive_is_refused_before_scan_and_registration(
+    make_config, tmp_path, monkeypatch
+):
+    """投入元の中に保存フォルダがあれば、走査（全ハッシュ）の前・取り込み先の登録の前に断る。"""
+    import crawler_client
+    from models import Archive
+    d, src = _dirs(tmp_path, "fresh_d", "inbox")
+    write_file(os.path.join(src, "old_archive", ".akasyx", "archive.id"), b"x\n")
+
+    def _never(*a, **k):
+        raise AssertionError("crawler must not run")
+
+    monkeypatch.setattr(crawler_client, "resolve_crawler_repo", lambda path: path)
+    monkeypatch.setattr(crawler_client, "run_crawler", _never)
+    with pytest.raises(PreflightError, match="archive folder"):
+        main.run(make_config(archive_root=d, source_path=src))
+    assert not os.path.exists(os.path.join(d, ".akasyx", "archive.id"))
+    sess, engine = _db(tmp_path)
+    try:
+        assert sess.query(Archive).count() == 0
+    finally:
+        sess.close(); engine.dispose()
+
+
+def test_source_under_folder_named_akasyx_is_ingested(make_config, tmp_path, fake_crawler):
+    """投入元より上位のフォルダ名が .akasyx でも、投入元の中のファイルは取り込む。"""
+    a, base = _dirs(tmp_path, "archive_a", "vol")
+    src = os.path.join(base, ".akasyx", "tmp", "restore")
+    write_file(os.path.join(src, "r.txt"), b"RESTORE")
+    assert _add(make_config, a, src, tmp_path, fake_crawler) == main.EXIT_OK
+    assert not os.path.exists(os.path.join(src, "r.txt"))
+
+
+def test_source_in_archive_is_decided_before_hashing(make_config, tmp_path, fake_crawler, monkeypatch):
+    a, b, leftover = _seed_cross(make_config, tmp_path, fake_crawler)
+    write_file(os.path.join(os.path.dirname(leftover), ".akasyx", "archive.id"), b"x\n")
+    from utl import hashing
+    calls = []
+    real = hashing.file_hash
+    monkeypatch.setattr(hashing, "file_hash", lambda p, *a, **k: calls.append(p) or real(p, *a, **k))
+    cfg = make_config(mode=MODE_DELETE_DUPLICATES, archive_root=b)
+    assert main.run(cfg) == main.EXIT_OK
+    assert leftover not in calls
+
+
+def test_trash_dir_inside_another_archive_is_refused(make_config, tmp_path, fake_crawler):
+    a, b, leftover = _seed_cross(make_config, tmp_path, fake_crawler)
+    cfg = make_config(
+        mode=MODE_DELETE_DUPLICATES, archive_root=b, assume_yes=True,
+        trash_dir=os.path.join(a, "trash"),
+    )
+    with pytest.raises(PreflightError, match="archive folder"):
+        main.run(cfg)
+    assert os.path.exists(leftover)
+
+
+def test_archive_scan_survives_symlink_loop(tmp_path):
+    """--follow-symlinks の事前チェックが、シンボリックリンクの循環で止まらない。"""
+    import archives
+    src = tmp_path / "inbox"
+    (src / "a").mkdir(parents=True)
+    os.symlink(src, src / "a" / "loop")
+    assert archives.archives_below(str(src), follow_symlinks=True) == []

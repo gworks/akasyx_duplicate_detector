@@ -26,6 +26,7 @@ from models import (
     RESULT_MOVED,
     RESULT_SKIPPED_EMPTY,
     RESULT_SKIPPED_NOHASH,
+    RESULT_SKIPPED_IN_ARCHIVE,
     RESULT_SKIPPED_OWN_DATA,
     Ingest,
 )
@@ -113,6 +114,15 @@ def preflight(config: DetectorConfig) -> None:
                 f"  source        : {config.source_path}"
             )
         if os.path.isdir(config.source_path):
+            # 投入元の中に保存フォルダがあれば、走査（全ハッシュ）と取り込み先の登録の前に断る
+            below = archives.archives_below(config.source_path, config.follow_symlinks)
+            if below:
+                listed = "\n".join(f"  {d}" for d in below)
+                raise PreflightError(
+                    "The source contains an archive folder (a folder with .akasyx/archive.id):\n"
+                    f"{listed}\n"
+                    "  Choose a source that does not include archive folders."
+                )
             crawler_client.check_crawler(config)
 
     if config.mode == MODE_VERIFY:
@@ -122,6 +132,14 @@ def preflight(config: DetectorConfig) -> None:
         if is_nested(config.archive_root, config.trash_dir):
             raise PreflightError(
                 f"The trash directory is inside the archive folder: {config.trash_dir}"
+            )
+        # 別の保存フォルダの中に退避すると、その保存フォルダの verify が未登録の保存物として拾う（#6）
+        enclosing = archives.enclosing_archive(config.trash_dir)
+        if enclosing is not None:
+            raise PreflightError(
+                "The trash directory is inside an archive folder:\n"
+                f"  archive folder : {enclosing}\n"
+                f"  trash directory: {config.trash_dir}"
             )
         os.makedirs(config.trash_dir, exist_ok=True)
 
@@ -140,6 +158,11 @@ def _summarize(config: DetectorConfig, counters: dict) -> str:
                 if counters.get(RESULT_SKIPPED_OWN_DATA)
                 else ""
             )
+            + (
+                f", inside an archive folder (skipped): {counters[RESULT_SKIPPED_IN_ARCHIVE]}"
+                if counters.get(RESULT_SKIPPED_IN_ARCHIVE)
+                else ""
+            )
         )
     parts = ", ".join(f"{k}: {v}" for k, v in sorted(counters.items()))
     return f"[Summary] {parts or 'nothing to process'}"
@@ -153,13 +176,22 @@ def _apply_counters(record: Ingest, counters: dict) -> None:
         counters.get(RESULT_SKIPPED_EMPTY, 0)
         + counters.get(RESULT_SKIPPED_NOHASH, 0)
         + counters.get(RESULT_SKIPPED_OWN_DATA, 0)
+        + counters.get(RESULT_SKIPPED_IN_ARCHIVE, 0)
     )
     record.failed = counters.get(RESULT_FAILED, 0) + counters.get("failed", 0)
     record.stats_json = json_dumps(counters)
 
 
 def run_archives(config: DetectorConfig) -> int:
-    """登録済みの保存フォルダ一覧（保存フォルダの指定もロックも要らない）。"""
+    """登録済みの保存フォルダ一覧（保存フォルダの指定もロックも要らない）。--forget は登録を外す。"""
+    if config.forget_id is not None:
+        with master_db_lock(config.archive_db):
+            session, _engine = get_session(config.archive_db)
+            try:
+                archives.forget_archive(session, config.forget_id)
+                return EXIT_OK
+            finally:
+                session.close()
     session, _engine = get_session(config.archive_db)
     try:
         rows = archives.list_archives(session)

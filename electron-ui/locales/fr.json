@@ -72,6 +72,7 @@
   "result_skipped_empty": "Fichier vide",
   "result_skipped_nohash": "Sans empreinte",
   "result_skipped_own_data": "Données internes (ignorées)",
+  "result_skipped_in_archive": "Dans un dossier d'archive (ignoré)",
   "result_failed": "Échec",
   "result_ok": "OK",
   "result_missing": "Manquant",

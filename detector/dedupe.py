@@ -23,7 +23,7 @@ from models import (
     utcnow,
 )
 from utl import hashing
-from utl.helpers import from_posix, to_posix
+from utl.helpers import from_posix, path_key, to_posix
 from utl.result_csv import create_csv, csv_update
 
 logger = logging.getLogger(__name__)
@@ -58,18 +58,26 @@ def _pending_items(session, config):
     return query.order_by(IngestItem.id).all()
 
 
-def check_item(session, config, item, owner_roots: dict | None = None) -> tuple[str, str | None]:
+def check_item(session, config, item, caches: "DedupeCaches | None" = None) -> tuple[str, str | None]:
     """削除前の2点検証（設計書 §10）。戻り値は (判定, メッセージ)。
 
     ① 投入元のファイルが存在し、現在のハッシュが記録と一致する
     ② 同じ内容の stored 行があり（どの保存フォルダでもよい — #6）、実体があり、ハッシュが一致する
        実体がある保存フォルダにつながっていなければ消さない。消す対象が実体そのものでも消さない
     ③ 投入元のファイルが保存フォルダの中にない（別の保存フォルダの保存物を消さない）
-    owner_roots は保存フォルダごとの場所などの確認結果のキャッシュ（1 回の実行で共有する）
+    caches は保存フォルダの確認結果のキャッシュ（1 回の実行で共有する）
     """
     src = item.source_path_abs
     if not src or not os.path.lexists(src):
         return CHECK_GONE, "Source file no longer exists"
+
+    # 投入元がどこかの保存フォルダの中なら消さない。add の事前チェックより前の記録や、あとから投入元の
+    # フォルダを保存フォルダにした場合、消すと別の保存フォルダの保存物（DB は stored のまま）を失う（#6）。
+    # 読まずに決まるので、ハッシュの再計算より先に見る
+    caches = caches if caches is not None else DedupeCaches()
+    inside = caches.enclosing(os.path.dirname(src))
+    if inside is not None:
+        return CHECK_SOURCE_IN_ARCHIVE, f"The source file is inside an archive folder: {inside}"
 
     try:
         actual = hashing.file_hash(src)
@@ -77,13 +85,6 @@ def check_item(session, config, item, owner_roots: dict | None = None) -> tuple[
         return CHECK_SOURCE_CHANGED, f"Cannot read source file: {e}"
     if actual != item.filehash:
         return CHECK_SOURCE_CHANGED, f"Source file content has changed (now {actual})"
-
-    # 投入元がどこかの保存フォルダの中なら消さない。add の事前チェックより前の記録や、あとから投入元の
-    # フォルダを保存フォルダにした場合、消すと別の保存フォルダの保存物（DB は stored のまま）を失う（#6）
-    cache = owner_roots if owner_roots is not None else {}
-    inside = _enclosing_archive_cached(os.path.dirname(src), cache)
-    if inside is not None:
-        return CHECK_SOURCE_IN_ARCHIVE, f"The source file is inside an archive folder: {inside}"
 
     rows = owning_query(
         session, item.filehash, item.hash_algo, config.archive_id, stored_only=True
@@ -95,7 +96,7 @@ def check_item(session, config, item, owner_roots: dict | None = None) -> tuple[
 
     failures = []
     for row in rows:
-        verdict, message = _check_copy(session, config, src, item.filehash, row, cache)
+        verdict, message = _check_copy(session, config, src, item.filehash, row, caches)
         if verdict in (CHECK_OK, CHECK_SAME_FILE):
             return verdict, message
         failures.append((verdict, message))
@@ -103,17 +104,20 @@ def check_item(session, config, item, owner_roots: dict | None = None) -> tuple[
     return next((f for f in failures if f[0] == CHECK_ARCHIVE_UNAVAILABLE), failures[0])
 
 
-def _check_copy(session, config, src, filehash, row, cache) -> tuple[str, str | None]:
+def _check_copy(session, config, src, filehash, row, caches) -> tuple[str, str | None]:
     """stored 行 1 つについて、保存フォルダの実物で検証します。"""
-    root, unavailable = _owner_root(session, config, row, cache)
+    root, unavailable = caches.owner_root(session, config, row)
     if unavailable:
         return CHECK_ARCHIVE_UNAVAILABLE, unavailable
     dst = from_posix(root, row.stored_path_rel)
     if not os.path.lexists(dst):
         return CHECK_ARCHIVE_MISSING, f"Archived file is missing: {dst}"
+    # 消す対象のパスが保存物のパスそのものなら消さない。最後の要素は解かない（投入元がハードリンクや
+    # 保存物を指すシンボリックリンクなら、消えるのはリンクだけで保存物は残るので消してよい）
+    src_path = os.path.join(os.path.realpath(os.path.dirname(src)), os.path.basename(src))
+    if path_key(src_path, real=False) == path_key(dst):
+        return CHECK_SAME_FILE, f"The source is the archived file itself: {dst}"
     try:
-        if os.path.samefile(src, dst):
-            return CHECK_SAME_FILE, f"The source is the archived file itself: {dst}"
         if hashing.file_hash(dst) != filehash:
             return CHECK_ARCHIVE_MISSING, f"Archived file content does not match: {dst}"
     except OSError as e:
@@ -121,27 +125,31 @@ def _check_copy(session, config, src, filehash, row, cache) -> tuple[str, str | 
     return CHECK_OK, None
 
 
-def _enclosing_archive_cached(directory: str, cache: dict) -> str | None:
-    """archives.enclosing_archive をフォルダごとにキャッシュします（同じフォルダの重複が多いため）。"""
-    key = ("enclosing", directory)
-    if key not in cache:
-        cache[key] = archives.enclosing_archive(directory)
-    return cache[key]
+class DedupeCaches:
+    """1 回の delete-duplicates で共有する確認結果（ネットワーク上の場所を 1 件ごとに問い合わせない）。"""
 
+    def __init__(self):
+        self._enclosing: dict[str, str | None] = {}
+        self._owner_roots: dict[int, tuple[str, str | None]] = {}
 
-def _owner_root(session, config, row, cache: dict) -> tuple[str, str | None]:
-    """保存済みの実物がある保存フォルダの場所を返します。戻り値は (場所, つながっていない理由)。
+    def enclosing(self, directory: str) -> str | None:
+        """directory を含む保存フォルダ（archives.enclosing_archive）。"""
+        if directory not in self._enclosing:
+            self._enclosing[directory] = archives.enclosing_archive(directory)
+        return self._enclosing[directory]
 
-    今の実行の保存フォルダなら、起動時に確かめた場所をそのまま使う。別の保存フォルダは登録上の場所に
-    あり、かつ `.akasyx/archive.id` の uid が一致するときだけ使う（外した NAS の跡に別のフォルダが
-    あっても、それを実物の置き場と取り違えない）。結果は保存フォルダごとに cache に残し、
-    ネットワーク上の場所を 1 件ごとに問い合わせない。
-    """
-    if row.archive_id == config.archive_id:
-        return config.archive_root, None
-    if row.archive_id not in cache:
-        cache[row.archive_id] = _check_owner_root(session, row.archive_id)
-    return cache[row.archive_id]
+    def owner_root(self, session, config, row) -> tuple[str, str | None]:
+        """保存済みの実物がある保存フォルダの場所。戻り値は (場所, つながっていない理由)。
+
+        今の実行の保存フォルダなら、起動時に確かめた場所をそのまま使う。別の保存フォルダは登録上の場所に
+        あり、かつ `.akasyx/archive.id` の uid が一致するときだけ使う（外した NAS の跡に別のフォルダが
+        あっても、それを実物の置き場と取り違えない）。
+        """
+        if row.archive_id == config.archive_id:
+            return config.archive_root, None
+        if row.archive_id not in self._owner_roots:
+            self._owner_roots[row.archive_id] = _check_owner_root(session, row.archive_id)
+        return self._owner_roots[row.archive_id]
 
 
 def _check_owner_root(session, archive_id: int) -> tuple[str, str | None]:
@@ -167,7 +175,7 @@ def _trash_dest(config, item) -> str:
 def run_delete_duplicates(session, config, ingest) -> tuple[str, dict]:
     """据え置いた重複を検証して削除（または退避）します。"""
     items = _pending_items(session, config)
-    owner_roots: dict = {}
+    caches = DedupeCaches()
     counters: dict[str, int] = {}
     total_size = 0
     status = "completed"
@@ -177,7 +185,7 @@ def run_delete_duplicates(session, config, ingest) -> tuple[str, dict]:
 
     try:
         for item in items:
-            verdict, message = check_item(session, config, item, owner_roots)
+            verdict, message = check_item(session, config, item, caches)
             counters[verdict] = counters.get(verdict, 0) + 1
 
             if verdict == CHECK_GONE:

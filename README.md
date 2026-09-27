@@ -41,6 +41,7 @@ uv run main.py delete-duplicates /path/to/archive --yes
 # 状態と履歴
 uv run main.py report /path/to/archive
 uv run main.py archives                       # 正本 DB に登録されている保存フォルダの一覧
+uv run main.py archives --forget 3            # 消した保存フォルダ #3 の記録を重複判定から外す
 uv run main.py --help
 ```
 
@@ -105,6 +106,10 @@ UI の「詳細設定 → データの保存場所」（「Finder で表示」�
 同じ正本 DB を使う実行は、保存フォルダが違っても同時に 1 本だけ（`<正本 DB>.lock`）。
 投入元が保存フォルダ（`.akasyx/archive.id` のあるフォルダ。登録の有無・正本 DB を問わない）の中にある、
 または中に保存フォルダを含むと断る（中の保存物を自分自身の重複と判定したり、識別子ごと移したりしないため）。
+`--follow-symlinks` でリンクを辿った先が保存フォルダの中なら、そのファイルは `skipped_in_archive` として動かさない。
+保存フォルダを消したときは `archives --forget <ID>` で登録を外す（外さないと、その保存フォルダにあった内容は
+重複と判定され続け、どこにも保存されない。取り込みの CSV に「つながっていない保存フォルダにある」と出る）。
+保存記録は missing になるだけで履歴は消えない。保存フォルダがその場所にあるときは断る。
 
 - **起動時に正本 DB が無ければ（親フォルダごと）自動で作る**。ログに「正本 DB がありません。新規作成します」と出る。
   初回起動・`dist/` を消した後・別マシンでの初回はこれで空の DB から始まる

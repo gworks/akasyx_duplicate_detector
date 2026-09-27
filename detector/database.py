@@ -1,5 +1,6 @@
 # database.py - archive.db の接続・セッション管理（設計書 §6.3）
 import contextlib
+import errno
 import logging
 import os
 
@@ -153,10 +154,21 @@ def master_db_lock(archive_db: str):
     ロックファイルは消さずに残す（消すと、開いたままの別プロセスと別の実体をロックし合う隙間ができる）。
     """
     path = master_db_lock_path(archive_db)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
     try:
-        if not _try_os_lock(fd):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as e:
+        raise PreflightError(f"Cannot create the master DB lock file: {path}: {e}") from e
+    try:
+        try:
+            locked = _try_os_lock(fd)
+        except OSError as e:
+            # ロックに対応しない場所（ネットワーク FS 等）。正本 DB はローカルディスクに置く
+            raise PreflightError(
+                f"Cannot lock the master DB lock file: {path}: {e}\n"
+                "  Put the master DB on a local disk (--archive-db)."
+            ) from e
+        if not locked:
             holder = ""
             with contextlib.suppress(OSError):
                 holder = os.pread(fd, 32, 0).decode(errors="replace").strip() if hasattr(os, "pread") else ""
@@ -184,8 +196,10 @@ def _try_os_lock(fd: int) -> bool:
         try:
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
             return True
-        except OSError:
-            return False
+        except OSError as e:
+            if e.errno in (errno.EACCES, errno.EDEADLK):  # 他のプロセスが持っている
+                return False
+            raise
     import fcntl
 
     try:

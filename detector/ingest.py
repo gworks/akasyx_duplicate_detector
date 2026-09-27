@@ -5,6 +5,7 @@ from datetime import datetime
 
 from sqlalchemy import and_, case, or_
 
+import archives
 import crawler_client
 import mover
 from config import OS_JUNK_FILES, OWN_DATA_DB, own_data_dirs, own_data_locations
@@ -17,6 +18,7 @@ from models import (
     RESULT_MOVED,
     RESULT_SKIPPED_EMPTY,
     RESULT_SKIPPED_NOHASH,
+    RESULT_SKIPPED_IN_ARCHIVE,
     RESULT_SKIPPED_OWN_DATA,
     STATUS_STORED,
     Archive,
@@ -64,7 +66,7 @@ def owning_query(
 
 
 def judge(
-    session, scanned, config, virtual_hashes: set | None = None
+    session, scanned, config, virtual_hashes: set | None = None, availability: dict | None = None
 ) -> tuple[str, ArchiveFile | None, str | None]:
     """1ファイルの判定（設計書 §7.1 の判定表）。上から順に評価する。
 
@@ -95,16 +97,34 @@ def judge(
                 existing,
                 f"Hash matches but size differs (DB {existing.size} / actual {scanned.size})",
             )
-        return RESULT_DUPLICATE, existing, owner_location(session, existing)
+        return RESULT_DUPLICATE, existing, owner_location(session, existing, config, availability)
 
     return RESULT_MOVED, None, None
 
 
-def owner_location(session, row: ArchiveFile) -> str:
-    """同じ内容がどの保存フォルダのどこにあるかを表す文字列（CSV・ログ用）。"""
+def owner_location(session, row: ArchiveFile, config=None, availability: dict | None = None) -> str:
+    """同じ内容がどの保存フォルダのどこにあるかを表す文字列（CSV・ログ用）。
+
+    別の保存フォルダが今つながっていなければそう書き、消した保存フォルダなら登録を外す方法を示す
+    （消えた保存フォルダの記録が重複判定を塞ぎ続けないように — #6）。確認は保存フォルダごとに 1 回。
+    """
     archive = session.get(Archive, row.archive_id)
     root = archive.root_abs if archive is not None else f"#{row.archive_id}"
-    return f"Same content already in archive folder {root}: {row.stored_path_rel}"
+    message = f"Same content already in archive folder {root}: {row.stored_path_rel}"
+    if archive is None or config is None or row.archive_id == config.archive_id:
+        return message
+    cache = availability if availability is not None else {}
+    if row.archive_id not in cache:
+        try:
+            cache[row.archive_id] = archives.is_at_registered_location(archive)
+        except PreflightError:
+            cache[row.archive_id] = False
+    if not cache[row.archive_id]:
+        message += (
+            " (this archive folder is not available now; if it no longer exists, "
+            f"run `archives --forget {row.archive_id}`)"
+        )
+    return message
 
 
 # 正本 DB と一緒に扱うファイル（SQLite の付随ファイルと、正本 DB 単位のロック database.master_db_lock）
@@ -146,8 +166,13 @@ def own_data_matcher(config, source: str | None = None):
         return p in db_files or any(key_within(d, p) for d in dirs)
 
     def is_own(path):
-        if META_DIRNAME in os.path.normpath(path).split(os.sep):
-            # 保存フォルダの管理用フォルダ（識別子の無いロック・作業ファイルの残り）。保存物ではない
+        # 投入元の中にある保存フォルダの管理用フォルダ（識別子の無いロック・作業ファイルの残り）。保存物ではない。
+        # 投入元より上位のフォルダ名は見ない（投入元自体が .akasyx の下でも中身は取り込む）
+        try:
+            parts = os.path.relpath(os.path.abspath(path), src_abs).split(os.sep)
+        except ValueError:  # Windows で別ドライブ
+            parts = []
+        if parts and parts[0] != os.pardir and META_DIRNAME in parts[:-1]:
             return True
         if matches(path_key(path, real=False)):
             return True
@@ -165,16 +190,6 @@ def _collect_files(config):
         # .DS_Store 等の OS メタデータは保存する価値が無く、取り込むと保存フォルダが汚れる
         scan = crawler_client.run_crawler(source, config, extra_excludes=OS_JUNK_FILES)
         crawler_client.ensure_completed(scan)
-        markers = crawler_client.find_archive_markers(scan.db_path, scan.scan_id)
-        if markers:
-            # 中の保存フォルダの保存物を自分自身の重複と判定したり、識別子ごと移したりしないよう、
-            # 1 件も動かす前に断る（#6。登録の有無・正本 DB に関係なく目印で見る）
-            listed = "\n".join(f"  {os.path.dirname(os.path.dirname(m))}" for m in markers)
-            raise PreflightError(
-                "The source contains an archive folder (a folder with .akasyx/archive.id):\n"
-                f"{listed}\n"
-                "  Choose a source that does not include archive folders."
-            )
         return crawler_client.read_files(scan.db_path, scan.scan_id), scan
     # 単一ファイルは crawler を使わず直接読む（設計書 §6.4）
     return iter([crawler_client.scan_single_file(source)]), None
@@ -211,6 +226,8 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
     csv_file = create_csv(config.log_dir, "add_result", ts_start)
     processed = 0
     is_own = own_data_matcher(config)
+    in_archive = archive_matcher()
+    availability: dict = {}
 
     try:
         for scanned in files:
@@ -221,9 +238,17 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
                 message = "The detector's own data (master DB / work DB / logs / UI data); not ingested"
                 logger.warning(f"Skipped the detector's own data inside the source: {scanned.path_abs}")
                 _record_item(session, config, ingest, scanned, result, None, None, message)
+            elif (inside := in_archive(scanned.path_abs)) is not None:
+                # 投入元の中の保存フォルダは事前チェックで断っている。ここに来るのはシンボリックリンクを辿って
+                # 保存フォルダの下位へ入った場合。動かすとその保存フォルダの保存物を失う（#6）
+                result, stored_rel = RESULT_SKIPPED_IN_ARCHIVE, None
+                message = f"The file is inside an archive folder: {inside}"
+                logger.warning(f"Skipped a file inside an archive folder: {scanned.path_abs}")
+                _record_item(session, config, ingest, scanned, result, None, None, message)
             else:
                 result, stored_rel, message = _process_one(
-                    session, config, ingest, scanned, planner, reserved, virtual_hashes
+                    session, config, ingest, scanned, planner, reserved, virtual_hashes,
+                    availability,
                 )
             counters[result] = counters.get(result, 0) + 1
             csv_update(
@@ -256,8 +281,21 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
     return status, counters
 
 
+def archive_matcher():
+    """ファイルの実体が保存フォルダの中にあれば、その保存フォルダを返す関数を返します（フォルダごとにキャッシュ）。"""
+    cache: dict[str, str | None] = {}
+
+    def inside(path):
+        d = os.path.dirname(path)
+        if d not in cache:
+            cache[d] = archives.enclosing_archive(d)
+        return cache[d]
+
+    return inside
+
+
 def _process_one(
-    session, config, ingest, scanned, planner, reserved, virtual_hashes
+    session, config, ingest, scanned, planner, reserved, virtual_hashes, availability=None
 ) -> tuple[str, str | None, str | None]:
     """1ファイルを判定し、必要なら移動して記録します。
 
@@ -265,7 +303,7 @@ def _process_one(
     """
     try:
         result, existing, message = judge(
-            session, scanned, config, virtual_hashes if config.dry_run else None
+            session, scanned, config, virtual_hashes if config.dry_run else None, availability
         )
     except Exception as e:  # 1件の失敗で実行全体を止めない（設計書 §12）
         session.rollback()

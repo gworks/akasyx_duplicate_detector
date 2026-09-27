@@ -183,6 +183,8 @@ class DetectorConfig:
     ingest_id: int | None = None
     trash_dir: str | None = None
     assume_yes: bool = False
+    # archives --forget: 登録を外す保存フォルダの ID（#6）
+    forget_id: int | None = None
 
 
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -304,6 +306,14 @@ def build_parser() -> argparse.ArgumentParser:
         MODE_ARCHIVES, help="list archive folders registered in the master DB"
     )
     _add_common_args(p_arc)
+    p_arc.add_argument(
+        "--forget",
+        type=int,
+        metavar="ID",
+        dest="forget_id",
+        help="stop using the records of a deleted archive folder for duplicate detection "
+        "(refused if the folder is present)",
+    )
 
     return parser
 
@@ -349,6 +359,7 @@ def parse_arguments(argv: list[str] | None = None) -> DetectorConfig:
             else None
         ),
         assume_yes=getattr(args, "yes", False),
+        forget_id=getattr(args, "forget_id", None),
     )
 
 

@@ -11,7 +11,17 @@ from datetime import datetime
 from config import OS_JUNK_FILES
 from database import META_DIRNAME, archive_id_path, legacy_db_path, meta_dir, tmp_dir
 from errors import PreflightError
-from models import Archive, ArchiveFile, Base, Ingest, IngestItem, LegacyImport, utcnow
+from models import (
+    OWNING_STATUSES,
+    STATUS_MISSING,
+    Archive,
+    ArchiveFile,
+    Base,
+    Ingest,
+    IngestItem,
+    LegacyImport,
+    utcnow,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +160,35 @@ def enclosing_archive(path: str) -> str | None:
         if parent == d:
             return None
         d = parent
+
+
+def archives_below(root: str, follow_symlinks: bool = False, limit: int = 5) -> list[str]:
+    """root の中にある保存フォルダ（`.akasyx/archive.id` のあるフォルダ）を返します（最大 limit 件）。
+
+    add の事前チェック用。crawler の走査（全ハッシュ）より前に断れるよう、メタデータだけを歩く。
+    `.akasyx/` の中には入らない。読めないフォルダは crawler も読めないので飛ばす。
+    """
+    found = []
+    seen: set[tuple[int, int]] = set()
+    for dirpath, dirnames, _ in os.walk(root, followlinks=follow_symlinks):
+        if follow_symlinks:
+            # シンボリックリンクを辿ると循環しうる（os.walk は検出しない）。実体で一度だけ歩く
+            try:
+                st = os.stat(dirpath)
+            except OSError:
+                dirnames.clear()
+                continue
+            if (st.st_dev, st.st_ino) in seen:
+                dirnames.clear()
+                continue
+            seen.add((st.st_dev, st.st_ino))
+        if META_DIRNAME in dirnames:
+            if os.path.isfile(archive_id_path(dirpath)):
+                found.append(dirpath)
+                if len(found) >= limit:
+                    break
+            dirnames.remove(META_DIRNAME)
+    return found
 
 
 def is_at_registered_location(row: Archive) -> bool:
@@ -391,6 +430,38 @@ def _fix_datetimes(data: dict) -> None:
                 data[key] = datetime.fromisoformat(data[key])
             except ValueError:
                 data[key] = None
+
+
+def forget_archive(session, archive_id: int) -> int:
+    """消した保存フォルダの登録を外します（#6）。戻り値は重複判定の対象から外した行数。
+
+    重複判定は全保存フォルダ共通なので、消した保存フォルダの保存記録が残ると、その内容は二度と
+    どこにも保存されない。保存記録は missing にして重複判定から外す（行と履歴は消さない）。
+    保存フォルダがその場所にある（つながっている）なら断る。外したあとに同じ保存フォルダを開くと、
+    verify が実体から missing を復活させる。
+    """
+    row = session.get(Archive, archive_id)
+    if row is None:
+        raise PreflightError(f"No archive folder with ID #{archive_id} is registered")
+    if is_at_registered_location(row):
+        raise PreflightError(
+            f"Archive folder #{archive_id} is present at its location; it cannot be forgotten:\n"
+            f"  {row.root_abs}"
+        )
+    rows = (
+        session.query(ArchiveFile)
+        .filter(ArchiveFile.archive_id == archive_id, ArchiveFile.status.in_(OWNING_STATUSES))
+        .all()
+    )
+    for f in rows:
+        f.status = STATUS_MISSING
+    session.commit()
+    logger.info(
+        f"Forgot archive folder #{archive_id} ({row.root_abs}): "
+        f"{len(rows)} records are no longer used for duplicate detection"
+    )
+    print(f"Forgot archive folder #{archive_id}: {row.root_abs} ({len(rows)} records)")
+    return len(rows)
 
 
 def list_archives(session) -> list[tuple[Archive, int, int]]:
