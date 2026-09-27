@@ -16,7 +16,7 @@ from models import Archive, ArchiveFile, Base, Ingest, IngestItem, LegacyImport,
 logger = logging.getLogger(__name__)
 
 
-def _read_uid(archive_root: str) -> str | None:
+def read_uid(archive_root: str) -> str | None:
     """`.akasyx/archive.id` の uid。ファイルが無ければ None。
 
     読めない（権限・I/O エラー）のは「無い」と区別して断る。無いとみなすと別の保存フォルダとして
@@ -134,16 +134,22 @@ def _find_by_location(session, root: str) -> Archive | None:
     return matches[0]
 
 
+def is_at_registered_location(row: Archive) -> bool:
+    """登録上の場所に、この保存フォルダ（同じ uid）が今あるか。
+
+    フォルダが無い（移動した・NAS が外れている）か、別の保存フォルダが置かれていれば False。
+    識別子を読めないときは PreflightError（扱いは呼び出し側で決める）。
+    """
+    return os.path.isdir(row.root_abs) and read_uid(row.root_abs) == row.uid
+
+
 def _is_live_copy_source(row: Archive, root: str) -> bool:
     """登録上の場所に、同じ uid の保存フォルダがまだ残っているか（= root はその複製）。
 
     呼び出し側で「root は登録上の場所とは別の実体」と確かめてから呼ぶ（同じ場所の別表記は複製ではない）。
     """
-    old = row.root_abs
-    if not os.path.isdir(old):
-        return False
     try:
-        return _read_uid(old) == row.uid
+        return is_at_registered_location(row)
     except PreflightError as e:
         # もう使っていない場所の不調で、移動した保存フォルダまで開けなくしない
         logger.warning(f"Could not check the previous location; treating as moved: {e}")
@@ -171,7 +177,7 @@ def resolve_archive(session, archive_root: str) -> Archive:
     # 場所で見つけられなくなる）。新規登録・移動・別表記のどの分岐でもこの形を使う
     root = os.path.realpath(archive_root)
     os.makedirs(tmp_dir(root), exist_ok=True)
-    uid = _read_uid(root)
+    uid = read_uid(root)
 
     row = None
     if uid:

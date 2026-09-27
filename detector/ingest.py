@@ -3,6 +3,8 @@ import logging
 import os
 from datetime import datetime
 
+from sqlalchemy import and_, case, or_
+
 import crawler_client
 import mover
 from config import OS_JUNK_FILES, OWN_DATA_DB, own_data_dirs, own_data_locations
@@ -14,6 +16,8 @@ from models import (
     RESULT_SKIPPED_EMPTY,
     RESULT_SKIPPED_NOHASH,
     RESULT_SKIPPED_OWN_DATA,
+    STATUS_STORED,
+    Archive,
     ArchiveFile,
     IngestItem,
 )
@@ -25,17 +29,26 @@ logger = logging.getLogger(__name__)
 COMMIT_INTERVAL = 100
 
 
-def find_owning(session, archive_id: int, filehash: str, hash_algo: str) -> ArchiveFile | None:
-    """同一内容を保持している行を返します（同じ保存フォルダ・同一 hash_algo 同士でのみ照合）。"""
+def find_owning(session, filehash: str, hash_algo: str, archive_id: int) -> ArchiveFile | None:
+    """同一内容を保持している行を返します（同一 hash_algo 同士でのみ照合）。
+
+    正本 DB に登録された全保存フォルダが対象（#6）。どこかの保存フォルダに同じ内容があれば重複。
+    ただし pending は今の保存フォルダのもの（= この実行の予約。前回の中断分は起動時に復旧済み）だけ数える。
+    別の保存フォルダの pending は中断の残りで、実体がどこにも無いかもしれず、その保存フォルダの復旧で
+    消されると参照している判定記録が FK 違反で復旧を止めるため。
+    複数あれば今の保存フォルダの行を優先する（delete-duplicates で、つながっている実物で検証できるように）。
+    """
     return (
         session.query(ArchiveFile)
         .filter(
-            ArchiveFile.archive_id == archive_id,
             ArchiveFile.filehash == filehash,
             ArchiveFile.hash_algo == hash_algo,
-            ArchiveFile.status.in_(OWNING_STATUSES),
+            or_(
+                ArchiveFile.status == STATUS_STORED,
+                and_(ArchiveFile.status.in_(OWNING_STATUSES), ArchiveFile.archive_id == archive_id),
+            ),
         )
-        .order_by(ArchiveFile.id)
+        .order_by(case((ArchiveFile.archive_id == archive_id, 0), else_=1), ArchiveFile.id)
         .first()
     )
 
@@ -64,7 +77,7 @@ def judge(
         # dry-run で、同じ実行内の先行ファイルが取り込み対象になっている
         return RESULT_DUPLICATE, None, "Same content as an earlier file in this run"
 
-    existing = find_owning(session, config.archive_id, *key)
+    existing = find_owning(session, *key, config.archive_id)
     if existing is not None:
         if existing.size != scanned.size:
             return (
@@ -72,12 +85,20 @@ def judge(
                 existing,
                 f"Hash matches but size differs (DB {existing.size} / actual {scanned.size})",
             )
-        return RESULT_DUPLICATE, existing, None
+        return RESULT_DUPLICATE, existing, owner_location(session, existing)
 
     return RESULT_MOVED, None, None
 
 
-_SQLITE_SIDECARS = ("", "-wal", "-shm", "-journal")
+def owner_location(session, row: ArchiveFile) -> str:
+    """同じ内容がどの保存フォルダのどこにあるかを表す文字列（CSV・ログ用）。"""
+    archive = session.get(Archive, row.archive_id)
+    root = archive.root_abs if archive is not None else f"#{row.archive_id}"
+    return f"Same content already in archive folder {root}: {row.stored_path_rel}"
+
+
+# 正本 DB と一緒に扱うファイル（SQLite の付随ファイルと、正本 DB 単位のロック database.master_db_lock）
+_DB_SIDECARS = ("", "-wal", "-shm", "-journal", ".lock")
 
 
 def own_data_matcher(config, source: str | None = None):
@@ -108,7 +129,7 @@ def own_data_matcher(config, source: str | None = None):
         for kind, _label, path, _movable in own_data_locations(config)
         if kind == OWN_DATA_DB
         for k in keys(path)
-        for sfx in _SQLITE_SIDECARS
+        for sfx in _DB_SIDECARS
     }
 
     def matches(p):
@@ -248,10 +269,12 @@ def _process_one(
                 # 予約が UNIQUE で弾かれた = 直前に同一内容が登録された
                 result = RESULT_DUPLICATE
                 owner = find_owning(
-                    session, config.archive_id, scanned.filehash, scanned.hash_algo
+                    session, scanned.filehash, scanned.hash_algo, config.archive_id
                 )
                 archive_file_id = owner.id if owner is not None else None
-                message = "Identical content was registered just before"
+                message = "Identical content was registered just before" + (
+                    f" ({owner_location(session, owner)})" if owner is not None else ""
+                )
             else:
                 result = RESULT_FAILED
                 message = move.message

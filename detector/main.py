@@ -13,7 +13,7 @@ import mover
 import report
 import verify
 from config import DetectorConfig
-from database import archive_lock, get_session
+from database import archive_lock, get_session, master_db_lock
 from errors import DetectorError, PreflightError
 from models import (
     MODE_ADD,
@@ -27,9 +27,10 @@ from models import (
     RESULT_SKIPPED_EMPTY,
     RESULT_SKIPPED_NOHASH,
     RESULT_SKIPPED_OWN_DATA,
+    Archive,
     Ingest,
 )
-from utl.helpers import is_nested, json_dumps
+from utl.helpers import is_nested, json_dumps, key_within, path_key
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,30 @@ def preflight(config: DetectorConfig) -> None:
         os.makedirs(config.trash_dir, exist_ok=True)
 
 
+def check_source_against_archives(session, config: DetectorConfig, current_id: int) -> None:
+    """投入元が登録済みのどの保存フォルダとも重ならないことを確かめます（#6）。
+
+    重なると、その保存フォルダの保存済みファイルが自分自身の重複と判定され（全保存フォルダ共通の判定）、
+    delete-duplicates の対象になる。重ならない向きでも、中の保存物を別の保存フォルダへ移してしまう。
+    登録上の場所（実体の realpath で記録済み）は文字列で比べ、つながっていない NAS 等に I/O をかけない。
+    重なった登録だけ、その場所にフォルダが今あるかを確かめる（消した保存フォルダの登録が上位フォルダを
+    投入元にするのを妨げないように。登録を外すコマンドは無い）。今の保存フォルダとの重なりは preflight が見る。
+    """
+    src = path_key(config.source_path)
+    for row in session.query(Archive).filter(Archive.id != current_id).order_by(Archive.id):
+        root = path_key(row.root_abs, real=False)
+        if not (key_within(root, src) or key_within(src, root)):
+            continue
+        # 識別子（uid）が一致するかは問わない。識別子だけ消えた保存フォルダでも中身は保存物なので安全側に断る
+        if os.path.isdir(row.root_abs):
+            raise PreflightError(
+                "The source overlaps a registered archive folder "
+                "(is inside it, contains it, or is the same):\n"
+                f"  registered archive folder: {row.root_abs}\n"
+                f"  source                   : {config.source_path}"
+            )
+
+
 def _summarize(config: DetectorConfig, counters: dict) -> str:
     """crawler の [実行サマリ] 形式を踏襲した1行サマリ（設計書 §7.5）。"""
     if config.mode == MODE_ADD:
@@ -177,10 +202,14 @@ def run(config: DetectorConfig) -> int:
 
     preflight(config)
 
-    with archive_lock(config.archive_root):
+    # 重複判定は全保存フォルダ共通なので、同じ正本 DB を使う実行は保存フォルダが違っても 1 本だけ（#6）
+    with master_db_lock(config.archive_db), archive_lock(config.archive_root):
         session, _engine = get_session(config.archive_db)
         try:
             archive = archives.resolve_archive(session, config.archive_root)
+            if config.mode == MODE_ADD:
+                # 今の保存フォルダの登録（移動していれば更新済み）を除いて比べるため、解決の後に行う
+                check_source_against_archives(session, config, archive.id)
             config.archive_id = archive.id
 
             # 前回の中断分を先に片付ける（どのサブコマンドでも実施 — 設計書 §7.4）

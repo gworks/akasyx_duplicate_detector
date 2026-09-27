@@ -88,15 +88,8 @@ def _pid_alive(pid: int) -> bool:
 
 
 @contextlib.contextmanager
-def archive_lock(archive_root: str):
-    """保存フォルダ単位の多重起動を防ぐロック（設計書 §12）。
-
-    WAL でも書き込みは排他されるが、複数プロセスが同時に移動すると実体の整合が崩れる。
-    ロックファイルに PID を書き、死んだプロセスのロックは引き継ぐ。
-    """
-    os.makedirs(meta_dir(archive_root), exist_ok=True)
-    path = os.path.join(meta_dir(archive_root), LOCK_FILENAME)
-
+def _pid_lock(path: str, in_use_message: str):
+    """ロックファイルに PID を書いて排他します。死んだプロセスのロックは引き継ぎます。"""
     for attempt in range(2):
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -114,7 +107,7 @@ def archive_lock(archive_root: str):
                     os.unlink(path)
                 continue
             raise PreflightError(
-                f"The archive folder is in use by another process (PID {holder or 'unknown'}): {path}\n"
+                f"{in_use_message} (PID {holder or 'unknown'}): {path}\n"
                 "If no other instance is running, delete this lock file"
             )
     else:  # pragma: no cover - 上の for で必ず break か raise する
@@ -127,3 +120,37 @@ def archive_lock(archive_root: str):
     finally:
         with contextlib.suppress(OSError):
             os.unlink(path)
+
+
+@contextlib.contextmanager
+def archive_lock(archive_root: str):
+    """保存フォルダ単位の多重起動を防ぐロック（設計書 §12）。
+
+    WAL でも書き込みは排他されるが、複数プロセスが同時に移動すると実体の整合が崩れる。
+    """
+    os.makedirs(meta_dir(archive_root), exist_ok=True)
+    path = os.path.join(meta_dir(archive_root), LOCK_FILENAME)
+    with _pid_lock(path, "The archive folder is in use by another process"):
+        yield path
+
+
+def master_db_lock_path(archive_db: str) -> str:
+    # 実体の位置に置く。正本 DB ファイルへのシンボリックリンクで指す実行とも同じロックにするため
+    return os.path.realpath(archive_db) + ".lock"
+
+
+@contextlib.contextmanager
+def master_db_lock(archive_db: str):
+    """正本 DB 単位の多重起動を防ぐロック（#6）。
+
+    重複判定は全保存フォルダ共通だが、部分 UNIQUE 索引は保存フォルダ単位のまま。
+    別の保存フォルダへの実行が同時に走ると、判定と予約の隙間で同じ内容が両方に入るため、
+    同じ正本 DB を使う実行は 1 本に限る。
+    """
+    path = master_db_lock_path(archive_db)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with _pid_lock(
+        path,
+        "The master DB is in use by another process (possibly for another archive folder)",
+    ):
+        yield path
