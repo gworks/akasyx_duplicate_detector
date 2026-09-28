@@ -186,6 +186,10 @@ class DetectorConfig:
     assume_yes: bool = False
     # archives --forget: 登録を外す保存フォルダの ID（#6）
     forget_id: int | None = None
+    # archives --forget --expect-uid: 外す保存フォルダの uid がこれと違えば断る（UI が一覧で見たものだけを外す。#11）
+    expect_uid: str | None = None
+    # archives --json: 一覧を JSON で stdout に出す（UI が読む。#11）
+    list_json: bool = False
 
 
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -324,6 +328,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="stop using the records of a deleted archive folder for duplicate detection "
         "(refused if the folder is present)",
     )
+    p_arc.add_argument(
+        "--expect-uid",
+        metavar="UID",
+        dest="expect_uid",
+        help="with --forget: refuse unless the archive folder has this uid (used by the UI)",
+    )
+    p_arc.add_argument(
+        "--json",
+        action="store_true",
+        dest="list_json",
+        help="print the list as JSON on stdout (for the UI)",
+    )
 
     return parser
 
@@ -370,6 +386,8 @@ def parse_arguments(argv: list[str] | None = None) -> DetectorConfig:
         ),
         assume_yes=getattr(args, "yes", False),
         forget_id=getattr(args, "forget_id", None),
+        list_json=getattr(args, "list_json", False),
+        expect_uid=getattr(args, "expect_uid", None),
     )
 
 

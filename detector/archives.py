@@ -758,7 +758,7 @@ def _settle_forgotten(session, row: Archive, returned: bool) -> None:
     )
 
 
-def forget_archive(session, archive_id: int) -> int:
+def forget_archive(session, archive_id: int, expect_uid: str | None = None) -> int:
     """消した保存フォルダの登録を外します（#6）。戻り値は重複判定の対象から外した行数。
 
     重複判定は全保存フォルダ共通なので、消した保存フォルダの保存記録が残ると、その内容は二度と
@@ -766,10 +766,17 @@ def forget_archive(session, archive_id: int) -> int:
     保存フォルダがその場所にある（つながっている）なら断る。NAS を外していただけ・移動しただけの
     保存フォルダを外してしまっても、次に開いたとき resolve_archive が記録を stored に戻す（_settle_forgotten）。
     pending（中断の残り）は別の保存フォルダの判定に使われないので触らない（開いたときの復旧に任せる）。
+    expect_uid（UI が一覧で見た保存フォルダの uid）があれば、違う保存フォルダは外さない（#11）。ID は正本 DB ごとの
+    番号なので、一覧を読んだ後に正本 DB の指定が変わると、同じ ID の別の保存フォルダを指しうる。
     """
     row = session.get(Archive, archive_id)
     if row is None:
         raise PreflightError(f"No archive folder with ID #{archive_id} is registered")
+    if expect_uid is not None and row.uid != expect_uid:
+        raise PreflightError(
+            f"Archive folder #{archive_id} is not the one expected (uid {row.uid}, expected {expect_uid}); "
+            "reload the list of archive folders"
+        )
     # 識別子ファイルだけ消えた保存フォルダも「ある」とみなす（開けば場所で見つかり識別子が書き戻される）
     present = is_at_registered_location(row) or (
         os.path.isdir(row.root_abs) and read_uid(row.root_abs) is None
@@ -814,3 +821,19 @@ def list_archives(session) -> list[tuple[Archive, int, int]]:
         )
         out.append((a, int(count), int(size)))
     return out
+
+
+def forgotten_counts(session) -> dict[int, int]:
+    """archives --json 用: 保存フォルダごとの forgotten（登録を外した）件数。"""
+    rows = (
+        session.query(ArchiveFile.archive_id, func.count(ArchiveFile.id))
+        .filter(ArchiveFile.status == STATUS_FORGOTTEN)
+        .group_by(ArchiveFile.archive_id)
+        .all()
+    )
+    return {archive_id: int(count) for archive_id, count in rows}
+
+
+def pending_adoption_ids(session) -> set[int]:
+    """archives --json 用: adopt 待ちの保存フォルダの ID。"""
+    return {row.archive_id for row in session.query(PendingAdoption).all()}

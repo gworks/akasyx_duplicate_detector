@@ -203,33 +203,78 @@ def _apply_counters(record: Ingest, counters: dict) -> None:
 
 
 def run_archives(config: DetectorConfig) -> int:
-    """登録済みの保存フォルダ一覧（保存フォルダの指定もロックも要らない）。--forget は登録を外す。"""
+    """登録済みの保存フォルダ一覧（保存フォルダの指定もロックも要らない）。--forget は登録を外す。
+
+    正本 DB が無ければ作らない（一覧は読むだけ。UI から入力途中・打ち間違いのパスで呼ばれても DB やフォルダを残さない）。
+    """
+    if not os.path.isfile(config.archive_db):
+        if config.forget_id is not None:
+            raise PreflightError(f"Master DB not found: {config.archive_db}")
+        if config.list_json:
+            # 初回起動の「まだ無い」を、読めなかったこととは区別して返す
+            print(json_dumps({"master_db": config.archive_db, "db_exists": False, "archives": []}))
+        else:
+            print(f"Master DB not found: {config.archive_db} (no archive folders are registered yet)")
+        return EXIT_OK
     if config.forget_id is not None:
         with master_db_lock(config.archive_db):
             session, _engine = get_session(config.archive_db)
             try:
-                archives.forget_archive(session, config.forget_id)
+                archives.forget_archive(session, config.forget_id, expect_uid=config.expect_uid)
                 return EXIT_OK
             finally:
                 session.close()
     session, _engine = get_session(config.archive_db)
     try:
         rows = archives.list_archives(session)
+        if config.list_json:
+            _print_archives_json(session, config, rows)
+            return EXIT_OK
         print(f"Master DB: {config.archive_db}")
         print("")
         print(f"■ Registered archive folders: {len(rows)}")
         for a, count, size in rows:
             exists = "" if os.path.isdir(a.root_abs) else "  * not found at this path"
             print(f"  #{a.id:<4} {a.root_abs}{exists}")
-            used = a.last_used_at
-            if used is not None:
-                if used.tzinfo is None:
-                    used = used.replace(tzinfo=timezone.utc)
-                used = f"{used.astimezone():%Y-%m-%d %H:%M}"
+            used = _aware(a.last_used_at)
+            used = f"{used.astimezone():%Y-%m-%d %H:%M}" if used else None
             print(f"        stored {count} files / {size} bytes / uid {a.uid} / last used {used or '-'}")
         return EXIT_OK
     finally:
         session.close()
+
+
+def _aware(value: datetime | None) -> datetime | None:
+    """DB の日時（タイムゾーン無しの UTC）を UTC 付きにします。"""
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _print_archives_json(session, config: DetectorConfig, rows) -> None:
+    """archives --json: UI が読む一覧（#11）。stdout には JSON だけを出す（ログは stderr）。"""
+    forgotten = archives.forgotten_counts(session)
+    pending = archives.pending_adoption_ids(session)
+    out = {
+        "master_db": config.archive_db,
+        "db_exists": True,
+        "archives": [
+            {
+                "id": a.id,
+                "root": a.root_abs,
+                "uid": a.uid,
+                # テキストの一覧と同じ目安（forget 自体は archives.forget_archive が判定する）
+                "present": os.path.isdir(a.root_abs),
+                "stored_files": count,
+                "stored_bytes": size,
+                "forgotten_files": forgotten.get(a.id, 0),
+                "pending_adoption": a.id in pending,
+                "last_used_at": _aware(a.last_used_at),
+            }
+            for a, count, size in rows
+        ],
+    }
+    print(json_dumps(out))
 
 
 def run(config: DetectorConfig) -> int:

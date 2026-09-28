@@ -71,7 +71,7 @@ code, .log, .command-text {
 .brand { font-weight: 600; font-size: 14px; }
 .version { color: var(--ink-dim); font-weight: 400; margin-left: 6px; font-size: 12px; }
 
-.tabs { display: flex; gap: 4px; }
+.tabs { display: flex; flex-wrap: wrap; gap: 4px; }
 .lang-select {
   margin-left: auto;
   font: inherit;
@@ -270,3 +270,29 @@ code, .log, .command-text {
 .log .warn { color: #f0c674; }
 .log .summary { color: #9ae6b4; font-weight: 600; }
 .log .meta { color: #8b8d96; }
+
+/* ---- 保存フォルダの一覧（#11） ---- */
+.archives-head { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
+#archives-message { margin-bottom: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.archive-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.archive-item {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--pane);
+}
+.archive-body { flex: 1; min-width: 0; }
+.archive-root { font-size: 12px; overflow-wrap: anywhere; user-select: text; }
+.archive-root .archive-id { color: var(--ink-dim); margin-right: 6px; }
+.archive-meta { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 4px; }
+.archive-meta .chip.absent { color: var(--warn); }
+.archive-meta .chip.pending { color: var(--error); }
+.archive-item .btn { flex: none; }
+
+/* 出力が示す次の操作 */
+.next-step { display: flex; gap: 10px; align-items: center; }
+.next-step > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.next-step .btn { flex: none; }

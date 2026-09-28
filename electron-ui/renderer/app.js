@@ -6,7 +6,7 @@ const LOG_TRIM = 1000;
 
 // 進捗チップの並び順（detector の result 値そのまま届く）。表示名は辞書の result_<値>
 const RESULT_ORDER = [
-  'moved', 'duplicate', 'skipped_empty', 'skipped_nohash', 'skipped_own_data', 'skipped_in_archive', 'failed',
+  'moved', 'duplicate', 'adopted', 'skipped_empty', 'skipped_nohash', 'skipped_own_data', 'skipped_in_archive', 'failed',
   'ok', 'missing', 'unregistered', 'archive_duplicate', 'hash_mismatch',
   'check_ok', 'deleted', 'moved_to_trash',
   'verified', 'gone', 'source_changed', 'archive_missing', 'archive_unavailable', 'source_in_archive', 'same_file',
@@ -23,6 +23,11 @@ const dom = {
   clearLog: el('clear-log'), recent: el('recent-archives'),
   dataDir: el('data-dir'), openDataDir: el('open-data-dir'), runCwd: el('run-cwd'),
   langSelect: el('lang-select'),
+  archiveRootField: el('archive-root-field'), archiveList: el('archive-list'),
+  archivesMasterDb: el('archives-master-db'), archivesMessage: el('archives-message'),
+  archivesRefresh: el('archives-refresh'),
+  nextForget: el('next-forget'), nextForgetGo: el('next-forget-go'),
+  nextAdopt: el('next-adopt'), nextAdoptText: el('next-adopt-text'), nextAdoptGo: el('next-adopt-go'),
 };
 
 let context = { repoRoot: '', dataDir: '', version: '', detectorFound: true };
@@ -35,6 +40,14 @@ let startedAt = 0;
 let logLines = 0;
 let lastProgress = null;   // 言語を切り替えたときに進捗チップを描き直すため
 let lastStatus = null;     // { level, key, vars } 同上
+let archivesState = null;  // 保存フォルダの一覧: { masterDb, archives, error } / 読み込み中は { loading: true }
+let nextAdoptPath = null;  // 出力の案内が示す、adopt が要るフォルダ
+let commandValid = false;  // 今のフォームから実行できるコマンドが組めるか
+
+/** 実行ボタン。一覧の問い合わせ中も main は実行を断るので、押せないようにしておく。 */
+function updateRunButton() {
+  dom.run.disabled = running || !commandValid || listInFlight;
+}
 
 // ------------------------------------------------------------------ 言語
 
@@ -65,6 +78,8 @@ function applyLanguage(next) {
   renderContext();
   if (lastProgress) renderProgress(lastProgress);
   if (lastStatus) setStatus(lastStatus.level, lastStatus.key, lastStatus.vars);
+  renderArchives();
+  renderNextAdopt();
 }
 
 async function changeLanguage(next) {
@@ -105,8 +120,10 @@ function setMode(next) {
   for (const panel of document.querySelectorAll('.mode-panel')) {
     panel.classList.toggle('active', panel.dataset.panel === next);
   }
+  dom.archiveRootField.hidden = next === 'archives';
   refreshPreview();
   persist();
+  if (next === 'archives' && !running) loadArchives();
 }
 
 // ------------------------------------------------------------ 設定の保存
@@ -176,7 +193,8 @@ function refreshPreview() {
     const { command, error } = await api.preview(collectForm());
     dom.commandText.textContent = command || (error ? `— ${error}` : '—');
     dom.commandText.classList.toggle('invalid', !command);
-    dom.run.disabled = running || !command;
+    commandValid = !!command;
+    updateRunButton();
   }, 120);
 }
 
@@ -187,6 +205,7 @@ function logClass(entry) {
   if (entry.stream === 'meta') return 'meta';
   const text = entry.text;
   if (text.startsWith('[Summary]')) return 'summary';
+  if (text.startsWith('Note:')) return 'warn';
   if (/ ERROR /.test(text) || text.startsWith('Error:')) return 'err';
   if (/ WARNING /.test(text)) return 'warn';
   // stderr の通常ログ（INFO）は本来の出力より控えめに見せる
@@ -222,6 +241,168 @@ function clearLog() {
   dom.chips.replaceChildren();
   dom.openCsv.hidden = true;
   lastCsvPath = null;
+  dom.nextForget.hidden = true;
+  nextAdoptPath = null;
+  renderNextAdopt();
+}
+
+/** 出力が示す次の操作（#11）。Note: 行 → 保存フォルダの一覧、adopt の案内 → adopt タブ。 */
+function showNextSteps(result) {
+  dom.nextForget.hidden = !(result.forgetIds && result.forgetIds.length);
+  nextAdoptPath = result.adoptPath || null;
+  renderNextAdopt();
+}
+
+function renderNextAdopt() {
+  dom.nextAdopt.hidden = !nextAdoptPath;
+  if (nextAdoptPath) dom.nextAdoptText.textContent = t('next_adopt', { path: nextAdoptPath });
+}
+
+// ------------------------------------------------------- 保存フォルダの一覧（#11）
+
+// 操作を止めるのは、一覧の問い合わせが実際に飛んでいる間だけ（listInFlight は finally で必ず下ろす）。
+// archivesState.loading は表示だけに使う（busy で待っている間も「読み込み中」と出すが、何も止めない）
+let listInFlight = false;
+let reloadAfterList = false; // 飛んでいる間に正本 DB の指定が変わった（その結果は捨てて読み直す）
+let retryTimer = null;       // busy のときの読み直し。ほかの処理からは消さない
+
+/** archives --json で一覧を読み直します。実行中は読まない（終わったら読み直す）。 */
+async function loadArchives() {
+  if (running) return;
+  if (listInFlight) {
+    reloadAfterList = true;
+    return;
+  }
+  clearTimeout(retryTimer);
+  listInFlight = true;
+  archivesState = { loading: true };
+  renderArchives();
+  let result;
+  try {
+    result = await api.listArchives(collectForm());
+  } catch (e) {
+    result = { archives: null, error: t('archives_error', { detail: e.message || String(e) }) };
+  } finally {
+    listInFlight = false;
+  }
+  if (reloadAfterList) {
+    reloadAfterList = false;
+    archivesState = null;
+    if (mode === 'archives') loadArchives();
+    else renderArchives();
+    return;
+  }
+  if (result.busy) {
+    // 前の読み込み（閉じる前のウィンドウのもの等）や実行が終わるのを、読み込み中の表示のまま待って読み直す
+    if (mode === 'archives' && !running) {
+      retryTimer = setTimeout(loadArchives, 1000);
+    } else {
+      archivesState = null; // タブを開いたとき・実行が終わったときに読む
+      renderArchives();
+    }
+    return;
+  }
+  archivesState = result;
+  renderArchives();
+}
+
+/** 正本 DB の指定が変わった。前の DB の一覧は捨てて読み直す。 */
+function invalidateArchives() {
+  if (listInFlight) {
+    reloadAfterList = true;
+    return;
+  }
+  clearTimeout(retryTimer);
+  archivesState = null;
+  renderArchives();
+  if (mode === 'archives') loadArchives();
+}
+
+function formatBytes(bytes) {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = Number(bytes) || 0;
+  let i = 0;
+  while (value >= 1024 && i < units.length - 1) {
+    value /= 1024;
+    i += 1;
+  }
+  return `${value.toLocaleString(lang, { maximumFractionDigits: i ? 1 : 0 })} ${units[i]}`;
+}
+
+function chip(text, cls = '') {
+  const node = document.createElement('span');
+  node.className = `chip ${cls}`.trim();
+  node.textContent = text;
+  return node;
+}
+
+function renderArchives() {
+  const state = archivesState;
+  dom.archivesRefresh.disabled = running || listInFlight;
+  updateRunButton();
+  const message = (level, text) => {
+    dom.archivesMessage.className = `banner banner-${level}`;
+    dom.archivesMessage.textContent = text;
+    dom.archivesMessage.hidden = false;
+  };
+  dom.archivesMessage.hidden = true;
+  dom.archiveList.replaceChildren();
+  dom.archivesMasterDb.textContent = state && state.masterDb ? t('archives_master_db', { path: state.masterDb }) : '';
+  if (!state) return;
+  if (state.loading) return message('info', t('archives_loading'));
+  // 読めなかったときは空の一覧を出さない（「登録が 0 件」と取り違えないため）
+  if (state.error) return message('error', state.error);
+  if (!state.dbExists) return message('info', t('archives_no_db'));
+  if (!state.archives.length) return message('info', t('archives_empty'));
+
+  dom.archiveList.replaceChildren(...state.archives.map((a) => renderArchiveItem(a, state)));
+}
+
+function renderArchiveItem(a, state) {
+  const item = document.createElement('li');
+  item.className = 'archive-item';
+  const body = document.createElement('div');
+  body.className = 'archive-body';
+  const root = document.createElement('div');
+  root.className = 'archive-root';
+  const id = document.createElement('span');
+  id.className = 'archive-id';
+  id.textContent = `#${a.id}`;
+  root.append(id, document.createTextNode(a.root));
+
+  const meta = document.createElement('div');
+  meta.className = 'archive-meta';
+  meta.append(a.present ? chip(t('archive_present')) : chip(t('archive_not_found'), 'absent'));
+  meta.append(chip(t('archive_stored', {
+    files: Number(a.stored_files).toLocaleString(lang), size: formatBytes(a.stored_bytes),
+  })));
+  if (a.forgotten_files) {
+    meta.append(chip(t('archive_forgotten', { files: Number(a.forgotten_files).toLocaleString(lang) })));
+  }
+  if (a.pending_adoption) meta.append(chip(t('archive_pending_adoption'), 'pending'));
+  if (a.last_used_at) {
+    const used = new Date(a.last_used_at);
+    if (!Number.isNaN(used.getTime())) {
+      meta.append(chip(t('archive_last_used', { date: used.toLocaleString(lang, { dateStyle: 'medium', timeStyle: 'short' }) })));
+    }
+  }
+  body.append(root, meta);
+  item.append(body);
+
+  // 外すものがあるときだけ出す。その場所にあるかの最終判断は detector（断りはログと状態の帯に出る）
+  if (a.stored_files > 0) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn stop';
+    button.textContent = t('archive_forget');
+    button.disabled = running;
+    // 一覧を読んだ正本 DB と、見た保存フォルダの uid で外す（その後で詳細設定の正本 DB が変わっても別のものを外さない）
+    button.addEventListener('click', () => start({
+      forgetId: a.id, forgetUid: a.uid, forgetRoot: a.root, forgetArchiveDb: state.masterDb,
+    }));
+    item.append(button);
+  }
+  return item;
 }
 
 /** 状態の帯。key は辞書のキー（vars で差し込み）。言語を切り替えたら描き直す。
@@ -262,10 +443,12 @@ function renderProgress(progress) {
 /** 実行中表示の切り替え。since を渡すと（開き直し時など）その時刻からの経過で表示する。 */
 function setRunning(next, since = Date.now()) {
   running = next;
-  dom.run.disabled = next;
+  updateRunButton();
   dom.stop.disabled = !next;
   dom.spinner.hidden = !next;
   for (const tab of dom.tabs.querySelectorAll('.tab')) tab.disabled = next;
+  for (const button of dom.archiveList.querySelectorAll('button')) button.disabled = next;
+  dom.archivesRefresh.disabled = next;
 
   clearInterval(elapsedTimer);
   if (next) {
@@ -278,6 +461,8 @@ function setRunning(next, since = Date.now()) {
     elapsedTimer = setInterval(renderElapsed, 1000);
   } else {
     refreshPreview();
+    // 登録を外した後など、一覧を見ているなら読み直す
+    if (mode === 'archives') loadArchives();
   }
 }
 
@@ -293,10 +478,11 @@ function resumeRun(run) {
   setRunning(true, run.startedAt);
 }
 
-async function start() {
+/** 実行します。extra はフォームに無い指定（一覧の行から登録を外すときの forgetId など）。 */
+async function start(extra = {}) {
   if (running) return;
   clearLog();
-  const form = collectForm();
+  const form = { ...collectForm(), ...extra };
   // 応答を待つ前に実行中にする。spawn 失敗（uv 不在など）では応答より先に run:exit が届くことがあり、
   // 応答側で後から実行中に戻すと、子プロセスが無いのに操作不能になる
   setRunning(true);
@@ -309,7 +495,7 @@ async function start() {
     return;
   }
   appendLog([{ stream: 'meta', text: `$ ${result.command}` }]);
-  rememberRecent((form.archiveRoot || '').trim());
+  if (form.mode !== 'archives') rememberRecent((form.archiveRoot || '').trim());
   persist();
   // 応答より先に終了通知を受けて片付いていたら（onExit が running を落としている）、状態を上書きしない
   if (!running) return;
@@ -334,6 +520,17 @@ function renderContext() {
   }
 }
 
+/**
+ * 選んだ・落とした・案内から拾った実パスをパス欄に入れます。パス欄の正規化（\ や引用符）で書き換わらない形にし、
+ * 手で入力したときと同じく change を起こす（正本 DB 欄なら一覧を読み直す）。
+ */
+async function setPathField(input, realPath) {
+  input.value = await api.toFieldValue(realPath);
+  input.dispatchEvent(new Event('change'));
+  refreshPreview();
+  persist();
+}
+
 function wirePickers() {
   for (const button of document.querySelectorAll('[data-pick]')) {
     button.addEventListener('click', async () => {
@@ -343,11 +540,7 @@ function wirePickers() {
         files: button.dataset.pickFiles === '1',
         defaultPath: target.value.trim() || undefined,
       });
-      if (picked) {
-        target.value = picked;
-        refreshPreview();
-        persist();
-      }
+      if (picked) await setPathField(target, picked);
     });
   }
 }
@@ -367,11 +560,7 @@ function wireDropTargets() {
       e.stopPropagation();
       highlight(false);
       const path = droppedPath(e.dataTransfer);
-      if (path) {
-        input.value = path;
-        refreshPreview();
-        persist();
-      }
+      if (path) setPathField(input, path);
     });
   }
 }
@@ -410,6 +599,8 @@ function wireForm() {
       persist();
     });
   }
+  // 正本 DB の指定が変わったら、前の DB の一覧は捨てて読み直す。入力途中（1 文字ごと）ではなく確定したときだけ
+  el('archiveDb').addEventListener('change', invalidateArchives);
   dom.langSelect.addEventListener('change', () => changeLanguage(dom.langSelect.value));
   dom.tabs.addEventListener('click', (e) => {
     const tab = e.target.closest('.tab');
@@ -419,7 +610,20 @@ function wireForm() {
 
 
 function wireRunControls() {
-  dom.run.addEventListener('click', start);
+  dom.run.addEventListener('click', () => start());
+  dom.archivesRefresh.addEventListener('click', loadArchives);
+  // 導線をたどったら帯は消す（行き先のタブで続きを行う）
+  dom.nextForgetGo.addEventListener('click', () => {
+    dom.nextForget.hidden = true;
+    setMode('archives');
+  });
+  dom.nextAdoptGo.addEventListener('click', async () => {
+    // 案内の実パスはパス欄の正規化で書き換わらない形にして入れる
+    await setPathField(el('archiveRoot'), nextAdoptPath);
+    nextAdoptPath = null;
+    renderNextAdopt();
+    setMode('adopt');
+  });
   dom.stop.addEventListener('click', () => {
     api.stop();
     dom.stop.disabled = true;
@@ -457,6 +661,7 @@ function wireRunEvents() {
       lastCsvPath = result.csvPath;
       dom.openCsv.hidden = false;
     }
+    showNextSteps(result);
     if (result.stoppedByUser) {
       setStatus('warn', 'status_stopped');
       return;
@@ -481,8 +686,9 @@ async function init() {
   wireDropTargets();
   wireForm();
   wireRunControls();
-  setMode(mode);
+  // 走り続けている実行を先に取り戻す（setMode が archives の一覧を読みに行き、main に断られないように）
   if (context.run) resumeRun(context.run);
+  setMode(mode);
 }
 
 init();

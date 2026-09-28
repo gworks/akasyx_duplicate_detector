@@ -26,6 +26,7 @@
       "main.js",
       "preload.js",
       "commands.js",
+      "detector-output.js",
       "i18n.js",
       "locales/**/*",
       "renderer/**/*",
