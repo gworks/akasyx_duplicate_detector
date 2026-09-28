@@ -45,11 +45,18 @@ def find_owning(session, filehash: str, hash_algo: str, archive_id: int) -> Arch
 
 
 def owning_query(
-    session, filehash: str, hash_algo: str, archive_id: int, stored_only: bool = False
+    session,
+    filehash: str,
+    hash_algo: str,
+    archive_id: int,
+    stored_only: bool = False,
+    prefer_id: int | None = None,
 ):
-    """同一内容の持ち主の候補（今の保存フォルダ → id 順）。add の判定と delete-duplicates の検証で共用する。
+    """同一内容の持ち主の候補（今の保存フォルダ → prefer_id の行 → id 順）。add の判定と delete-duplicates の検証で共用する。
 
     stored_only=True は実体が確定した行だけ（delete-duplicates の検証用）。
+    prefer_id は判定時に参照した行（delete-duplicates の検証で、今の保存フォルダの次に確かめる。#10）。
+    並び順はここだけで決める（呼び出し側で並べ直さない）。
     """
     owning = ArchiveFile.status == STATUS_STORED
     if not stored_only:
@@ -57,10 +64,13 @@ def owning_query(
             owning,
             and_(ArchiveFile.status.in_(OWNING_STATUSES), ArchiveFile.archive_id == archive_id),
         )
+    order = [case((ArchiveFile.archive_id == archive_id, 0), else_=1)]
+    if prefer_id is not None:
+        order.append(case((ArchiveFile.id == prefer_id, 0), else_=1))
     return (
         session.query(ArchiveFile)
         .filter(ArchiveFile.filehash == filehash, ArchiveFile.hash_algo == hash_algo, owning)
-        .order_by(case((ArchiveFile.archive_id == archive_id, 0), else_=1), ArchiveFile.id)
+        .order_by(*order, ArchiveFile.id)
     )
 
 
