@@ -614,19 +614,27 @@ def import_legacy_db(session, archive: Archive, legacy_path: str) -> dict | None
             counts["ingests"] += 1
 
         cols = _columns("ar_archive_files") - {"id", "archive_id"}
+        files: list[tuple[int, ArchiveFile]] = []
         for r in conn.execute("SELECT * FROM ar_archive_files ORDER BY id"):
             data = {k: r[k] for k in r.keys() if k in cols}
             _fix_datetimes(data)
             if data.get("ingest_id") is not None:
                 data["ingest_id"] = ingest_ids.get(data["ingest_id"])
-            obj = ArchiveFile(archive_id=archive.id, **data)
-            if obj.status == STATUS_STORED and not promote_many(session, [obj]):
+            files.append((r["id"], ArchiveFile(archive_id=archive.id, **data)))
+        # stored にするかは 1 回でまとめて決める（#8。行ごとに問い合わせると stored の数だけクエリが走る）。
+        # session に入れる前に決める（入れてからだと autoflush で stored のまま書かれ、判定に自分が混ざる）
+        candidates = [obj for _, obj in files if obj.status == STATUS_STORED]
+        promoted = {id(obj) for obj in promote_many(session, candidates)}
+        for obj in candidates:
+            if id(obj) not in promoted:
                 # 同じ内容の stored は全体で 1 つ（#6）。実体は残るので未登録として取り込む
                 obj.status = STATUS_UNREGISTERED
-            session.add(obj)
-            session.flush()
-            file_ids[r["id"]] = obj.id
-            counts["files"] += 1
+        # 読んだ順に入れて 1 回で flush し、明細（ingest_items）が参照する id の対応表を作る
+        session.add_all([obj for _, obj in files])
+        session.flush()
+        for legacy_id, obj in files:
+            file_ids[legacy_id] = obj.id
+        counts["files"] = len(files)
 
         cols = _columns("ar_ingest_items") - {"id"}
         for r in conn.execute("SELECT * FROM ar_ingest_items ORDER BY id"):
