@@ -309,3 +309,52 @@ def test_alias_registered_by_older_version_is_rewritten_to_real_path(session, ar
     row.root_abs = link  # 以前の版の記録を模す
     session.commit()
     assert archives.resolve_archive(session, archive).root_abs == os.path.realpath(archive)
+
+
+def test_legacy_import_decides_stored_in_one_batch(session, archive, tmp_path, monkeypatch):
+    """v0.1.x の取り込みは stored の判定を 1 回にまとめる（#8。行ごとに問い合わせない）。結果は 1 件ずつと同じ。"""
+    from models import Archive
+    legacy = legacy_db_path(archive)
+    _make_legacy_db(legacy, archive)  # id 11: 'a'*64 stored（明細 21 が参照）
+    conn = sqlite3.connect(legacy)
+    rows = [  # (id, hash, name, status)
+        (12, "b" * 64, "b.txt", "stored"),
+        (13, "c" * 64, "c.txt", "stored"),   # 別の保存フォルダに stored がある → unregistered
+        (14, "d" * 64, "d.txt", "missing"),  # stored 以外はそのまま
+        (15, "e" * 64, "e.txt", "stored"),
+    ]
+    for fid, h, name, status in rows:
+        conn.execute(
+            "INSERT INTO ar_archive_files (id, filehash, hash_algo, size, name, stored_path_rel, ingest_id,"
+            " status, created_at, updated_at) VALUES (?, ?, 'sha256', 3, ?, ?, 7, ?,"
+            " '2026-08-30 00:00:00', '2026-08-30 00:00:00')",
+            (fid, h, name, f"inbox/{name}", status),
+        )
+    conn.commit(); conn.close()
+    other = Archive(uid="other", root_abs=str(tmp_path / "other"))
+    session.add(other)
+    session.flush()
+    session.add(ArchiveFile(
+        archive_id=other.id, filehash="c" * 64, hash_algo="sha256", size=3, name="c.txt",
+        stored_path_rel="c.txt", status="stored",
+    ))
+    session.commit()
+
+    calls = []
+    real = archives.promote_many
+
+    def spy(sess, rows):
+        calls.append(rows)
+        return real(sess, rows)
+
+    monkeypatch.setattr(archives, "promote_many", spy)
+    row = archives.resolve_archive(session, archive)
+
+    assert len(calls) == 1
+    got = {
+        f.name: f.status
+        for f in session.query(ArchiveFile).filter_by(archive_id=row.id).all()
+    }
+    assert got == {"a.txt": "stored", "b.txt": "stored", "c.txt": "unregistered", "d.txt": "missing", "e.txt": "stored"}
+    item = session.query(IngestItem).one()  # 明細の参照先は付け直した id
+    assert session.get(ArchiveFile, item.archive_file_id).name == "a.txt"
