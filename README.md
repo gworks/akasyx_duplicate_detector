@@ -115,7 +115,7 @@ uv run main.py --help
   消した保存フォルダを `forget` した跡に別のフォルダを置いた場合も `adopt` を求める
 - 登録済みの保存フォルダに、あとから手でファイルを入れた場合は `adopt` を求めない（従来どおり `verify` が未登録として扱う）
 - v0.1.x の DB（`.akasyx/archive.db`）がある保存フォルダは、開けば移行で記録ができるので adopt は要らない
-- UI からはまだ実行できない（CLI のみ）
+- UI では「既存ファイルの登録」タブ。取り込みなどが adopt を求めて断られると、その場から adopt タブへ移れる（#11）
 
 ### 正本 DB の場所（v0.2.0 で変更）
 
@@ -139,6 +139,8 @@ UI の「詳細設定 → データの保存場所」（「Finder で表示」�
 `--follow-symlinks` でリンクを辿った先が保存フォルダの中なら、そのファイルは `skipped_in_archive` として動かさない。
 保存フォルダを消したときは `archives --forget <ID>` で登録を外す（外さないと、その保存フォルダにあった内容は
 重複と判定され続け、どこにも保存されない。取り込みの CSV とサマリの後の Note に「つながっていない保存フォルダにある」と出る）。
+UI では「保存フォルダ一覧」タブの行ごとの「登録を外す」（確認ダイアログの後に実行。断りはログと状態の帯に出る。
+取り込みの結果に Note が出たときは、その場から一覧へ移れる。#11）。
 保存記録は forgotten になるだけで履歴・処置予定フラグは消えない。保存記録（stored）が 1 件も無い保存フォルダは
 重複判定を塞がないので forget は断る。保存フォルダがその場所にあるとき
 （識別子ファイルだけ消えている場合も含む）は断る。
@@ -204,8 +206,8 @@ crawler は別リポジトリで CI には無いため、`fs_files` 相当の一
 
 ## UI（Electron）
 
-パス入力とオプション指定を画面から行うためのフロントエンドです。`electron-ui/` に置き、
-**detector 側には一切手を入れていません**。UI はロジックを持たず、フォームの値から
+パス入力とオプション指定を画面から行うためのフロントエンドです。`electron-ui/` に置きます。
+UI はロジックを持たず、フォームの値から
 `uv run main.py ...` を組み立てて子プロセス起動し、標準出力・終了コードを表示するだけです
 （設計書 §16 の「境界を CLI に固定する」方針）。UI が壊れても CLI は無傷で、
 CLI で直せることは UI でも同じように直ります。
@@ -230,8 +232,10 @@ Python 側の前提は CLI と同じです（`detector/` で `uv sync` 済み、
 |---|---|
 | 取り込み | `add`（dry-run、`--folder-limit`、`--min-size` などを含む） |
 | 整合性チェック | `verify`（`--flag-quarantine` の4種別をチェックボックスで指定） |
+| 既存ファイルの登録 | `adopt` |
 | 重複の後始末 | `delete-duplicates`（`--trash-dir` / `--yes`） |
 | 状態・履歴 | `report` |
+| 保存フォルダ一覧 | `archives --json` で一覧を表示し、行ごとに `archives --forget <ID>`（保存フォルダの指定は不要） |
 
 入力を楽にするための仕掛け:
 
@@ -253,15 +257,19 @@ Python 側の前提は CLI と同じです（`detector/` で `uv sync` 済み、
   辞書に無いキーは英語の値で埋める。HTML を含む値はキー名を `*_html` にする（`data-i18n-html` で innerHTML に入る）
 - 文言を足したら 6 言語すべてに同じキーを入れる。`cd electron-ui && npm test` が、JSON として読めること・キーと
   `{差し込み名}` の一致・`index.html` と入力エラーが参照するキーの存在を検査する
-- detector 本体のログ・コンソール出力は**英語のみ**。UI は `Progress: <n> files (<result>)` と `CSV report: <path>` の
-  2 種類の行を読む（変えるときは `electron-ui/main.js` の正規表現も直す）
+- detector 本体のログ・コンソール出力は**英語のみ**。UI は `Progress: <n> files (<result>)`・`CSV report: <path>`・
+  `Note: … archives --forget <ID>`・adopt の案内（`…: adopt <フォルダ>`）の行と、`archives --json` の出力を読む
+  （変えるときは `electron-ui/detector-output.js` の正規表現も直す。Note と adopt の案内は
+  `detector/tests/test_archives_ui.py` が同じ正規表現で実際の出力を確かめる）
 
 ### 安全側の作り
 
 - 引数の組み立ては `electron-ui/commands.js` の 1 箇所だけで行い、画面に出す
   コマンドプレビューと実際に実行するコマンドが食い違わないようにしています
-- `delete-duplicates --yes`（実削除）は、メインプロセス側で必ず確認ダイアログを出します
+- `delete-duplicates --yes`（実削除）と `archives --forget`（登録を外す）は、メインプロセス側で必ず確認ダイアログを出します
   （画面側の実装に依存しません）
+- 保存フォルダ一覧の読み込みは実行中には行いません（取り込み中の正本 DB を同時に開かない）。
+  読めなかったときは空の一覧ではなくエラーを出します
 - 「中断」は子プロセスのプロセスグループへ `SIGINT` を送ります。detector は
   `KeyboardInterrupt` を受けて `status='interrupted'` で後片付けするので、
   途中で止めても DB と実体の整合は保たれます

@@ -18,10 +18,14 @@ contextBridge.exposeInMainWorld('detector', {
   preview: (form) => ipcRenderer.invoke('command:preview', form),
   start: (form) => ipcRenderer.invoke('run:start', form),
   stop: () => ipcRenderer.invoke('run:stop'),
+  // 登録済みの保存フォルダの一覧: { masterDb, archives, error }（#11）
+  listArchives: (form) => ipcRenderer.invoke('archives:list', form),
   reveal: (target) => ipcRenderer.invoke('shell:reveal', target),
   open: (target) => ipcRenderer.invoke('shell:open', target),
   openDataDir: () => ipcRenderer.invoke('data:open'),
   copy: (text) => ipcRenderer.invoke('clipboard:write', text),
+  // detector が出力した実パス → パス欄に入れる値
+  toFieldValue: (target) => ipcRenderer.invoke('path:field', target),
   // ドラッグ＆ドロップされた File から実パスを得る（file.path は廃止済み）
   pathForFile: (file) => {
     try {

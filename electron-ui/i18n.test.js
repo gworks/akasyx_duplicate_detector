@@ -57,6 +57,9 @@ test('入力エラー（FormError）のキーはすべて辞書にある', () =>
     { mode: 'add', archiveRoot: '/a', sourcePath: '/b', folderLimit: '0' },
     { mode: 'add', archiveRoot: '/a', sourcePath: '/b', minSize: '-1' },
     { mode: 'report', archiveRoot: '/a', ingestId: 'x' },
+    { mode: 'archives', forgetId: '0' },
+    { mode: 'archives', forgetId: '1' },
+    { mode: 'adopt' },
   ];
   for (const form of bad) {
     assert.throws(() => buildArgs(form), (e) => e instanceof FormError && e.key in en, JSON.stringify(form));
