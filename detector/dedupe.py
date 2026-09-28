@@ -87,14 +87,14 @@ def check_item(
     if actual != item.filehash:
         return CHECK_SOURCE_CHANGED, f"Source file content has changed (now {actual})"
 
+    # どれか 1 つで検証できればよい（#6）
+    # 今の保存フォルダ（確認の I/O が要らない）→ 判定時に参照した行 → その他の順（並び順は owning_query で決める。#10）
     rows = owning_query(
-        session, item.filehash, item.hash_algo, config.archive_id, stored_only=True
+        session, item.filehash, item.hash_algo, config.archive_id,
+        stored_only=True, prefer_id=item.archive_file_id,
     ).all()
     if not rows:
         return CHECK_ARCHIVE_MISSING, "No matching record in any archive folder"
-    # どれか 1 つで検証できればよい（#6）
-    # 今の保存フォルダ（確認の I/O が要らない）→ 判定時に参照した行 → その他の順
-    rows.sort(key=lambda r: (r.archive_id != config.archive_id, r.id != item.archive_file_id))
 
     # 消す対象のパスが、どれかの保存物のパスそのものなら消さない（前の候補で検証が通っても）。
     # 今の判定順では source_in_archive が先に止めるので通常はここに来ないが、目印の判定をすり抜けたときに
@@ -150,17 +150,18 @@ def _check_copy(dst, filehash) -> tuple[str, str | None]:
 def _owner_root(session, config, row, lookup) -> tuple[str, str | None]:
     """保存済みの実物がある保存フォルダの場所。戻り値は (場所, つながっていない理由)。
 
-    今の実行の保存フォルダなら、起動時に確かめた場所をそのまま使う。別の保存フォルダは登録上の場所に
-    あり、かつ `.akasyx/archive.id` の uid が一致するときだけ使う（外した NAS の跡に別のフォルダが
-    あっても、それを実物の置き場と取り違えない）。
+    場所は same_file の確認と同じ `_registered_root` で求め、ここではつながっているかだけを確かめる
+    （2 か所で求めると、確認と検証が別々の場所を見ることになる。#9）。今の実行の保存フォルダは起動時に
+    確かめた場所なので確認しない。別の保存フォルダは登録上の場所にあり、かつ `.akasyx/archive.id` の uid が
+    一致するときだけ使う（外した NAS の跡に別のフォルダがあっても、それを実物の置き場と取り違えない）。
     """
-    if row.archive_id == config.archive_id:
-        return config.archive_root, None
-    archive = session.get(Archive, row.archive_id)
-    if archive is None:  # pragma: no cover - FK があるので通常は起きない
+    root = _registered_root(session, config, row)
+    if root is None:  # pragma: no cover - FK があるので通常は起きない
         return "", f"Archive folder #{row.archive_id} is not registered"
-    available, reason = lookup.available(archive)
-    return archive.root_abs, (None if available else f"The archive folder that holds the file: {reason}")
+    if row.archive_id == config.archive_id:
+        return root, None
+    available, reason = lookup.available(session.get(Archive, row.archive_id))
+    return root, (None if available else f"The archive folder that holds the file: {reason}")
 
 
 def _trash_dest(config, item) -> str:

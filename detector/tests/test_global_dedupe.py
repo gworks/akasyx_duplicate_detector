@@ -90,6 +90,40 @@ def test_find_owning_is_global(session, archive, tmp_path):
     assert ingest.find_owning(session, "h", "sha256", archive_id=1).id == row.id
 
 
+def test_owning_query_orders_current_then_preferred_then_id(session, archive, tmp_path):
+    """持ち主の候補の並び順は owning_query の 1 か所で決める（#10）。今の保存フォルダ → 優先する行 → id 順。"""
+    from conftest import ARCHIVE_ID
+    from models import Archive
+    others = []
+    for name in ("o1", "o2"):
+        a = Archive(uid=name, root_abs=str(tmp_path / name))
+        session.add(a)
+        session.flush()
+        others.append(a)
+
+    def stored(archive_id, name):
+        row = ArchiveFile(
+            archive_id=archive_id, filehash="h", hash_algo="sha256", size=1, name=name,
+            stored_path_rel=name, status=STATUS_STORED,
+        )
+        session.add(row)
+        session.flush()
+        return row
+
+    o1 = stored(others[0].id, "a")
+    o2 = stored(others[1].id, "b")
+    cur = stored(ARCHIVE_ID, "c")  # session フィクスチャが登録した今の保存フォルダ
+    session.commit()
+
+    def ids(**kw):
+        return [r.id for r in ingest.owning_query(session, "h", "sha256", ARCHIVE_ID, stored_only=True, **kw)]
+
+    assert ids() == [cur.id, o1.id, o2.id]
+    assert ids(prefer_id=o2.id) == [cur.id, o2.id, o1.id]  # 判定時に参照した行を、別の保存フォルダの中で先に
+    assert ids(prefer_id=cur.id) == [cur.id, o1.id, o2.id]
+    assert ids(prefer_id=None) == [cur.id, o1.id, o2.id]
+
+
 def test_delete_duplicates_verifies_in_owner_archive(make_config, tmp_path, fake_crawler):
     a, b, leftover = _seed_cross(make_config, tmp_path, fake_crawler)
     cfg = make_config(mode=MODE_DELETE_DUPLICATES, archive_root=b, assume_yes=True)
