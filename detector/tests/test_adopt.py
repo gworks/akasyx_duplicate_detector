@@ -492,3 +492,49 @@ def test_adopt_on_returned_forgotten_archive_is_refused(make_config, tmp_path, f
     # 印を残さないので、そのまま通常のコマンドで使える（開けば forget した記録が戻る）
     assert main.run(make_config(mode=MODE_REPORT, archive_root=n)) == main.EXIT_OK
     assert len(_rows(tmp_path, status=STATUS_STORED)) == 1
+
+
+def test_legacy_archive_placed_at_forgotten_trace_is_migrated(make_config, tmp_path, fake_crawler):
+    """forget した保存フォルダの跡に v0.1.x の保存フォルダを置いても、開けば移行できる（行き止まりにしない）。"""
+    from test_archives import _make_legacy_db
+    from database import legacy_db_path
+    old = str(tmp_path / "arch")
+    os.makedirs(old)
+    src0 = str(tmp_path / "in0")
+    write_file(os.path.join(src0, "seed.jpg"), b"SEED")
+    fake_crawler(src0, str(tmp_path / "c0.db"))
+    assert main.run(make_config(archive_root=old, source_path=src0)) == main.EXIT_OK
+    sess, engine = _db(tmp_path)
+    try:
+        aid = sess.query(Archive).one().id
+    finally:
+        sess.close(); engine.dispose()
+    shutil.rmtree(old)
+    assert main.main(["archives", "--forget", str(aid), "--archive-db", archive_db_path(tmp_path)]) == main.EXIT_OK
+    write_file(os.path.join(old, "inbox", "a.txt"), b"abc")
+    _make_legacy_db(legacy_db_path(old), old)
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=old)) == main.EXIT_OK
+    assert ("inbox/a.txt", STATUS_STORED) in _rows(tmp_path)
+
+
+def test_legacy_folder_at_trace_of_already_migrated_archive_needs_adopt(make_config, tmp_path, fake_crawler):
+    """forget した保存フォルダ自体が v0.1.x から移行済みなら、跡に置いた別の v0.1.x は移行されないので adopt を求める。"""
+    from test_archives import _make_legacy_db
+    from database import legacy_db_path
+    root = str(tmp_path / "legacy")
+    write_file(os.path.join(root, "inbox", "a.txt"), b"abc")
+    _make_legacy_db(legacy_db_path(root), root)
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=root)) == main.EXIT_OK  # A を移行
+    sess, engine = _db(tmp_path)
+    try:
+        aid = sess.query(Archive).one().id
+    finally:
+        sess.close(); engine.dispose()
+    shutil.rmtree(root)
+    assert main.main(["archives", "--forget", str(aid), "--archive-db", archive_db_path(tmp_path)]) == main.EXIT_OK
+    write_file(os.path.join(root, "other", "b.txt"), b"bcd")  # 同じ場所に別の v0.1.x の保存フォルダ B
+    _make_legacy_db(legacy_db_path(root), root)
+    with pytest.raises(PreflightError, match="adopt"):
+        main.run(make_config(mode=MODE_REPORT, archive_root=root))
+    assert _adopt(make_config, root, tmp_path, fake_crawler) == main.EXIT_OK  # 行き止まりにしない
+    assert ("other/b.txt", STATUS_STORED) in _rows(tmp_path)

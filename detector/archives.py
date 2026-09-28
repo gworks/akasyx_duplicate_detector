@@ -382,14 +382,6 @@ def resolve_archive(session, archive_root: str, adopting: bool = False) -> Archi
     # 登録には実体のパスを記録する（シンボリックリンク等の一時的な別名を記録すると、別名が消えたあとに
     # 場所で見つけられなくなる）。新規登録・移動・別表記のどの分岐でもこの形を使う
     root = os.path.realpath(archive_root)
-    if adopting and os.path.isfile(legacy_db_path(root)):
-        # v0.1.x の保存フォルダは開けば移行（import_legacy_db）で記録ができるので adopt は要らない。
-        # 登録や adopt 待ちの印を作る前に断る（先に印を付けると、移行した行と adopt の行がパスの一意索引で
-        # ぶつかって adopt が毎回落ち、印が残ってどのコマンドも使えなくなる）
-        raise PreflightError(
-            "This is a v0.1.x archive folder (it has .akasyx/archive.db); adopt is not needed.\n"
-            f"  Open it with another command (e.g. verify) to migrate its records: {root}"
-        )
     uid = read_uid(root)
 
     row = None
@@ -402,6 +394,13 @@ def resolve_archive(session, archive_root: str, adopting: bool = False) -> Archi
         if row is not None and uid and row.uid != uid:
             row = None  # 同じ場所に別の保存フォルダが置かれた。パス一致では同一視しない
 
+    if adopting and _legacy_will_import(session, row, root):
+        # v0.1.x の保存フォルダは開けば移行で記録ができるので adopt は要らない。登録や adopt 待ちの印を作る前に
+        # 断る（先に印を付けると、移行した行と adopt の行がパスの一意索引でぶつかって adopt が毎回落ち、印が残る）
+        raise PreflightError(
+            "This is a v0.1.x archive folder (it has .akasyx/archive.db); adopt is not needed.\n"
+            f"  Open it with another command (e.g. verify) to migrate its records: {root}"
+        )
     if row is None:
         # 新しく登録する保存フォルダの中に別の保存フォルダがあれば断る（#6）。中の保存物を verify が
         # 未登録として拾い、同じ実体を 2 つの保存フォルダが持つことになる。歩くのは初回の登録時だけ
@@ -437,7 +436,14 @@ def resolve_archive(session, archive_root: str, adopting: bool = False) -> Archi
         _write_uid(root, row.uid)
         logger.info(f"Registered archive folder: #{row.id} {root}")
     else:
-        if not returned and not adopting and _has_forgotten(session, row) and _has_stored_content(root):
+        if (
+            not returned
+            and not adopting
+            and _has_forgotten(session, row)
+            # v0.1.x の保存フォルダで、このあと移行（import_legacy_db）が本当に記録を作るときは断らない（新規登録と同じ）
+            and not _legacy_will_import(session, row, root)
+            and _has_stored_content(root)
+        ):
             # forget した保存フォルダの跡（同じ場所）に、識別子の無い別のフォルダが置かれた。forget した記録は
             # この中身と無関係なので（_settle_forgotten が missing にする）、記録が無いのと同じ。識別子を書く前に断る
             raise PreflightError(
@@ -483,6 +489,19 @@ def resolve_archive(session, archive_root: str, adopting: bool = False) -> Archi
     _check_adoption_state(session, row, root, adopting)
     os.makedirs(tmp_dir(root), exist_ok=True)
     return row
+
+
+def _legacy_will_import(session, row: Archive | None, root: str) -> bool:
+    """このあと import_legacy_db が v0.1.x の DB から記録を作るか。
+
+    取り込み済みの印（ar_legacy_imports、保存フォルダごとに 1 つ）がある登録では、旧 DB があっても
+    改名されるだけで取り込まれない（forget した移行済みの保存フォルダの跡に、別の v0.1.x を置いた場合など）。
+    """
+    if not os.path.isfile(legacy_db_path(root)):
+        return False
+    if row is None:
+        return True
+    return session.query(LegacyImport).filter_by(archive_id=row.id).first() is None
 
 
 def _has_forgotten(session, row: Archive) -> bool:
@@ -557,8 +576,10 @@ def import_legacy_db(session, archive: Archive, legacy_path: str) -> dict | None
     done = session.query(LegacyImport).filter_by(archive_id=archive.id).first()
     if done is not None:
         logger.warning(
-            f"The v0.1.x DB was already imported at {done.imported_at}; "
-            f"retrying only the rename: {legacy_path}"
+            f"A v0.1.x DB was already imported into this archive folder at {done.imported_at}; "
+            f"not importing again, only renaming: {legacy_path} "
+            "(if this is a different v0.1.x DB, e.g. placed where a forgotten archive folder was, "
+            "its history is not imported; its files are registered by adopt)"
         )
         _rename_legacy(legacy_path, checkpointed)
         return None
