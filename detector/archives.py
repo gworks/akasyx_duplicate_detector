@@ -6,6 +6,8 @@ import logging
 import os
 import sqlite3
 import stat
+import threading
+import unicodedata
 import uuid
 from datetime import datetime
 
@@ -113,22 +115,33 @@ def _same_location(a: str, b: str, st_b: os.stat_result | None = None) -> bool:
 def _same_real_path(a: str, b: str) -> bool:
     """ファイル ID が使えないときの代わり: 実体のパスが同じか。
 
-    最後の要素（フォルダ名）の大文字小文字だけ違う場合は、親フォルダの中にその名前が 1 つしか無ければ
-    同じフォルダ（区別しないボリュームで表記が違うだけ）、2 つあれば別々のフォルダとみなす。
-    親フォルダの表記が違う場合は確かめようがないので別々とみなす（一致しすぎは危険側）。
+    最後の要素（フォルダ名）の表記（大文字小文字・Unicode の正規化）だけ違う場合は、親フォルダの中に
+    その表記の名前が 1 つしか無ければ同じフォルダ（区別しないボリュームで表記が違うだけ）、2 つあれば
+    別々のフォルダとみなす。表記の比べ方は `_spelling_key` にそろえる（#7）。
+    親フォルダの表記が違う場合は確かめようがないので別々とみなす（一致しすぎは危険側。#1 のレビューで決定。
+    別々とみなした結果は「新しく登録／複製として断る」で、データは失わない）。
     """
     ra = os.path.normcase(os.path.realpath(a))
     rb = os.path.normcase(os.path.realpath(b))
     if ra == rb:
         return True
-    if os.path.dirname(ra) != os.path.dirname(rb) or ra.casefold() != rb.casefold():
+    if os.path.dirname(ra) != os.path.dirname(rb) or _spelling_key(ra) != _spelling_key(rb):
         return False
-    name = os.path.basename(ra).casefold()
+    name = _spelling_key(os.path.basename(ra))
     try:
-        spellings = [n for n in os.listdir(os.path.dirname(ra)) if n.casefold() == name]
+        spellings = [n for n in os.listdir(os.path.dirname(ra)) if _spelling_key(n) == name]
     except OSError:
         return False
     return len(spellings) == 1
+
+
+def _spelling_key(path: str) -> str:
+    """大文字小文字と Unicode の正規化（NFC / NFD）の違いを除いた表記（I/O なし）。
+
+    macOS は Finder から渡るパス（NFD）とターミナルで打ったパス（NFC）で表記が違うことがあり、
+    realpath はそれを揃えない。同じフォルダを別の登録として新しく登録しないよう、比べる前に揃える。
+    """
+    return unicodedata.normalize("NFC", os.path.normcase(path)).casefold()
 
 
 def _find_by_location(session, root: str) -> Archive | None:
@@ -139,21 +152,26 @@ def _find_by_location(session, root: str) -> Archive | None:
     保存フォルダの行は少ないので全件を比べる。
 
     同じ表記の登録があればそれを使う（接続していないネットワークの場所を stat して待たないため）。
-    無ければ実体で照合し、複数一致したら最後に使った行を選んで警告する（文字列一致しか見ていなかった
+    無ければ、大文字小文字を除いて表記が同じ登録だけを実体で照合する（#7。登録は実体のパスで記録して
+    いるので、同じ実体なら表記は大文字小文字と Unicode の正規化しか違わない。表記の違う登録＝止まっている NAS かもしれない
+    場所には I/O をかけない）。複数一致したら最後に使った行を選んで警告する（文字列一致しか見ていなかった
     頃に同じ実体が重複登録されていることがあるため）。同じ表記の登録が複数あるときも同じ規則で選ぶ。
-    制限: 同じ表記の登録が無いときは全登録を順に stat するので、接続していないネットワークの登録が
-    あるとその分待たされる（archive.id を失ったときだけ起きる。将来の課題）。
+    制限: 以前の版が別名（シンボリックリンク経由）のまま記録した登録は、識別子を失った状態では見つけない
+    （中身があれば adopt を求めて断るので重複は入らない。空なら新しく登録する — 2026-09-29 決定）。
     """
     rows = session.query(Archive).all()
     # 同じ表記の登録があれば stat せずに済ませる（登録に接続していないネットワークの場所があると
     # stat がタイムアウトまで待つため、まず文字列で当てる）
     matches = [r for r in rows if r.root_abs == root]
     if not matches:
-        try:
-            st_root = os.stat(root)
-        except OSError:
-            return None
-        matches = [r for r in rows if _same_location(r.root_abs, root, st_root)]
+        key = _spelling_key(root)
+        candidates = [r for r in rows if _spelling_key(r.root_abs) == key]
+        if candidates:
+            try:
+                st_root = os.stat(root)
+            except OSError:
+                return None
+            matches = [r for r in candidates if _same_location(r.root_abs, root, st_root)]
     if not matches:
         return None
     # DB から読んだ値は naive、同じセッション内で入れた値は aware なので揃えて比べる
@@ -328,17 +346,69 @@ def is_at_registered_location(row: Archive) -> bool:
     return os.path.isdir(row.root_abs) and read_uid(row.root_abs) == row.uid
 
 
-def _is_live_copy_source(row: Archive, root: str) -> bool:
-    """登録上の場所に、同じ uid の保存フォルダがまだ残っているか（= root はその複製）。
+# 移動した保存フォルダの元の場所を確かめる期限（秒）。止まっている NAS は OS のタイムアウト（SMB では
+# 数十秒）まで戻らないので打ち切る（#7）。期限を過ぎたら、つながっていない（= 移動した）として扱う
+PREVIOUS_LOCATION_TIMEOUT = 10.0
+# 期限を過ぎても OS の中で戻らない確認のスレッドは止められない。その数に上限を設ける
+_PROBE_SLOTS = threading.BoundedSemaphore(4)
 
-    呼び出し側で「root は登録上の場所とは別の実体」と確かめてから呼ぶ（同じ場所の別表記は複製ではない）。
+
+def _probe_previous_location(prev: str, uid: str, root: str) -> tuple[bool, bool]:
+    """登録上の元の場所 prev を確かめます。戻り値は (root と同じ場所か, 元の場所に同じ uid の保存フォルダが残っているか)。
+
+    元の場所への I/O（stat・realpath・listdir・識別子の読み込み）はすべてここで行う（期限を 1 回で済ませる）。
+    別スレッドで動くので、SQLAlchemy の行ではなく文字列を受け取る。
     """
+    if _same_location(prev, root):
+        return True, False
     try:
-        return is_at_registered_location(row)
+        # 元の場所に同じ uid の保存フォルダがまだある = root はその複製
+        return False, os.path.isdir(prev) and read_uid(prev) == uid
     except PreflightError as e:
         # もう使っていない場所の不調で、移動した保存フォルダまで開けなくしない
         logger.warning(f"Could not check the previous location; treating as moved: {e}")
-        return False
+        return False, False
+
+
+def _probe_previous_location_bounded(row: Archive, root: str) -> tuple[bool, bool]:
+    """_probe_previous_location を期限付きで行います。期限を過ぎたら警告して (False, False)（移動した扱い）。
+
+    意図した代償（2026-09-29 ユーザー決定、設計書 v020 §4）: 期限を過ぎてから応答する場所（スリープから
+    起きるのが遅い NAS 等）に元の保存フォルダが残っていると、複製の検出が働かず、登録が複製の側へ移る。
+    そのあと元の方を開くと複製として断られる（データは失われない。複製を消せば元の方が移動として開ける）。
+    期限切れで断る案は、NAS を止めたままローカルへ移した保存フォルダを使えなくなるので採らなかった。
+    期限切れは必ず警告を出して知らせる。
+    """
+    prev, uid = row.root_abs, row.uid
+    if not _PROBE_SLOTS.acquire(blocking=False):
+        logger.warning(
+            f"The previous location of the archive folder was not checked (earlier checks are still waiting "
+            f"for the network); treating it as moved: {prev}"
+        )
+        return False, False
+    box: dict = {}
+
+    def run():
+        try:
+            box["value"] = _probe_previous_location(prev, uid, root)
+        except BaseException as e:  # pragma: no cover - 呼び出し側で投げ直す
+            box["error"] = e
+        finally:
+            _PROBE_SLOTS.release()
+
+    # daemon: 戻らない確認があっても、プロセスの終了を待たせない
+    worker = threading.Thread(target=run, name="previous-location-probe", daemon=True)
+    worker.start()
+    worker.join(PREVIOUS_LOCATION_TIMEOUT)
+    if worker.is_alive():
+        logger.warning(
+            f"The previous location of the archive folder did not respond within "
+            f"{PREVIOUS_LOCATION_TIMEOUT:g} s (e.g. a network drive that is not connected); treating it as moved: {prev}"
+        )
+        return False, False
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
 
 
 def check_new_archive_placement(root: str) -> None:
@@ -453,8 +523,12 @@ def resolve_archive(session, archive_root: str, adopting: bool = False) -> Archi
                 f"  folder: {root}\n"
                 f"  Register the files in it first: adopt {root}"
             )
-        moved = row.root_abs != root and not _same_location(row.root_abs, root)
-        if moved and _is_live_copy_source(row, root):
+        # 元の場所の確認は期限付き（止まっている NAS で待たない — #7）。同じ表記なら I/O は要らない
+        same, live_copy = (
+            (True, False) if row.root_abs == root else _probe_previous_location_bounded(row, root)
+        )
+        moved = not same
+        if moved and live_copy:
             raise PreflightError(
                 "This archive folder looks like a copy of another archive folder (same ID):\n"
                 f"  this folder    : {root}\n"
