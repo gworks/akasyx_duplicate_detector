@@ -15,6 +15,8 @@ from config import OS_JUNK_FILES
 from database import META_DIRNAME, archive_id_path, legacy_db_path, meta_dir, tmp_dir
 from errors import PreflightError
 from models import (
+    STATUS_FAILED,
+    STATUS_PENDING,
     OWNING_STATUSES,
     PATH_HOLDING_STATUSES,
     STATUS_FORGOTTEN,
@@ -472,16 +474,23 @@ def resolve_archive(session, archive_root: str, adopting: bool = False) -> Archi
             # 識別子の書き込み・forget の片付け（_settle_forgotten）より前に adopt 待ちにする。間で落ちると、
             # 次に開いたとき「戻ってきた保存フォルダ」として adopt 待ちでないまま通常のコマンドが通ってしまう。
             # 複製の検出など断る判定の後に置く（断る保存フォルダに印を残さない）
-            # 識別子で戻ってきた保存フォルダでは、forget した記録もこのあと stored に戻るので記録として数える
-            _refuse_adopt_if_records(session, row, root, include_forgotten=returned)
+            # 識別子で戻ってきた保存フォルダでは、forget した記録もこのあと stored に戻るので記録として数える。
+            # forget した跡（場所の一致だけ）では、残っている pending（add の中断の残り）は置かれたフォルダの
+            # 中身と関係が無いので数えない（_settle_forgotten が failed にする）
+            trace = not returned and _has_forgotten(session, row)
+            _refuse_adopt_if_records(
+                session, row, root, include_forgotten=returned, include_pending=not trace
+            )
             session.add(PendingAdoption(archive_id=row.id))
             session.commit()
+        # forget した記録の片付けは識別子を書く前に行う。識別子を書いた後に落ちると、次に開いたとき
+        # 識別子で見つかって「戻ってきた保存フォルダ」と取り違え、跡の forget した記録を stored に戻してしまう
+        _settle_forgotten(session, row, returned)
         if not uid:
             _write_uid(root, row.uid)
         row.last_used_at = utcnow()
         session.commit()
 
-    _settle_forgotten(session, row, returned)
     # v0.1.x の DB が保存フォルダに残っていれば取り込む（登録済みかどうかに関係なく）
     migrated = import_legacy_db(session, row, legacy_db_path(root))
     if migrated:
@@ -533,14 +542,16 @@ def _check_adoption_state(session, row: Archive, root: str, adopting: bool) -> N
 
 
 def _refuse_adopt_if_records(
-    session, row: Archive, root: str, include_forgotten: bool = False
+    session, row: Archive, root: str, include_forgotten: bool = False, include_pending: bool = True
 ) -> None:
     """保存記録（stored / pending）がある保存フォルダへの adopt は断ります（実体の変化は verify）。
 
     include_forgotten: forget した保存フォルダが識別子ごと戻ってきたとき。forget した記録は
     _settle_forgotten が stored に戻すので記録として数える（数えないと adopt の行とぶつかる）。
     """
-    statuses = (*OWNING_STATUSES, STATUS_FORGOTTEN) if include_forgotten else OWNING_STATUSES
+    statuses = [s for s in OWNING_STATUSES if include_pending or s != STATUS_PENDING]
+    if include_forgotten:
+        statuses.append(STATUS_FORGOTTEN)
     has_owning = (
         session.query(ArchiveFile.id)
         .filter(ArchiveFile.archive_id == row.id, ArchiveFile.status.in_(statuses))
@@ -733,6 +744,13 @@ def _settle_forgotten(session, row: Archive, returned: bool) -> None:
     for f, _ in rows:
         if f.status == STATUS_FORGOTTEN:
             f.status = STATUS_MISSING
+    if not returned:
+        # 跡に置かれた別のフォルダには、forget した保存フォルダの中断した予約（pending）の実体は無い。
+        # 復旧（recover_pending）に回すと、同じパスの別のファイルを予約の完了と取り違えうるので failed にする
+        for f in session.query(ArchiveFile).filter(
+            ArchiveFile.archive_id == row.id, ArchiveFile.status == STATUS_PENDING
+        ):
+            f.status = STATUS_FAILED
     session.commit()
     logger.info(
         f"Archive folder #{row.id} was forgotten: restored {len(restored)} of {len(rows)} records"
@@ -766,6 +784,12 @@ def forget_archive(session, archive_id: int) -> int:
         .filter(ArchiveFile.archive_id == archive_id, ArchiveFile.status == STATUS_STORED)
         .all()
     )
+    if not rows:
+        # stored が無い保存フォルダは重複判定を塞がない（別の保存フォルダの pending は持ち主にしない）ので、
+        # 外すものが無い。forgotten の行ができない forget 済みの状態を作らないためにも断る
+        raise PreflightError(
+            f"Archive folder #{archive_id} has no stored records; there is nothing to forget: {row.root_abs}"
+        )
     for f in rows:
         # 消したのではなく外れていただけなら、開き直したときに戻す（_settle_forgotten）
         f.status = STATUS_FORGOTTEN

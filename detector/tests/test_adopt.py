@@ -538,3 +538,87 @@ def test_legacy_folder_at_trace_of_already_migrated_archive_needs_adopt(make_con
         main.run(make_config(mode=MODE_REPORT, archive_root=root))
     assert _adopt(make_config, root, tmp_path, fake_crawler) == main.EXIT_OK  # 行き止まりにしない
     assert ("other/b.txt", STATUS_STORED) in _rows(tmp_path)
+
+
+def test_pending_row_of_forgotten_archive_does_not_block_trace(make_config, tmp_path, fake_crawler):
+    """forget した保存フォルダに add の中断の pending 行が残っていても、跡に置いたフォルダを adopt できる。"""
+    from models import STATUS_FAILED, STATUS_PENDING
+    old = str(tmp_path / "arch")
+    os.makedirs(old)
+    src0 = str(tmp_path / "in0")
+    write_file(os.path.join(src0, "seed.jpg"), b"SEED")
+    fake_crawler(src0, str(tmp_path / "c0.db"))
+    assert main.run(make_config(archive_root=old, source_path=src0)) == main.EXIT_OK
+    sess, engine = _db(tmp_path)
+    try:
+        aid = sess.query(Archive).one().id
+        sess.add(ArchiveFile(archive_id=aid, filehash="h" * 64, hash_algo="sha256", size=3, name="p.jpg",
+                             stored_path_rel="2020/p.jpg", origin_path_abs=str(tmp_path / "gone.jpg"),
+                             status=STATUS_PENDING))
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    shutil.rmtree(old)
+    assert main.main(["archives", "--forget", str(aid), "--archive-db", archive_db_path(tmp_path)]) == main.EXIT_OK
+    write_file(os.path.join(old, "2020", "p.jpg"), b"PHOTO")  # 中断した予約と同じパスに別のファイル
+    with pytest.raises(PreflightError, match="adopt"):
+        main.run(make_config(mode=MODE_REPORT, archive_root=old))
+    assert _adopt(make_config, old, tmp_path, fake_crawler) == main.EXIT_OK
+    assert ("2020/p.jpg", STATUS_STORED) in _rows(tmp_path)
+    sess, engine = _db(tmp_path)
+    try:  # 中断した予約は、跡に置いたファイルと取り違えずに failed にする
+        assert sess.query(ArchiveFile).filter_by(filehash="h" * 64).one().status == STATUS_FAILED
+    finally:
+        sess.close(); engine.dispose()
+
+
+def test_forgotten_records_are_settled_before_the_id_is_written(make_config, tmp_path, fake_crawler, monkeypatch):
+    """跡では、識別子を書く前に forget した記録を片付ける（書いた後に落ちても、次回戻ったと取り違えない）。"""
+    import archives
+    from models import STATUS_FORGOTTEN
+    old = str(tmp_path / "arch")
+    os.makedirs(old)
+    src0 = str(tmp_path / "in0")
+    write_file(os.path.join(src0, "seed.jpg"), b"SEED")
+    fake_crawler(src0, str(tmp_path / "c0.db"))
+    assert main.run(make_config(archive_root=old, source_path=src0)) == main.EXIT_OK
+    sess, engine = _db(tmp_path)
+    try:
+        aid = sess.query(Archive).one().id
+    finally:
+        sess.close(); engine.dispose()
+    shutil.rmtree(old)
+    assert main.main(["archives", "--forget", str(aid), "--archive-db", archive_db_path(tmp_path)]) == main.EXIT_OK
+    write_file(os.path.join(old, "2020", "p.jpg"), b"PHOTO")
+    real = archives._write_uid
+
+    def _write_then_crash(root, uid):
+        real(root, uid)
+        raise RuntimeError("crashed right after writing the ID")
+
+    monkeypatch.setattr(archives, "_write_uid", _write_then_crash)
+    with pytest.raises(RuntimeError):
+        main.run(make_config(mode=MODE_ADOPT, archive_root=old))
+    monkeypatch.undo()
+    assert _rows(tmp_path, status=STATUS_FORGOTTEN) == []  # 片付け済み（戻ったと取り違えて stored にしない）
+    assert _adopt(make_config, old, tmp_path, fake_crawler) == main.EXIT_OK
+    assert ("seed.jpg", STATUS_STORED) not in [(p.split("/")[-1], st) for p, st in _rows(tmp_path)]
+
+
+def test_forget_with_no_stored_records_is_refused(make_config, tmp_path):
+    """保存記録が 0 件の保存フォルダは重複判定を塞がないので forget は要らない（印の無い forget 済みの状態を作らない）。"""
+    from models import STATUS_PENDING
+    arch = str(tmp_path / "arch")
+    os.makedirs(arch)
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=arch)) == main.EXIT_OK
+    sess, engine = _db(tmp_path)
+    try:
+        aid = sess.query(Archive).one().id
+        sess.add(ArchiveFile(archive_id=aid, filehash="h" * 64, hash_algo="sha256", size=3, name="p.jpg",
+                             stored_path_rel="p.jpg", status=STATUS_PENDING))  # add の中断の残りだけ
+        sess.commit()
+    finally:
+        sess.close(); engine.dispose()
+    shutil.rmtree(arch)
+    argv = ["archives", "--forget", str(aid), "--archive-db", archive_db_path(tmp_path)]
+    assert main.main(argv) == main.EXIT_REJECTED
