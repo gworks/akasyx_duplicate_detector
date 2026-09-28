@@ -98,15 +98,18 @@ def test_empty_folder_still_opens_without_adopt(make_config, tmp_path, fake_craw
     assert main.run(make_config(archive_root=empty, source_path=src)) == main.EXIT_OK
 
 
-def test_files_copied_into_registered_empty_archive_need_adopt(make_config, tmp_path, fake_crawler):
-    """記録が 0 件の保存フォルダに、あとから手でファイルを入れた場合も adopt を求める。"""
+def test_files_copied_into_registered_archive_are_left_to_verify(make_config, tmp_path, fake_crawler):
+    """登録済みの保存フォルダに、あとから手でファイルを入れた場合は adopt を求めない（従来どおり verify の扱い）。
+
+    断るのは「adopt 待ち」の印があるときだけ（2026-09-28 決定。記録の状態から推し量る判定は、verify・forget で
+    状態が書き換わるたびにずれたのでやめた）。手で入れたファイルは、記録が無ければ adopt で登録することもできる。
+    """
     arch = str(tmp_path / "arch")
     os.makedirs(arch)
     assert main.run(make_config(mode=MODE_REPORT, archive_root=arch)) == main.EXIT_OK  # 空で登録
     write_file(os.path.join(arch, "manual", "x.jpg"), b"XXXX")
-    with pytest.raises(PreflightError, match="adopt"):
-        main.run(make_config(mode=MODE_REPORT, archive_root=arch))
-    assert _adopt(make_config, arch, tmp_path, fake_crawler) == main.EXIT_OK
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=arch)) == main.EXIT_OK
+    assert _adopt(make_config, arch, tmp_path, fake_crawler) == main.EXIT_OK  # 保存記録が無いので adopt もできる
     assert _rows(tmp_path) == [("manual/x.jpg", STATUS_STORED)]
 
 
@@ -280,19 +283,20 @@ def test_folder_with_only_empty_files_needs_no_adopt(make_config, tmp_path, fake
     assert main.run(make_config(mode=MODE_REPORT, archive_root=root)) == main.EXIT_OK
 
 
-def test_files_copied_after_an_empty_adopt_still_need_adopt(make_config, tmp_path, fake_crawler):
-    """何も登録せずに終わった adopt の後で手でファイルを入れたら、また adopt を求める（add で重複を作らない）。"""
-    root = str(tmp_path / "only_empty")
-    write_file(os.path.join(root, "empty.txt"), b"")
-    assert _adopt(make_config, root, tmp_path, fake_crawler) == main.EXIT_OK
-    write_file(os.path.join(root, "manual", "x.jpg"), b"XXXX")
+def test_verify_after_adopt_keeps_archive_usable(make_config, tmp_path, fake_crawler):
+    """中身が全部他の保存フォルダの重複で adopt した後、verify を挟んでも使える（adopt 待ちの印は外れている）。"""
+    a = str(tmp_path / "a")
+    os.makedirs(a)
     src = str(tmp_path / "inbox")
-    write_file(os.path.join(src, "x_copy.jpg"), b"XXXX")
+    write_file(os.path.join(src, "a.jpg"), b"AAAA")
     fake_crawler(src, str(tmp_path / "c.db"))
-    with pytest.raises(PreflightError, match="adopt"):
-        main.run(make_config(archive_root=root, source_path=src))
-    assert _adopt(make_config, root, tmp_path, fake_crawler) == main.EXIT_OK
-    assert ("manual/x.jpg", STATUS_STORED) in _rows(tmp_path)
+    assert main.run(make_config(archive_root=a, source_path=src)) == main.EXIT_OK
+    b = str(tmp_path / "b")
+    write_file(os.path.join(b, "x", "a.jpg"), b"AAAA")
+    assert _adopt(make_config, b, tmp_path, fake_crawler) == main.EXIT_OK
+    fake_crawler(b, str(tmp_path / "v.db"))
+    assert main.run(make_config(mode=MODE_VERIFY, archive_root=b)) == main.EXIT_OK
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=b)) == main.EXIT_OK
 
 
 def test_failed_count_is_not_doubled():

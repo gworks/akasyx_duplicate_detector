@@ -15,7 +15,6 @@ from config import OS_JUNK_FILES
 from database import META_DIRNAME, archive_id_path, legacy_db_path, meta_dir, tmp_dir
 from errors import PreflightError
 from models import (
-    MODE_ADOPT,
     OWNING_STATUSES,
     PATH_HOLDING_STATUSES,
     STATUS_FORGOTTEN,
@@ -28,6 +27,7 @@ from models import (
     Ingest,
     IngestItem,
     LegacyImport,
+    PendingAdoption,
     utcnow,
 )
 
@@ -398,7 +398,7 @@ def resolve_archive(session, archive_root: str, adopting: bool = False) -> Archi
         # 新しく登録する保存フォルダの中に別の保存フォルダがあれば断る（#6）。中の保存物を verify が
         # 未登録として拾い、同じ実体を 2 つの保存フォルダが持つことになる。歩くのは初回の登録時だけ
         check_new_archive_placement(root)
-        # v0.1.x の DB がある保存フォルダは移行で記録ができるので、移行後の確認（_check_records_match_content）に任せる
+        # v0.1.x の DB がある保存フォルダは、このあと移行（import_legacy_db）で記録ができるので断らない
         if not adopting and not os.path.isfile(legacy_db_path(root)) and _has_stored_content(root):
             # 中身があるのに記録が無いまま登録すると、中にある内容と同じファイルまで取り込んで重複を作る（#4 / #5）。
             # 識別子を書く前に断る（断るだけの実行で利用者のフォルダに登録の跡を残さない）
@@ -421,6 +421,10 @@ def resolve_archive(session, archive_root: str, adopting: bool = False) -> Archi
             logger.warning(f"ID {uid} is not in the DB; {state}; registering it with this ID")
         row = Archive(uid=uid or uuid.uuid4().hex, root_abs=root, last_used_at=utcnow())
         session.add(row)
+        if adopting:
+            # 登録と同じコミットで adopt 待ちにする（この後 adopt が落ちても、他のコマンドは断る）
+            session.flush()
+            session.add(PendingAdoption(archive_id=row.id))
         session.commit()
         _write_uid(root, row.uid)
         logger.info(f"Registered archive folder: #{row.id} {root}")
@@ -460,12 +464,9 @@ def resolve_archive(session, archive_root: str, adopting: bool = False) -> Archi
     migrated = import_legacy_db(session, row, legacy_db_path(root))
     if migrated:
         logger.info(f"Imported from legacy DB: {migrated}")
-    _check_records_match_content(session, row, root, adopting)
+    _check_adoption_state(session, row, root, adopting)
     os.makedirs(tmp_dir(root), exist_ok=True)
     return row
-
-
-RECORD_STATUSES = (*OWNING_STATUSES, STATUS_MISSING)
 
 
 def _has_forgotten(session, row: Archive) -> bool:
@@ -477,49 +478,32 @@ def _has_forgotten(session, row: Archive) -> bool:
     )
 
 
-def _check_records_match_content(session, row: Archive, root: str, adopting: bool) -> None:
-    """「中身があるのに記録が 1 件も無い保存フォルダ」は adopt 以外で使わせません（#4 / #5）。
+def _check_adoption_state(session, row: Archive, root: str, adopting: bool) -> None:
+    """adopt 待ちの保存フォルダは adopt 以外で使わせません。adopt は保存記録があれば断ります（#4 / #5）。
 
-    新しく登録するときは resolve_archive が識別子を書く前に断る。ここで拾うのは、空で登録したあとに
-    手でファイルを入れた場合と、adopt が途中で落ちた場合（登録だけ残る）。adopt は記録が既にあれば断る
-    （登録済みの保存フォルダの実体の変化は verify で扱う）。
+    「中身があるのに記録が無い」を記録の状態（stored / missing / unregistered …）から推し量る判定は、
+    verify・forget・別の保存フォルダの変化で状態が書き換わるたびにずれたのでやめ、adopt 待ちの印
+    （ar_pending_adoptions）で決める（2026-09-28 決定）。新しく登録するフォルダに中身があるときは
+    resolve_archive が識別子を書く前に断る。印が外れた後に手で入れたファイルは、従来どおり verify が扱う。
     """
-    # 保存記録（stored / pending）と missing を数える。missing は「保存していたが今は見えない」記録で、
-    # 実体が戻れば verify が stored に戻す（adopt の出番ではない）。unregistered・failed だけのときは
-    # 重複判定に使える記録が無いので、中身があれば adopt を求める（adopt は unregistered の行を使い回す）
-    def _exists(statuses) -> bool:
-        return (
+    pending = session.get(PendingAdoption, row.id) is not None
+    if not adopting and pending:
+        raise PreflightError(
+            "The files in this archive folder have not been registered yet (adopt did not finish):\n"
+            f"  archive folder: {root}\n"
+            f"  Run adopt again: adopt {root}"
+        )
+    if adopting and not pending:
+        has_owning = (
             session.query(ArchiveFile.id)
-            .filter(ArchiveFile.archive_id == row.id, ArchiveFile.status.in_(statuses))
+            .filter(ArchiveFile.archive_id == row.id, ArchiveFile.status.in_(OWNING_STATUSES))
             .first()
             is not None
         )
-
-    # adopt が unregistered にした行（別の保存フォルダ・この中の別のファイルに stored がある内容）も数える。
-    # その内容は重複判定に使える記録があるので、中身が全部他の保存フォルダの重複でも adopt の後は使える。
-    # verify が付けた unregistered（重複判定の対象外）は数えない
-    has_records = _exists(RECORD_STATUSES) or (
-        session.query(ArchiveFile.id)
-        .join(Ingest, ArchiveFile.ingest_id == Ingest.id)
-        .filter(
-            ArchiveFile.archive_id == row.id,
-            ArchiveFile.status == STATUS_UNREGISTERED,
-            Ingest.mode == MODE_ADOPT,
-        )
-        .first()
-        is not None
-    )
-    # adopt を断るのは保存記録があるときだけ（missing だけなら、今の中身を登録してよい。forget の跡など）
-    if adopting and _exists(OWNING_STATUSES):
-        raise PreflightError(
-            f"This archive folder already has records; use verify to check it: {root}"
-        )
-    if not adopting and not has_records and _has_stored_content(root):
-        raise PreflightError(
-            "This archive folder contains files, but has no records in the master DB:\n"
-            f"  archive folder: {root}\n"
-            f"  Register the files in it first: adopt {root}"
-        )
+        if has_owning:
+            raise PreflightError(
+                f"This archive folder already has records; use verify to check it: {root}"
+            )
 
 
 # --- v0.1.x → v0.2.0 移行 ---------------------------------------------------

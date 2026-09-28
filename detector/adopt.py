@@ -26,6 +26,7 @@ from models import (
     Archive,
     ArchiveFile,
     IngestItem,
+    PendingAdoption,
 )
 from utl.result_csv import create_csv, csv_update
 
@@ -39,6 +40,11 @@ def run_adopt(session, config, ingest) -> tuple[str, dict]:
     一部だけ登録して確定すると、記録があるので adopt をやり直せず、登録し損ねた内容と同じファイルを
     あとの add が重複として止めずに取り込む。直してから adopt をやり直せばよい。
     """
+    # adopt 待ちにしてから始める（登録済みの保存フォルダに手で入れたファイルを登録する場合も。途中で落ちたら
+    # 他のコマンドは断る）。全件の登録と同じコミットで外す
+    if session.get(PendingAdoption, config.archive_id) is None:
+        session.add(PendingAdoption(archive_id=config.archive_id))
+        session.commit()
     archives.check_tree_readable(config.archive_root)
     # 使い捨ての作業用 DB で走査する。共有の作業用 DB だと、以前の走査で読めなかったファイルを crawler が
     # 「同じ stat で 2 回失敗したので取り直さない」と覚えていて、権限を直しても adopt が断られ続ける
@@ -143,6 +149,9 @@ def run_adopt(session, config, ingest) -> tuple[str, dict]:
                 )
             )
             csv_update(csv_file, [f.name, f.path_abs, result, f.size, f.path_rel, message or ""])
+        pending = session.get(PendingAdoption, config.archive_id)
+        if pending is not None:
+            session.delete(pending)
         session.commit()
     except KeyboardInterrupt:
         session.rollback()
