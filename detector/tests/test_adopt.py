@@ -416,3 +416,26 @@ def test_adopt_on_unregistered_legacy_folder_is_refused_before_registering(make_
     finally:
         sess.close(); engine.dispose()
     assert main.run(make_config(mode=MODE_REPORT, archive_root=root)) == main.EXIT_OK  # 移行して使える
+
+
+def test_adopt_clears_quarantine_flag_on_rows_it_stores(make_config, tmp_path, fake_crawler):
+    """verify が付けた隔離予定の印は、adopt が stored にした行からは外す（正本を隔離対象にしない）。"""
+    from models import DISPOSITION_QUARANTINE
+    arch = str(tmp_path / "arch")
+    os.makedirs(arch)
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=arch)) == main.EXIT_OK
+    write_file(os.path.join(arch, "x.jpg"), b"XXXX")
+    write_file(os.path.join(arch, "dup", "x.jpg"), b"XXXX")
+    fake_crawler(arch, str(tmp_path / "v.db"))
+    cfg = make_config(mode=MODE_VERIFY, archive_root=arch, flag_quarantine=["unregistered", "archive_duplicate"])
+    assert main.run(cfg) == main.EXIT_OK
+    assert _adopt(make_config, arch, tmp_path, fake_crawler) == main.EXIT_OK
+    sess, engine = _db(tmp_path)
+    try:
+        rows = {r.stored_path_rel: r for r in sess.query(ArchiveFile)}
+        assert rows["dup/x.jpg"].status == STATUS_STORED  # パス順で先
+        assert rows["dup/x.jpg"].disposition is None
+        assert rows["x.jpg"].status == STATUS_UNREGISTERED
+        assert rows["x.jpg"].disposition == DISPOSITION_QUARANTINE  # 重複の方は印を残す
+    finally:
+        sess.close(); engine.dispose()

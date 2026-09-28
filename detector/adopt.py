@@ -120,7 +120,12 @@ def run_adopt(session, config, ingest) -> tuple[str, dict]:
                 "  Fix the permissions (or remove these files) and run adopt again."
             )
 
-        promoted = {id(r) for r in archives.promote_many(session, list(first_of.values()))}
+        stored_rows = archives.promote_many(session, list(first_of.values()))
+        for r in stored_rows:
+            # verify が付けた処置予定の印（隔離予定など）は、正本になった行からは外す（verify の missing 復活と同じ）。
+            # unregistered のまま残る重複の行は印を残す
+            r.disposition = None
+        promoted = {id(r) for r in stored_rows}
         for i, (f, result, row, message) in enumerate(decisions):
             first = first_of[(row.filehash, row.hash_algo)] if row is not None else None
             if first is not None and id(first) not in promoted:
