@@ -439,3 +439,56 @@ def test_adopt_clears_quarantine_flag_on_rows_it_stores(make_config, tmp_path, f
         assert rows["x.jpg"].disposition == DISPOSITION_QUARANTINE  # 重複の方は印を残す
     finally:
         sess.close(); engine.dispose()
+
+
+def test_adopt_on_forgotten_trace_marks_pending_before_writing_id(make_config, tmp_path, fake_crawler, monkeypatch):
+    """forget の跡のフォルダへの adopt は、識別子を書く前に adopt 待ちにする（間で落ちても他のコマンドは断る）。"""
+    old = str(tmp_path / "arch")
+    os.makedirs(old)
+    src0 = str(tmp_path / "in0")
+    write_file(os.path.join(src0, "seed.jpg"), b"SEED")
+    fake_crawler(src0, str(tmp_path / "c0.db"))
+    assert main.run(make_config(archive_root=old, source_path=src0)) == main.EXIT_OK
+    sess, engine = _db(tmp_path)
+    try:
+        aid = sess.query(Archive).one().id
+    finally:
+        sess.close(); engine.dispose()
+    shutil.rmtree(old)
+    assert main.main(["archives", "--forget", str(aid), "--archive-db", archive_db_path(tmp_path)]) == main.EXIT_OK
+    write_file(os.path.join(old, "2020", "p.jpg"), b"PHOTO")
+
+    def _crash(*a, **k):
+        raise RuntimeError("crashed right after the archive folder was opened")
+
+    monkeypatch.setitem(main.RUNNERS, MODE_ADOPT, _crash)
+    assert main.run(make_config(mode=MODE_ADOPT, archive_root=old)) == main.EXIT_FATAL
+    monkeypatch.undo()
+    with pytest.raises(PreflightError, match="adopt"):
+        main.run(make_config(mode=MODE_REPORT, archive_root=old))
+    assert _adopt(make_config, old, tmp_path, fake_crawler) == main.EXIT_OK
+    assert ("2020/p.jpg", STATUS_STORED) in _rows(tmp_path)
+
+
+def test_adopt_on_returned_forgotten_archive_is_refused(make_config, tmp_path, fake_crawler):
+    """forget した保存フォルダがそのまま戻ってきた（識別子が一致）ときの adopt は断る（記録は戻るので verify）。"""
+    n = str(tmp_path / "nas")
+    os.makedirs(n)
+    src = str(tmp_path / "in")
+    write_file(os.path.join(src, "x.jpg"), b"XXXX")
+    fake_crawler(src, str(tmp_path / "c.db"))
+    assert main.run(make_config(archive_root=n, source_path=src)) == main.EXIT_OK
+    sess, engine = _db(tmp_path)
+    try:
+        nid = sess.query(Archive).one().id
+    finally:
+        sess.close(); engine.dispose()
+    unplugged = str(tmp_path / "unplugged")
+    shutil.move(n, unplugged)
+    assert main.main(["archives", "--forget", str(nid), "--archive-db", archive_db_path(tmp_path)]) == main.EXIT_OK
+    shutil.move(unplugged, n)
+    with pytest.raises(PreflightError, match="verify"):
+        _adopt(make_config, n, tmp_path, fake_crawler)
+    # 印を残さないので、そのまま通常のコマンドで使える（開けば forget した記録が戻る）
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=n)) == main.EXIT_OK
+    assert len(_rows(tmp_path, status=STATUS_STORED)) == 1

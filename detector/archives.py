@@ -462,6 +462,14 @@ def resolve_archive(session, archive_root: str, adopting: bool = False) -> Archi
             # 実体のパスに直す。登録上のパスが既に実体で、大文字小文字等の表記が違うだけなら書き換えない
             # （開くたびに揺れないように）
             row.root_abs = root
+        if adopting and session.get(PendingAdoption, row.id) is None:
+            # 識別子の書き込み・forget の片付け（_settle_forgotten）より前に adopt 待ちにする。間で落ちると、
+            # 次に開いたとき「戻ってきた保存フォルダ」として adopt 待ちでないまま通常のコマンドが通ってしまう。
+            # 複製の検出など断る判定の後に置く（断る保存フォルダに印を残さない）
+            # 識別子で戻ってきた保存フォルダでは、forget した記録もこのあと stored に戻るので記録として数える
+            _refuse_adopt_if_records(session, row, root, include_forgotten=returned)
+            session.add(PendingAdoption(archive_id=row.id))
+            session.commit()
         if not uid:
             _write_uid(root, row.uid)
         row.last_used_at = utcnow()
@@ -502,16 +510,28 @@ def _check_adoption_state(session, row: Archive, root: str, adopting: bool) -> N
             f"  Run adopt again: adopt {root}"
         )
     if adopting and not pending:
-        has_owning = (
-            session.query(ArchiveFile.id)
-            .filter(ArchiveFile.archive_id == row.id, ArchiveFile.status.in_(OWNING_STATUSES))
-            .first()
-            is not None
+        _refuse_adopt_if_records(session, row, root)
+
+
+def _refuse_adopt_if_records(
+    session, row: Archive, root: str, include_forgotten: bool = False
+) -> None:
+    """保存記録（stored / pending）がある保存フォルダへの adopt は断ります（実体の変化は verify）。
+
+    include_forgotten: forget した保存フォルダが識別子ごと戻ってきたとき。forget した記録は
+    _settle_forgotten が stored に戻すので記録として数える（数えないと adopt の行とぶつかる）。
+    """
+    statuses = (*OWNING_STATUSES, STATUS_FORGOTTEN) if include_forgotten else OWNING_STATUSES
+    has_owning = (
+        session.query(ArchiveFile.id)
+        .filter(ArchiveFile.archive_id == row.id, ArchiveFile.status.in_(statuses))
+        .first()
+        is not None
+    )
+    if has_owning:
+        raise PreflightError(
+            f"This archive folder already has records; use verify to check it: {root}"
         )
-        if has_owning:
-            raise PreflightError(
-                f"This archive folder already has records; use verify to check it: {root}"
-            )
 
 
 # --- v0.1.x → v0.2.0 移行 ---------------------------------------------------
