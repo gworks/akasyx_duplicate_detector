@@ -15,6 +15,7 @@ from config import OS_JUNK_FILES
 from database import META_DIRNAME, archive_id_path, legacy_db_path, meta_dir, tmp_dir
 from errors import PreflightError
 from models import (
+    MODE_ADOPT,
     OWNING_STATUSES,
     PATH_HOLDING_STATUSES,
     STATUS_FORGOTTEN,
@@ -494,7 +495,20 @@ def _check_records_match_content(session, row: Archive, root: str, adopting: boo
             is not None
         )
 
-    has_records = _exists(RECORD_STATUSES)
+    # adopt が unregistered にした行（別の保存フォルダ・この中の別のファイルに stored がある内容）も数える。
+    # その内容は重複判定に使える記録があるので、中身が全部他の保存フォルダの重複でも adopt の後は使える。
+    # verify が付けた unregistered（重複判定の対象外）は数えない
+    has_records = _exists(RECORD_STATUSES) or (
+        session.query(ArchiveFile.id)
+        .join(Ingest, ArchiveFile.ingest_id == Ingest.id)
+        .filter(
+            ArchiveFile.archive_id == row.id,
+            ArchiveFile.status == STATUS_UNREGISTERED,
+            Ingest.mode == MODE_ADOPT,
+        )
+        .first()
+        is not None
+    )
     # adopt を断るのは保存記録があるときだけ（missing だけなら、今の中身を登録してよい。forget の跡など）
     if adopting and _exists(OWNING_STATUSES):
         raise PreflightError(

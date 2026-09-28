@@ -116,8 +116,10 @@ def run_adopt(session, config, ingest) -> tuple[str, dict]:
 
         promoted = {id(r) for r in archives.promote_many(session, list(first_of.values()))}
         for i, (f, result, row, message) in enumerate(decisions):
-            if result == RESULT_ADOPTED and id(row) not in promoted:
-                # 同じ内容が別の保存フォルダに stored（全体で 1 つ — #6）
+            first = first_of[(row.filehash, row.hash_algo)] if row is not None else None
+            if first is not None and id(first) not in promoted:
+                # 組の最初も含めて、同じ内容が別の保存フォルダに stored（全体で 1 つ — #6）。
+                # 組の 2 つ目以降も、この中の unregistered ではなく本当の保存先を示す
                 decisions[i] = (f, RESULT_ARCHIVE_DUPLICATE, row, _elsewhere(session, row))
         session.flush()
 

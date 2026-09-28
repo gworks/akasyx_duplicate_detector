@@ -373,3 +373,25 @@ def test_adopt_uses_a_fresh_crawler_db(make_config, tmp_path, monkeypatch, photo
     assert main.run(cfg) == main.EXIT_OK
     assert seen and seen[0] != cfg.db_dir
     assert not os.path.exists(seen[0])  # 終わったら消す
+
+
+def test_folder_of_only_duplicates_elsewhere_is_usable_after_adopt(make_config, tmp_path, fake_crawler):
+    """中身がすべて別の保存フォルダの重複でも（adopt で stored が 1 件もできない）、adopt の後は使える。"""
+    a = str(tmp_path / "a")
+    os.makedirs(a)
+    src = str(tmp_path / "inbox")
+    write_file(os.path.join(src, "a.jpg"), b"AAAA")
+    fake_crawler(src, str(tmp_path / "c.db"))
+    assert main.run(make_config(archive_root=a, source_path=src)) == main.EXIT_OK
+    b = str(tmp_path / "b")
+    write_file(os.path.join(b, "x", "a.jpg"), b"AAAA")
+    write_file(os.path.join(b, "y", "a2.jpg"), b"AAAA")
+    assert _adopt(make_config, b, tmp_path, fake_crawler) == main.EXIT_OK
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=b)) == main.EXIT_OK
+    sess, engine = _db(tmp_path)
+    try:
+        # 組の最初（x/a.jpg）も別の保存フォルダの重複なので、2 つ目の説明は本当の保存先（a）を指す
+        item = sess.query(IngestItem).filter_by(name="a2.jpg").one()
+        assert a in item.message
+    finally:
+        sess.close(); engine.dispose()
