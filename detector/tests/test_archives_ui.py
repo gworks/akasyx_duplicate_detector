@@ -114,17 +114,19 @@ def test_adopt_hint_names_the_folder(make_config, tmp_path, fake_crawler, capsys
     assert hints == [os.path.realpath(root)]
 
 
-def test_adopt_hint_is_not_offered_for_folder_of_another_master_db(tmp_path, capsys):
+def test_adopt_hint_is_not_offered_for_folder_of_another_master_db(tmp_path, fake_crawler, capsys):
     """識別子のある（別の正本 DB で使っていたかもしれない）フォルダの断りでは、adopt の導線を出さない。
     正しい対処は --archive-db の指定で、adopt すると同じ保存フォルダが 2 つの正本 DB に登録される。"""
     root, src = _dirs(tmp_path, "photos", "in")
     write_file(os.path.join(root, ".akasyx", "archive.id"), b"0123456789abcdef0123456789abcdef\n")
     write_file(os.path.join(root, "old.jpg"), b"OLD")
     write_file(os.path.join(src, "new.jpg"), b"NEW")
+    fake_crawler(src, str(tmp_path / "crawl.db"))  # 開発機の本物の crawler に頼らない（CI には無い）
     capsys.readouterr()
     argv = [
         "add", root, src, "--archive-db", archive_db_path(tmp_path),
         "--db-dir", str(tmp_path / "dbs"), "--log-dir", str(tmp_path / "log"),
+        "--crawler-repo", str(tmp_path / "no_crawler"),
     ]
     assert main.main(argv) == main.EXIT_REJECTED
     err = capsys.readouterr().err
