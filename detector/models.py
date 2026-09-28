@@ -26,6 +26,7 @@ MODE_ADD = "add"
 MODE_VERIFY = "verify"
 MODE_DELETE_DUPLICATES = "delete-duplicates"
 MODE_REPORT = "report"
+MODE_ADOPT = "adopt"  # 中身のある保存フォルダを実体から登録する（#4 / #5）
 MODE_ARCHIVES = "archives"  # 登録済みの保存フォルダ一覧（DB 全体を見る。保存フォルダ指定なし）
 
 # --- ar_archive_files.status -------------------------------------------------
@@ -59,6 +60,7 @@ RESULT_SKIPPED_NOHASH = "skipped_nohash"      # add: ハッシュが無く判定
 RESULT_SKIPPED_OWN_DATA = "skipped_own_data"  # add: detector 自身のデータ（投入元の中にあった）
 RESULT_SKIPPED_IN_ARCHIVE = "skipped_in_archive"  # add: 実体が保存フォルダの中（シンボリックリンクを辿った先）
 RESULT_FAILED = "failed"                      # add / 復旧: 処理に失敗した
+RESULT_ADOPTED = "adopted"                    # adopt: 実体を stored として登録した
 RESULT_ARCHIVE_DUPLICATE = "archive_duplicate"  # verify: 保存フォルダ内の重複
 RESULT_HASH_MISMATCH = "hash_mismatch"        # verify: DB と実体のハッシュが違う
 RESULT_RELOCATED = "relocated"                # verify: 場所が変わっていた
@@ -222,3 +224,18 @@ class LegacyImport(Base):
     archive_id: Mapped[int] = mapped_column(ForeignKey("ar_archives.id"), unique=True)
     legacy_path: Mapped[str] = mapped_column(Text)
     imported_at: Mapped[datetime] = mapped_column(TIMESTAMP, default=utcnow)
+
+
+class PendingAdoption(Base):
+    """ar_pending_adoptions — adopt 待ちの保存フォルダ（#4 / #5、2026-09-28）。
+
+    adopt が新しく登録した（中身のあるフォルダ・正本 DB を失った保存フォルダ）か、adopt を始めた保存フォルダに
+    付け、adopt が全件を登録するのと同じトランザクションで外す。印が残っている保存フォルダ（adopt が途中で
+    落ちた）は adopt 以外のコマンドで断る。既存の保存フォルダには行が無い（＝使ってよい）ので、この表を
+    足しても既存の正本 DB の動きは変わらない（create_all が表を作る）。
+    """
+
+    __tablename__ = "ar_pending_adoptions"
+
+    archive_id: Mapped[int] = mapped_column(ForeignKey("ar_archives.id"), primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(TIMESTAMP, default=utcnow)

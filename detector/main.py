@@ -4,6 +4,7 @@ import os
 import sys
 from datetime import datetime, timezone
 
+import adopt
 import archives
 import config as config_module
 import crawler_client
@@ -17,6 +18,7 @@ from database import META_DIRNAME, archive_lock, get_session, legacy_db_path, ma
 from errors import DetectorError, PreflightError
 from models import (
     MODE_ADD,
+    MODE_ADOPT,
     MODE_ARCHIVES,
     MODE_DELETE_DUPLICATES,
     MODE_REPORT,
@@ -42,6 +44,7 @@ EXIT_REJECTED = 3
 
 RUNNERS = {
     MODE_ADD: ingest_module.run_add,
+    MODE_ADOPT: adopt.run_adopt,
     MODE_VERIFY: verify.run_verify,
     MODE_DELETE_DUPLICATES: dedupe.run_delete_duplicates,
     MODE_REPORT: report.run_report,
@@ -141,7 +144,7 @@ def preflight(config: DetectorConfig) -> None:
                 )
             crawler_client.check_crawler(config)
 
-    if config.mode == MODE_VERIFY:
+    if config.mode in (MODE_VERIFY, MODE_ADOPT):
         crawler_client.check_crawler(config)
 
     if config.mode == MODE_DELETE_DUPLICATES and config.trash_dir:
@@ -194,7 +197,8 @@ def _apply_counters(record: Ingest, counters: dict) -> None:
         + counters.get(RESULT_SKIPPED_OWN_DATA, 0)
         + counters.get(RESULT_SKIPPED_IN_ARCHIVE, 0)
     )
-    record.failed = counters.get(RESULT_FAILED, 0) + counters.get("failed", 0)
+    # RESULT_FAILED と delete-duplicates の "failed" は同じ文字列。2 回足すと件数が倍になる
+    record.failed = counters.get(RESULT_FAILED, 0)
     record.stats_json = json_dumps(counters)
 
 
@@ -239,7 +243,9 @@ def run(config: DetectorConfig) -> int:
     with master_db_lock(config.archive_db), archive_lock(config.archive_root):
         session, _engine = get_session(config.archive_db)
         try:
-            archive = archives.resolve_archive(session, config.archive_root)
+            archive = archives.resolve_archive(
+                session, config.archive_root, adopting=config.mode == MODE_ADOPT
+            )
             config.archive_id = archive.id
 
             # 前回の中断分を先に片付ける（どのサブコマンドでも実施 — 設計書 §7.4）

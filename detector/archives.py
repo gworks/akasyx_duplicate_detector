@@ -5,6 +5,7 @@
 import logging
 import os
 import sqlite3
+import stat
 import uuid
 from datetime import datetime
 
@@ -14,6 +15,9 @@ from config import OS_JUNK_FILES
 from database import META_DIRNAME, archive_id_path, legacy_db_path, meta_dir, tmp_dir
 from errors import PreflightError
 from models import (
+    STATUS_FAILED,
+    STATUS_PENDING,
+    OWNING_STATUSES,
     PATH_HOLDING_STATUSES,
     STATUS_FORGOTTEN,
     STATUS_UNREGISTERED,
@@ -25,6 +29,7 @@ from models import (
     Ingest,
     IngestItem,
     LegacyImport,
+    PendingAdoption,
     utcnow,
 )
 
@@ -54,9 +59,15 @@ def _write_uid(archive_root: str, uid: str) -> None:
         f.write(uid + "\n")
 
 
-def _has_stored_content(root: str) -> bool:
-    """保存フォルダに実ファイルがあるか（.akasyx/ と OS のゴミファイルは数えない）。
+CRAWLER_DEFAULT_IGNORED_DIR = ".git"
 
+
+def _has_stored_content(root: str) -> bool:
+    """保存フォルダに、adopt が登録する実ファイルがあるか（#4 / #5）。
+
+    adopt と同じ条件で数える: `.akasyx/`・`.git/`（crawler の既定除外）・OS のゴミファイル・シンボリックリンク（crawler は既定で辿らない）・
+    0 バイトのファイル（min_size 未満。add でも取り込まない）は数えない。条件がずれると、adopt が何も登録しない
+    フォルダを「中身あり」として断り続けたり、逆に登録すべきファイルを見逃したりする。
     読めない配下があれば「空」とは言えないので断る（os.walk は既定で黙って飛ばす）。
     """
 
@@ -64,10 +75,19 @@ def _has_stored_content(root: str) -> bool:
         raise PreflightError(f"Cannot read part of the archive folder: {e.filename}: {e}") from e
 
     for dirpath, dirs, names in os.walk(root, onerror=_unreadable):
-        if dirpath == root:
-            dirs[:] = [d for d in dirs if d != META_DIRNAME]
-        if any(n not in OS_JUNK_FILES for n in names):
-            return True
+        # adopt・verify は crawler に --exclude .akasyx/ を渡す（gitignore の書き方なのでどの深さでも効く）。
+        # .git/ は crawler の組み込みの既定除外（akasyx_crawler ignore.DEFAULT_IGNORE_PATTERNS、どの深さでも）。
+        # detector は --gitignore-mode off で呼ぶので、これ以外に crawler が黙って飛ばすものは無い
+        dirs[:] = [d for d in dirs if d not in (META_DIRNAME, CRAWLER_DEFAULT_IGNORED_DIR)]
+        for n in names:
+            if n in OS_JUNK_FILES:
+                continue
+            try:
+                st = os.lstat(os.path.join(dirpath, n))
+            except OSError as e:
+                _unreadable(e)
+            if stat.S_ISREG(st.st_mode) and st.st_size > 0:
+                return True
     return False
 
 
@@ -269,6 +289,36 @@ def promote_many(session, rows) -> list:
     return promoted
 
 
+def check_tree_readable(root: str) -> None:
+    """root の配下がすべて読めることを確かめます（adopt の走査の前 — #4 / #5）。
+
+    crawler は読めないフォルダを警告だけ出して飛ばし、走査を completed で終える。adopt がそれを
+    知らずに確定すると一部だけ登録され、記録があるので adopt をやり直せず、登録し損ねた内容と同じ
+    ファイルをあとの add が取り込んでしまう。読めない場所があれば 1 件も登録する前に断る。
+    """
+    problems: list[str] = []
+
+    def _unreadable(e: OSError):
+        problems.append(f"{e.filename}: {e.strerror or e}")
+
+    for dirpath, dirs, names in os.walk(root, onerror=_unreadable):
+        dirs[:] = [d for d in dirs if d not in (META_DIRNAME, CRAWLER_DEFAULT_IGNORED_DIR)]
+        for n in names:
+            try:
+                os.lstat(os.path.join(dirpath, n))
+            except OSError as e:
+                _unreadable(e)
+        if len(problems) >= 5:
+            break
+    if problems:
+        listed = "\n".join(f"  {p}" for p in problems)
+        raise PreflightError(
+            "Part of the archive folder cannot be read, so adopt did not register anything:\n"
+            f"{listed}\n"
+            "  Fix the permissions (or remove these) and run adopt again."
+        )
+
+
 def is_at_registered_location(row: Archive) -> bool:
     """登録上の場所に、この保存フォルダ（同じ uid）が今あるか。
 
@@ -314,7 +364,7 @@ def check_new_archive_placement(root: str) -> None:
         )
 
 
-def resolve_archive(session, archive_root: str) -> Archive:
+def resolve_archive(session, archive_root: str, adopting: bool = False) -> Archive:
     """保存フォルダに対応する ar_archives 行を返します（無ければ登録）。
 
     1. `.akasyx/archive.id` があれば uid で探す。見つかれば、パスが変わっていれば更新する
@@ -334,7 +384,6 @@ def resolve_archive(session, archive_root: str) -> Archive:
     # 登録には実体のパスを記録する（シンボリックリンク等の一時的な別名を記録すると、別名が消えたあとに
     # 場所で見つけられなくなる）。新規登録・移動・別表記のどの分岐でもこの形を使う
     root = os.path.realpath(archive_root)
-    os.makedirs(tmp_dir(root), exist_ok=True)
     uid = read_uid(root)
 
     row = None
@@ -347,26 +396,63 @@ def resolve_archive(session, archive_root: str) -> Archive:
         if row is not None and uid and row.uid != uid:
             row = None  # 同じ場所に別の保存フォルダが置かれた。パス一致では同一視しない
 
-    if row is None and uid and _has_stored_content(root):
+    if adopting and _legacy_will_import(session, row, root):
+        # v0.1.x の保存フォルダは開けば移行で記録ができるので adopt は要らない。登録や adopt 待ちの印を作る前に
+        # 断る（先に印を付けると、移行した行と adopt の行がパスの一意索引でぶつかって adopt が毎回落ち、印が残る）
         raise PreflightError(
-            "This archive folder is not registered in the master DB, but it already contains files:\n"
-            f"  archive folder: {root} (ID {uid})\n"
-            "  It may have been used with a different master DB (e.g. development vs. packaged app,\n"
-            "  another computer). Using it as a new archive could store duplicates of files\n"
-            "  already in it. Specify the master DB it was used with via --archive-db."
+            "This is a v0.1.x archive folder (it has .akasyx/archive.db); adopt is not needed.\n"
+            f"  Open it with another command (e.g. verify) to migrate its records: {root}"
         )
-    if row is None and uid:
-        logger.warning(f"ID {uid} is not in the DB; the archive folder is empty, registering it as new")
     if row is None:
         # 新しく登録する保存フォルダの中に別の保存フォルダがあれば断る（#6）。中の保存物を verify が
         # 未登録として拾い、同じ実体を 2 つの保存フォルダが持つことになる。歩くのは初回の登録時だけ
         check_new_archive_placement(root)
+        # v0.1.x の DB がある保存フォルダは、このあと移行（import_legacy_db）で記録ができるので断らない
+        if not adopting and not os.path.isfile(legacy_db_path(root)) and _has_stored_content(root):
+            # 中身があるのに記録が無いまま登録すると、中にある内容と同じファイルまで取り込んで重複を作る（#4 / #5）。
+            # 識別子を書く前に断る（断るだけの実行で利用者のフォルダに登録の跡を残さない）
+            if uid:
+                raise PreflightError(
+                    "This archive folder is not registered in the master DB, but it already contains files:\n"
+                    f"  archive folder: {root} (ID {uid})\n"
+                    "  It may have been used with a different master DB (e.g. development vs. packaged app,\n"
+                    "  another computer). Specify the master DB it was used with via --archive-db.\n"
+                    f"  If that master DB is lost, register the files in it again: adopt {root}"
+                )
+            raise PreflightError(
+                "This folder already contains files, but has no records in the master DB:\n"
+                f"  folder: {root}\n"
+                "  Using it as is could store duplicates of files already in it.\n"
+                f"  Register the files in it first: adopt {root}"
+            )
+        if uid:
+            state = "registering the files in it (adopt)" if adopting else "the archive folder is empty"
+            logger.warning(f"ID {uid} is not in the DB; {state}; registering it with this ID")
         row = Archive(uid=uid or uuid.uuid4().hex, root_abs=root, last_used_at=utcnow())
         session.add(row)
+        if adopting:
+            # 登録と同じコミットで adopt 待ちにする（この後 adopt が落ちても、他のコマンドは断る）
+            session.flush()
+            session.add(PendingAdoption(archive_id=row.id))
         session.commit()
         _write_uid(root, row.uid)
         logger.info(f"Registered archive folder: #{row.id} {root}")
     else:
+        if (
+            not returned
+            and not adopting
+            and _has_forgotten(session, row)
+            # v0.1.x の保存フォルダで、このあと移行（import_legacy_db）が本当に記録を作るときは断らない（新規登録と同じ）
+            and not _legacy_will_import(session, row, root)
+            and _has_stored_content(root)
+        ):
+            # forget した保存フォルダの跡（同じ場所）に、識別子の無い別のフォルダが置かれた。forget した記録は
+            # この中身と無関係なので（_settle_forgotten が missing にする）、記録が無いのと同じ。識別子を書く前に断る
+            raise PreflightError(
+                "This folder is where a forgotten archive folder was, and it contains files that have no records:\n"
+                f"  folder: {root}\n"
+                f"  Register the files in it first: adopt {root}"
+            )
         moved = row.root_abs != root and not _same_location(row.root_abs, root)
         if moved and _is_live_copy_source(row, root):
             raise PreflightError(
@@ -384,17 +470,98 @@ def resolve_archive(session, archive_root: str) -> Archive:
             # 実体のパスに直す。登録上のパスが既に実体で、大文字小文字等の表記が違うだけなら書き換えない
             # （開くたびに揺れないように）
             row.root_abs = root
+        if adopting and session.get(PendingAdoption, row.id) is None:
+            # 識別子の書き込み・forget の片付け（_settle_forgotten）より前に adopt 待ちにする。間で落ちると、
+            # 次に開いたとき「戻ってきた保存フォルダ」として adopt 待ちでないまま通常のコマンドが通ってしまう。
+            # 複製の検出など断る判定の後に置く（断る保存フォルダに印を残さない）
+            # 識別子で戻ってきた保存フォルダでは、forget した記録もこのあと stored に戻るので記録として数える。
+            # forget した跡（場所の一致だけ）では、残っている pending（add の中断の残り）は置かれたフォルダの
+            # 中身と関係が無いので数えない（_settle_forgotten が failed にする）
+            trace = not returned and _has_forgotten(session, row)
+            _refuse_adopt_if_records(
+                session, row, root, include_forgotten=returned, include_pending=not trace
+            )
+            session.add(PendingAdoption(archive_id=row.id))
+            session.commit()
+        # forget した記録の片付けは識別子を書く前に行う。識別子を書いた後に落ちると、次に開いたとき
+        # 識別子で見つかって「戻ってきた保存フォルダ」と取り違え、跡の forget した記録を stored に戻してしまう
+        _settle_forgotten(session, row, returned)
         if not uid:
             _write_uid(root, row.uid)
         row.last_used_at = utcnow()
         session.commit()
 
-    _settle_forgotten(session, row, returned)
     # v0.1.x の DB が保存フォルダに残っていれば取り込む（登録済みかどうかに関係なく）
     migrated = import_legacy_db(session, row, legacy_db_path(root))
     if migrated:
         logger.info(f"Imported from legacy DB: {migrated}")
+    _check_adoption_state(session, row, root, adopting)
+    os.makedirs(tmp_dir(root), exist_ok=True)
     return row
+
+
+def _legacy_will_import(session, row: Archive | None, root: str) -> bool:
+    """このあと import_legacy_db が v0.1.x の DB から記録を作るか。
+
+    取り込み済みの印（ar_legacy_imports、保存フォルダごとに 1 つ）がある登録では、旧 DB があっても
+    改名されるだけで取り込まれない（forget した移行済みの保存フォルダの跡に、別の v0.1.x を置いた場合など）。
+    """
+    if not os.path.isfile(legacy_db_path(root)):
+        return False
+    if row is None:
+        return True
+    return session.query(LegacyImport).filter_by(archive_id=row.id).first() is None
+
+
+def _has_forgotten(session, row: Archive) -> bool:
+    return (
+        session.query(ArchiveFile.id)
+        .filter(ArchiveFile.archive_id == row.id, ArchiveFile.status == STATUS_FORGOTTEN)
+        .first()
+        is not None
+    )
+
+
+def _check_adoption_state(session, row: Archive, root: str, adopting: bool) -> None:
+    """adopt 待ちの保存フォルダは adopt 以外で使わせません。adopt は保存記録があれば断ります（#4 / #5）。
+
+    「中身があるのに記録が無い」を記録の状態（stored / missing / unregistered …）から推し量る判定は、
+    verify・forget・別の保存フォルダの変化で状態が書き換わるたびにずれたのでやめ、adopt 待ちの印
+    （ar_pending_adoptions）で決める（2026-09-28 決定）。新しく登録するフォルダに中身があるときは
+    resolve_archive が識別子を書く前に断る。印が外れた後に手で入れたファイルは、従来どおり verify が扱う。
+    """
+    pending = session.get(PendingAdoption, row.id) is not None
+    if not adopting and pending:
+        raise PreflightError(
+            "The files in this archive folder have not been registered yet (adopt did not finish):\n"
+            f"  archive folder: {root}\n"
+            f"  Run adopt again: adopt {root}"
+        )
+    if adopting and not pending:
+        _refuse_adopt_if_records(session, row, root)
+
+
+def _refuse_adopt_if_records(
+    session, row: Archive, root: str, include_forgotten: bool = False, include_pending: bool = True
+) -> None:
+    """保存記録（stored / pending）がある保存フォルダへの adopt は断ります（実体の変化は verify）。
+
+    include_forgotten: forget した保存フォルダが識別子ごと戻ってきたとき。forget した記録は
+    _settle_forgotten が stored に戻すので記録として数える（数えないと adopt の行とぶつかる）。
+    """
+    statuses = [s for s in OWNING_STATUSES if include_pending or s != STATUS_PENDING]
+    if include_forgotten:
+        statuses.append(STATUS_FORGOTTEN)
+    has_owning = (
+        session.query(ArchiveFile.id)
+        .filter(ArchiveFile.archive_id == row.id, ArchiveFile.status.in_(statuses))
+        .first()
+        is not None
+    )
+    if has_owning:
+        raise PreflightError(
+            f"This archive folder already has records; use verify to check it: {root}"
+        )
 
 
 # --- v0.1.x → v0.2.0 移行 ---------------------------------------------------
@@ -420,8 +587,10 @@ def import_legacy_db(session, archive: Archive, legacy_path: str) -> dict | None
     done = session.query(LegacyImport).filter_by(archive_id=archive.id).first()
     if done is not None:
         logger.warning(
-            f"The v0.1.x DB was already imported at {done.imported_at}; "
-            f"retrying only the rename: {legacy_path}"
+            f"A v0.1.x DB was already imported into this archive folder at {done.imported_at}; "
+            f"not importing again, only renaming: {legacy_path} "
+            "(if this is a different v0.1.x DB, e.g. placed where a forgotten archive folder was, "
+            "its history is not imported; its files are registered by adopt)"
         )
         _rename_legacy(legacy_path, checkpointed)
         return None
@@ -575,6 +744,13 @@ def _settle_forgotten(session, row: Archive, returned: bool) -> None:
     for f, _ in rows:
         if f.status == STATUS_FORGOTTEN:
             f.status = STATUS_MISSING
+    if not returned:
+        # 跡に置かれた別のフォルダには、forget した保存フォルダの中断した予約（pending）の実体は無い。
+        # 復旧（recover_pending）に回すと、同じパスの別のファイルを予約の完了と取り違えうるので failed にする
+        for f in session.query(ArchiveFile).filter(
+            ArchiveFile.archive_id == row.id, ArchiveFile.status == STATUS_PENDING
+        ):
+            f.status = STATUS_FAILED
     session.commit()
     logger.info(
         f"Archive folder #{row.id} was forgotten: restored {len(restored)} of {len(rows)} records"
@@ -608,6 +784,12 @@ def forget_archive(session, archive_id: int) -> int:
         .filter(ArchiveFile.archive_id == archive_id, ArchiveFile.status == STATUS_STORED)
         .all()
     )
+    if not rows:
+        # stored が無い保存フォルダは重複判定を塞がない（別の保存フォルダの pending は持ち主にしない）ので、
+        # 外すものが無い。forgotten の行ができない forget 済みの状態を作らないためにも断る
+        raise PreflightError(
+            f"Archive folder #{archive_id} has no stored records; there is nothing to forget: {row.root_abs}"
+        )
     for f in rows:
         # 消したのではなく外れていただけなら、開き直したときに戻す（_settle_forgotten）
         f.status = STATUS_FORGOTTEN
