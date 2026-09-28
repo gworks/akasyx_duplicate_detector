@@ -399,3 +399,20 @@ def test_folder_of_only_duplicates_elsewhere_is_usable_after_adopt(make_config, 
         assert a in item.message
     finally:
         sess.close(); engine.dispose()
+
+
+def test_adopt_on_unregistered_legacy_folder_is_refused_before_registering(make_config, tmp_path, fake_crawler):
+    """v0.1.x の DB が残る未登録フォルダへの adopt は、登録も adopt 待ちの印も作らずに断る（開けば移行される）。"""
+    from test_archives import _make_legacy_db
+    from database import legacy_db_path
+    root = str(tmp_path / "legacy")
+    write_file(os.path.join(root, "inbox", "a.txt"), b"abc")
+    _make_legacy_db(legacy_db_path(root), root)
+    with pytest.raises(PreflightError, match="v0.1"):
+        _adopt(make_config, root, tmp_path, fake_crawler)
+    sess, engine = _db(tmp_path)
+    try:
+        assert sess.query(Archive).count() == 0
+    finally:
+        sess.close(); engine.dispose()
+    assert main.run(make_config(mode=MODE_REPORT, archive_root=root)) == main.EXIT_OK  # 移行して使える

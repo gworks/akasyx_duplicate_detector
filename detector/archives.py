@@ -382,6 +382,14 @@ def resolve_archive(session, archive_root: str, adopting: bool = False) -> Archi
     # 登録には実体のパスを記録する（シンボリックリンク等の一時的な別名を記録すると、別名が消えたあとに
     # 場所で見つけられなくなる）。新規登録・移動・別表記のどの分岐でもこの形を使う
     root = os.path.realpath(archive_root)
+    if adopting and os.path.isfile(legacy_db_path(root)):
+        # v0.1.x の保存フォルダは開けば移行（import_legacy_db）で記録ができるので adopt は要らない。
+        # 登録や adopt 待ちの印を作る前に断る（先に印を付けると、移行した行と adopt の行がパスの一意索引で
+        # ぶつかって adopt が毎回落ち、印が残ってどのコマンドも使えなくなる）
+        raise PreflightError(
+            "This is a v0.1.x archive folder (it has .akasyx/archive.db); adopt is not needed.\n"
+            f"  Open it with another command (e.g. verify) to migrate its records: {root}"
+        )
     uid = read_uid(root)
 
     row = None
