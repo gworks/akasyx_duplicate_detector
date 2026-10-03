@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from models import (
+    MODE_ADOPT,
     MODE_ADD,
     MODE_ARCHIVES,
     MODE_DELETE_DUPLICATES,
@@ -183,6 +184,12 @@ class DetectorConfig:
     ingest_id: int | None = None
     trash_dir: str | None = None
     assume_yes: bool = False
+    # archives --forget: 登録を外す保存フォルダの ID（#6）
+    forget_id: int | None = None
+    # archives --forget --expect-uid: 外す保存フォルダの uid がこれと違えば断る（UI が一覧で見たものだけを外す。#11）
+    expect_uid: str | None = None
+    # archives --json: 一覧を JSON で stdout に出す（UI が読む。#11）
+    list_json: bool = False
 
 
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -268,6 +275,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_args(p_ver)
 
+    # --- adopt -----------------------------------------------------------------
+    p_adp = sub.add_parser(
+        MODE_ADOPT,
+        help="register the files already in an archive folder (a folder with content and no records, "
+        "or one whose master DB was lost)",
+    )
+    p_adp.add_argument("archive_root", help="archive folder")
+    _add_common_args(p_adp)
+
     # --- delete-duplicates ---------------------------------------------------
     p_del = sub.add_parser(
         MODE_DELETE_DUPLICATES, help="delete (with verification) duplicates that add left in the source"
@@ -304,6 +320,26 @@ def build_parser() -> argparse.ArgumentParser:
         MODE_ARCHIVES, help="list archive folders registered in the master DB"
     )
     _add_common_args(p_arc)
+    p_arc.add_argument(
+        "--forget",
+        type=int,
+        metavar="ID",
+        dest="forget_id",
+        help="stop using the records of a deleted archive folder for duplicate detection "
+        "(refused if the folder is present)",
+    )
+    p_arc.add_argument(
+        "--expect-uid",
+        metavar="UID",
+        dest="expect_uid",
+        help="with --forget: refuse unless the archive folder has this uid (used by the UI)",
+    )
+    p_arc.add_argument(
+        "--json",
+        action="store_true",
+        dest="list_json",
+        help="print the list as JSON on stdout (for the UI)",
+    )
 
     return parser
 
@@ -349,6 +385,9 @@ def parse_arguments(argv: list[str] | None = None) -> DetectorConfig:
             else None
         ),
         assume_yes=getattr(args, "yes", False),
+        forget_id=getattr(args, "forget_id", None),
+        list_json=getattr(args, "list_json", False),
+        expect_uid=getattr(args, "expect_uid", None),
     )
 
 

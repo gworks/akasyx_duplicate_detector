@@ -26,7 +26,7 @@ def run_report(session, config, ingest) -> tuple[str, dict]:
     for status in sorted(stats):
         bucket = stats[status]
         lines.append(
-            f"  {status:<13} {bucket['count']:>6} files  {format_size(bucket['size'])}"
+            f"  {status:<16} {bucket['count']:>6} files  {format_size(bucket['size'])}"
         )
 
     dispositions = (

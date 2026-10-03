@@ -26,6 +26,7 @@ MODE_ADD = "add"
 MODE_VERIFY = "verify"
 MODE_DELETE_DUPLICATES = "delete-duplicates"
 MODE_REPORT = "report"
+MODE_ADOPT = "adopt"  # 中身のある保存フォルダを実体から登録する（#4 / #5）
 MODE_ARCHIVES = "archives"  # 登録済みの保存フォルダ一覧（DB 全体を見る。保存フォルダ指定なし）
 
 # --- ar_archive_files.status -------------------------------------------------
@@ -35,6 +36,7 @@ STATUS_MISSING = "missing"            # DB にはあるが実体が無い（削�
 STATUS_UNREGISTERED = "unregistered"  # 実体はあるが DB に無かった（verify が事後登録）
 STATUS_QUARANTINED = "quarantined"    # 隔離フォルダへ移動済み（将来拡張）
 STATUS_FAILED = "failed"              # 復旧で判断がつかなかった（人の確認待ち）
+STATUS_FORGOTTEN = "forgotten"        # archives --forget で外した stored（#6）。同じ保存フォルダが戻れば stored に戻す
 
 # 内容を「保持している」状態。重複判定と部分 UNIQUE 索引の対象（設計書 §8）。
 # missing / unregistered を外すことで、消えたファイルと同内容のものを後から再登録できる。
@@ -56,7 +58,9 @@ RESULT_DUPLICATE = "duplicate"                # add: 内容重複のため投入
 RESULT_SKIPPED_EMPTY = "skipped_empty"        # add: 0 バイト（min_size 未満）
 RESULT_SKIPPED_NOHASH = "skipped_nohash"      # add: ハッシュが無く判定不能
 RESULT_SKIPPED_OWN_DATA = "skipped_own_data"  # add: detector 自身のデータ（投入元の中にあった）
+RESULT_SKIPPED_IN_ARCHIVE = "skipped_in_archive"  # add: 実体が保存フォルダの中（シンボリックリンクを辿った先）
 RESULT_FAILED = "failed"                      # add / 復旧: 処理に失敗した
+RESULT_ADOPTED = "adopted"                    # adopt: 実体を stored として登録した
 RESULT_ARCHIVE_DUPLICATE = "archive_duplicate"  # verify: 保存フォルダ内の重複
 RESULT_HASH_MISMATCH = "hash_mismatch"        # verify: DB と実体のハッシュが違う
 RESULT_RELOCATED = "relocated"                # verify: 場所が変わっていた
@@ -220,3 +224,18 @@ class LegacyImport(Base):
     archive_id: Mapped[int] = mapped_column(ForeignKey("ar_archives.id"), unique=True)
     legacy_path: Mapped[str] = mapped_column(Text)
     imported_at: Mapped[datetime] = mapped_column(TIMESTAMP, default=utcnow)
+
+
+class PendingAdoption(Base):
+    """ar_pending_adoptions — adopt 待ちの保存フォルダ（#4 / #5、2026-09-28）。
+
+    adopt が新しく登録した（中身のあるフォルダ・正本 DB を失った保存フォルダ）か、adopt を始めた保存フォルダに
+    付け、adopt が全件を登録するのと同じトランザクションで外す。印が残っている保存フォルダ（adopt が途中で
+    落ちた）は adopt 以外のコマンドで断る。既存の保存フォルダには行が無い（＝使ってよい）ので、この表を
+    足しても既存の正本 DB の動きは変わらない（create_all が表を作る）。
+    """
+
+    __tablename__ = "ar_pending_adoptions"
+
+    archive_id: Mapped[int] = mapped_column(ForeignKey("ar_archives.id"), primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(TIMESTAMP, default=utcnow)

@@ -106,8 +106,15 @@ rm -f "$ZIP"
 TMPD="$(mktemp -d)"
 ditto "$OUT" "$TMPD/akasyx-duplicate-detector"
 rm -f "$TMPD/akasyx-duplicate-detector/$MARKER"
-ditto -c -k --keepParent "$TMPD/akasyx-duplicate-detector" "$ZIP"
+# 拡張属性・リソースフォークは zip に入れない。入れると ditto は「._名前」の AppleDouble を本体と並べて格納し、
+# Finder（アーカイブユーティリティ）で展開したとき、シンボリックリンクの分は属性に戻せず ._ ファイルとして残る。
+# それが .framework の直下に入ると署名の封印が崩れ、Gatekeeper が「壊れている」と拒否する（2026-09-27 に実機で発生）
+ditto -c -k --norsrc --noextattr --noacl --keepParent "$TMPD/akasyx-duplicate-detector" "$ZIP"
 rm -rf "$TMPD"
+# 検査: zip に AppleDouble（._*）や __MACOSX が入っていないこと
+if unzip -Z1 "$ZIP" | grep -qE '(^|/)(\._|__MACOSX/)'; then
+  die "zip に ._ / __MACOSX が入っています（Finder で展開すると署名が壊れます）"
+fi
 
 echo
 du -sh "$OUT/$APP_NAME.app" "$ZIP"

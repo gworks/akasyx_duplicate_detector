@@ -40,4 +40,4 @@ archive folder contains a small hidden ".akasyx" folder, which you can delete
 if you no longer use it as an archive.
 
 Third-party software notices: THIRD_PARTY_LICENSES.txt
-© at-first OÜ (akasyx)
+© 2026 Tadayuki Kusakabe (akasyx)

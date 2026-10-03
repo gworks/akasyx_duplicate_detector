@@ -5,7 +5,7 @@
 // 引数の組み立てをメインプロセスに閉じ込めることで、画面に出すコマンドプレビューと
 // 実際に実行するコマンドが食い違わないことを保証する。
 
-const MODES = ['add', 'verify', 'delete-duplicates', 'report'];
+const MODES = ['add', 'verify', 'adopt', 'delete-duplicates', 'report', 'archives'];
 
 const QUARANTINE_KINDS = [
   'missing',
@@ -55,6 +55,18 @@ function normalizePath(value, platform = process.platform) {
   return p;
 }
 
+/**
+ * detector が出力した実パスを、パス欄に入れる値にします（normalizePath を通すと元に戻る）。
+ * POSIX では normalizePath がバックスラッシュのエスケープを解き、全体を囲む引用符を外すので、それを打ち消す。
+ */
+function toFieldValue(p, platform = process.platform) {
+  let v = String(p ?? '');
+  if (platform === 'win32' || isWindowsPath(v)) return v;
+  v = v.replace(/\\/g, '\\\\');
+  if (v[0] === "'" || v[0] === '"') v = `\\${v}`;
+  return v;
+}
+
 /** ドライブ指定（`C:\` `C:/`）か UNC（`\\server`）で始まる Windows のパスか。 */
 function isWindowsPath(p) {
   return /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('\\\\');
@@ -65,6 +77,13 @@ function buildArgs(form) {
   const mode = trimmed(form && form.mode);
   if (!MODES.includes(mode)) {
     throw new FormError('err_unknown_command', { mode: mode || '-' });
+  }
+
+  // archives（登録済みの保存フォルダの一覧・登録を外す）は保存フォルダを指定しない（#11）
+  if (mode === 'archives') {
+    // 一覧を読んだ正本 DB（forgetArchiveDb）を使うときは、入力欄の値は使わない
+    const common = form.forgetArchiveDb ? { ...form, archiveDb: '' } : form;
+    return pushCommonArgs(buildArchivesArgs(form), common);
   }
 
   const archiveRoot = normalizePath(form.archiveRoot);
@@ -127,7 +146,34 @@ function buildArgs(form) {
     pushIngestId(args, form.ingestId);
   }
 
-  // crawler 関連の上書き（未指定なら detector の既定に任せる）
+  return pushCommonArgs(args, form);
+}
+
+/** archives の引数。forgetId があれば登録を外す、json なら UI 用の一覧（#11）。
+ * 登録を外すときは一覧で見た保存フォルダの uid（forgetUid）を必ず渡す。ID は正本 DB ごとの番号なので、
+ * detector が uid を照合して、違う保存フォルダなら断る。 */
+function buildArchivesArgs(form) {
+  const args = ['archives'];
+  const rawForget = trimmed(String(form.forgetId ?? ''));
+  if (rawForget) {
+    if (!/^[1-9][0-9]*$/.test(rawForget)) {
+      throw new FormError('err_forget_id', { value: rawForget });
+    }
+    // uid は識別子ファイルの中身そのまま（文字種の保証が無い）ので絞らない。`=` でつないで、
+    // 先頭が - でも argparse がオプションと取り違えないようにする
+    const uid = String(form.forgetUid ?? '');
+    if (!uid.trim()) throw new FormError('err_forget_uid', { value: '-' });
+    args.push('--forget', rawForget, `--expect-uid=${uid}`);
+    // detector が一覧で返した実パス。入力欄の値ではないので正規化しない（\ や引用符が変わると別の DB を開く）
+    if (form.forgetArchiveDb) args.push('--archive-db', String(form.forgetArchiveDb));
+  } else if (form.json) {
+    args.push('--json');
+  }
+  return args;
+}
+
+/** 全サブコマンド共通の上書き（未指定なら detector の既定に任せる）。 */
+function pushCommonArgs(args, form) {
   for (const [key, flag] of [
     ['archiveDb', '--archive-db'],
     ['crawlerRepo', '--crawler-repo'],
@@ -162,5 +208,5 @@ function quoteArg(arg) {
 }
 
 module.exports = {
-  MODES, QUARANTINE_KINDS, FormError, buildArgs, formatCommand, quoteArg, normalizePath,
+  MODES, QUARANTINE_KINDS, FormError, buildArgs, formatCommand, quoteArg, normalizePath, toFieldValue,
 };

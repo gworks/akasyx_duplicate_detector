@@ -44,10 +44,10 @@ def test_resolve_rewrites_missing_id_file_by_path(session, archive):
     assert os.path.exists(archive_id_path(archive))
 
 
-def test_two_archives_do_not_share_duplicates(
+def test_two_archives_share_duplicates(
     make_config, tmp_path, fake_crawler
 ):
-    """同じ内容でも保存フォルダが違えば別々に保存される（重複判定は保存フォルダ単位）。"""
+    """保存フォルダが違っても同じ内容は 1 つだけ保存される（重複判定は全保存フォルダ共通 — #6）。"""
     a = tmp_path / "archive_a"; a.mkdir()
     b = tmp_path / "archive_b"; b.mkdir()
     src_a = tmp_path / "in_a"; src_a.mkdir()
@@ -59,9 +59,9 @@ def test_two_archives_do_not_share_duplicates(
     sess, engine = get_session(archive_db_path(tmp_path))
     try:
         rows = sess.query(ArchiveFile).filter_by(status=STATUS_STORED).all()
-        assert len(rows) == 2
-        assert len({r.archive_id for r in rows}) == 2
-        assert sess.query(Archive).count() >= 2
+        assert len(rows) == 1
+        assert sess.query(Archive).count() == 2
+        assert os.path.exists(os.path.join(str(src_b), "y.txt"))  # 重複として投入元に残る
     finally:
         sess.close(); engine.dispose()
 
@@ -309,3 +309,52 @@ def test_alias_registered_by_older_version_is_rewritten_to_real_path(session, ar
     row.root_abs = link  # 以前の版の記録を模す
     session.commit()
     assert archives.resolve_archive(session, archive).root_abs == os.path.realpath(archive)
+
+
+def test_legacy_import_decides_stored_in_one_batch(session, archive, tmp_path, monkeypatch):
+    """v0.1.x の取り込みは stored の判定を 1 回にまとめる（#8。行ごとに問い合わせない）。結果は 1 件ずつと同じ。"""
+    from models import Archive
+    legacy = legacy_db_path(archive)
+    _make_legacy_db(legacy, archive)  # id 11: 'a'*64 stored（明細 21 が参照）
+    conn = sqlite3.connect(legacy)
+    rows = [  # (id, hash, name, status)
+        (12, "b" * 64, "b.txt", "stored"),
+        (13, "c" * 64, "c.txt", "stored"),   # 別の保存フォルダに stored がある → unregistered
+        (14, "d" * 64, "d.txt", "missing"),  # stored 以外はそのまま
+        (15, "e" * 64, "e.txt", "stored"),
+    ]
+    for fid, h, name, status in rows:
+        conn.execute(
+            "INSERT INTO ar_archive_files (id, filehash, hash_algo, size, name, stored_path_rel, ingest_id,"
+            " status, created_at, updated_at) VALUES (?, ?, 'sha256', 3, ?, ?, 7, ?,"
+            " '2026-08-30 00:00:00', '2026-08-30 00:00:00')",
+            (fid, h, name, f"inbox/{name}", status),
+        )
+    conn.commit(); conn.close()
+    other = Archive(uid="other", root_abs=str(tmp_path / "other"))
+    session.add(other)
+    session.flush()
+    session.add(ArchiveFile(
+        archive_id=other.id, filehash="c" * 64, hash_algo="sha256", size=3, name="c.txt",
+        stored_path_rel="c.txt", status="stored",
+    ))
+    session.commit()
+
+    calls = []
+    real = archives.promote_many
+
+    def spy(sess, rows):
+        calls.append(rows)
+        return real(sess, rows)
+
+    monkeypatch.setattr(archives, "promote_many", spy)
+    row = archives.resolve_archive(session, archive)
+
+    assert len(calls) == 1
+    got = {
+        f.name: f.status
+        for f in session.query(ArchiveFile).filter_by(archive_id=row.id).all()
+    }
+    assert got == {"a.txt": "stored", "b.txt": "stored", "c.txt": "unregistered", "d.txt": "missing", "e.txt": "stored"}
+    item = session.query(IngestItem).one()  # 明細の参照先は付け直した id
+    assert session.get(ArchiveFile, item.archive_file_id).name == "a.txt"

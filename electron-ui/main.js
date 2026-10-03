@@ -5,7 +5,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { buildArgs, formatCommand, quoteArg, FormError, normalizePath } = require('./commands');
+const { buildArgs, formatCommand, quoteArg, FormError, normalizePath, toFieldValue } = require('./commands');
+const { scanLine, parseArchivesJson } = require('./detector-output');
 const i18n = require('./i18n');
 
 // electron-ui/ はリポジトリルート直下に置く（設計書 §16）
@@ -32,10 +33,8 @@ const UV_CANDIDATES = [
 ];
 const EXTRA_PATH_DIRS = UV_CANDIDATES.map((p) => path.dirname(p));
 
-// detector の出力（英語固定）のうち、UI が拾う 2 種類。detector/ingest.py・dedupe.py・verify.py と揃える
-const PROGRESS_LINE = /^Progress: (\d+) files \((.+)\)$/;
-const CSV_LINE = /CSV report: (.+)$/;
 const FLUSH_INTERVAL_MS = 80;
+const LIST_TIMEOUT_MS = 120000; // 保存フォルダの一覧（archives --json）を待つ上限
 
 // 終了コードの意味。文言は辞書のキーで renderer に渡し、renderer が今の言語で出す
 const EXIT_MEANINGS = {
@@ -49,6 +48,7 @@ let mainWindow = null;
 let child = null;          // 同時実行は 1 本だけ
 let starting = false;      // buildArgs〜spawn の間（削除確認ダイアログ待ちを含む）も「実行中」扱いにする
 let activeRun = null;      // { command, startedAt, pump } ウィンドウを閉じて開き直したときの復元用
+let listing = null;        // archives --json で一覧を読んでいるプロセス。終了（close）するまで実行を断る
 let stoppedByUser = false;
 
 // --- 言語（i18n.js。前回選んだ言語 → OS の言語 → en） -------------------------
@@ -193,7 +193,40 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   interrupt();
+  killGroup(listing, 'SIGKILL');
 });
+
+/** detached で起動した子プロセスのグループへシグナルを送ります（uv の下の python にも届く）。
+ * Windows は taskkill で木ごと止める。止め終わりを待つ Promise を返す。 */
+function killGroup(proc, signal) {
+  if (!proc) return Promise.resolve();
+  if (process.platform === 'win32') {
+    // Windows は負の PID（プロセスグループ）へのシグナルが無い。uv の下の python まで木ごと止め、
+    // taskkill が終わるのを待てるようにする（止まる前に「終わった」とみなさない）
+    return new Promise((resolve) => {
+      const killer = spawn('taskkill', ['/pid', String(proc.pid), '/T', '/F'], { windowsHide: true });
+      killer.on('error', () => {
+        try {
+          proc.kill(signal);
+        } catch {
+          // 既に終わっている
+        }
+        resolve();
+      });
+      killer.on('close', () => resolve());
+    });
+  }
+  try {
+    process.kill(-proc.pid, signal);
+  } catch {
+    try {
+      proc.kill(signal);
+    } catch {
+      // 既に終わっている
+    }
+  }
+  return Promise.resolve();
+}
 
 /** 実行中の子プロセスへ SIGINT を送ります（uv とその下の python の両方に届かせる）。 */
 function interrupt() {
@@ -219,6 +252,8 @@ function createStreamPump(send) {
   let progress = null;           // { processed, tally }
   let timer = null;
   let csvPath = null;
+  const forgetIds = new Set(); // Note: 行が示す、つながっていない保存フォルダ（登録を外す候補。#11）
+  let adoptPath = null;        // 断りの案内が示す、adopt が要るフォルダ
 
   const flush = () => {
     timer = null;
@@ -240,18 +275,19 @@ function createStreamPump(send) {
   let processed = 0;
 
   const handleLine = (stream, text) => {
-    const match = PROGRESS_LINE.exec(text);
-    if (match) {
+    const found = scanLine(text);
+    if (found.progress) {
       // 1ファイル1行。件数が多いとログ窓が実用にならないので集計に落とす
-      processed = Number(match[1]);
-      const result = match[2];
+      processed = found.progress.processed;
+      const { result } = found.progress;
       tally[result] = (tally[result] || 0) + 1;
       progress = { processed, tally: { ...tally } };
       schedule();
       return;
     }
-    const csv = CSV_LINE.exec(text);
-    if (csv) csvPath = csv[1].trim();
+    if (found.csvPath) csvPath = found.csvPath;
+    if (found.forgetId) forgetIds.add(found.forgetId);
+    if (found.adoptPath) adoptPath = found.adoptPath;
     pending.push({ stream, text });
     if (pending.length > 400) flush();
     else schedule();
@@ -267,17 +303,17 @@ function createStreamPump(send) {
     };
   };
 
+  const state = () => ({ processed, tally: { ...tally }, csvPath, forgetIds: [...forgetIds], adoptPath });
+
   return {
     onStdout: makeReader('out'),
     onStderr: makeReader('err'),
     /** 現時点の集計（ウィンドウを開き直したときの初期表示用）。 */
-    snapshot() {
-      return { processed, tally: { ...tally }, csvPath };
-    },
+    snapshot: state,
     finish() {
       if (timer) clearTimeout(timer);
       flush();
-      return { processed, tally: { ...tally }, csvPath };
+      return state();
     },
   };
 }
@@ -368,14 +404,100 @@ ipcMain.handle('data:open', () => {
   return true;
 });
 
+// detector が出力した実パスをパス欄に入れる値にする（パス欄の正規化で書き換わらないように）
+ipcMain.handle('path:field', (_event, target) => toFieldValue(target));
+
 ipcMain.handle('clipboard:write', (_event, text) => {
   clipboard.writeText(String(text ?? ''));
   return true;
 });
 
+/** detector を起動します。uv は PATH が最小限でも見つかるよう絶対パスで起動する（表示は `uv` のまま）。 */
+function spawnDetector(args, options = {}) {
+  const [program, ...baseArgs] = DETECTOR_EXE ? commandBase() : [resolveUv(), 'run', 'main.py'];
+  const proc = spawn(program, [...baseArgs, ...args], { cwd: RUN_DIR, env: childEnv(), ...options });
+  return { proc, program };
+}
+
+/** 起動できなかったときの説明（uv や同梱の実行形式が無い）。 */
+function launchErrorDetail(e, program) {
+  if (e.code === 'ENOENT') return tr(DETECTOR_EXE ? 'bundled_detector_missing' : 'uv_missing', { program });
+  return e.message;
+}
+
+// 登録済みの保存フォルダの一覧（#11）。実行中は断る（取り込み中の正本 DB を同時に開かない）。
+// 読めなかったときは空の一覧ではなく error を返す（「登録が 0 件」と取り違えないため）
+ipcMain.handle('archives:list', (_event, form) => {
+  // 実行中・前の読み込み中は断る。busy は一時的なので、画面はエラーにせず少し待って読み直す
+  if (child || starting || listing) return { archives: null, busy: true, error: null };
+  let args;
+  try {
+    args = buildArgs({ ...form, mode: 'archives', forgetId: '', json: true });
+  } catch (e) {
+    if (e instanceof FormError) return { archives: null, error: tr(e.key, e.vars) };
+    throw e;
+  }
+  return new Promise((resolve) => {
+    let spawned;
+    try {
+      spawned = spawnDetector(args, { detached: true });
+    } catch (e) {
+      // 引数の不正（NUL 文字入りのパス等）では spawn が同期で投げる
+      resolve({ archives: null, error: tr('archives_error', { detail: e.message }) });
+      return;
+    }
+    const { proc, program } = spawned;
+    listing = proc;
+    let settled = false;
+    // 実行を断るのはプロセスが本当に終わるまで（打ち切った後もまだ正本 DB を開いているかもしれない）
+    const done = (result) => {
+      if (settled) return;
+      settled = true;
+      if (listing === proc) listing = null;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    // つながっていないネットワークの登録があると stat が OS のタイムアウトまで戻らない（#7）。
+    // 一覧の取得中は実行を断っているので、いつまでも待たずに打ち切る（結果は close で返す）
+    let killed = null; // 打ち切ったときの、止め終わりを待つ Promise
+    const timer = setTimeout(() => {
+      killed = killGroup(proc, 'SIGKILL');
+    }, LIST_TIMEOUT_MS);
+
+    let out = '';
+    let err = '';
+    proc.stdout.setEncoding('utf-8');
+    proc.stderr.setEncoding('utf-8');
+    proc.stdout.on('data', (chunk) => { out += chunk; });
+    proc.stderr.on('data', (chunk) => { err += chunk; });
+    // 起動できなかったとき（close が来ないことがある）
+    proc.on('error', (e) => done({ archives: null, error: launchErrorDetail(e, program) }));
+    proc.on('close', (code) => {
+      if (killed) {
+        // Windows では uv が先に終わっても python が残りうるので、木ごと止め終わるまで「取得中」のまま
+        killed.then(() => done({ archives: null, error: tr('archives_error', { detail: tr('archives_timeout') }) }));
+        return;
+      }
+      if (code !== 0) {
+        // detector の断り（Error: …）があればそれを、無ければ stderr の末尾を出す
+        const lines = err.split('\n').map((l) => l.trimEnd()).filter(Boolean);
+        const start = lines.findIndex((l) => l.startsWith('Error:'));
+        const detail = (start >= 0 ? lines.slice(start) : lines.slice(-5)).join('\n');
+        done({ archives: null, error: tr('archives_error', { detail: detail || tr('exit_code', { code }) }) });
+        return;
+      }
+      try {
+        done({ ...parseArchivesJson(out), error: null });
+      } catch (e) {
+        done({ archives: null, error: tr('archives_error', { detail: e.message }) });
+      }
+    });
+  });
+});
+
 ipcMain.handle('run:start', async (_event, form) => {
   // 確認ダイアログを待っている間も含めて 1 本に絞る（child は spawn 後にしか立たない）
-  if (child || starting) return { started: false, error: tr('busy') };
+  if (child || starting || listing) return { started: false, error: tr('busy') };
   starting = true;
   try {
     return await startRun(form);
@@ -406,19 +528,32 @@ async function startRun(form) {
     if (response !== 1) return { started: false, error: null, canceled: true };
   }
 
+  // 登録を外すのも renderer 任せにせず、ここで必ず確認を取る（#11）。場所の表示は renderer から来た値だが、
+  // 実際に外すのは引数の ID だけ（コマンドも併記する）
+  if (form.mode === 'archives' && args.includes('--forget')) {
+    const id = args[args.indexOf('--forget') + 1];
+    const { response } = await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      buttons: [tr('forget_confirm_cancel'), tr('forget_confirm_ok')],
+      defaultId: 0,
+      cancelId: 0,
+      message: tr('forget_confirm_message', { id }),
+      detail: `${form.forgetRoot ? `${String(form.forgetRoot)}\n\n` : ''}${tr('forget_confirm_detail')}`
+        + `\n\n${formatCommand(args, commandBase())}`,
+    });
+    if (response !== 1) return { started: false, error: null, canceled: true };
+  }
+
   // 起動時のウィンドウではなく「今のウィンドウ」へ送る。閉じて開き直しても制御を失わないようにする
   const send = sendToWindow;
   const pump = createStreamPump(send);
-  // uv は PATH が最小限でも見つかるよう絶対パスで起動する（表示は `uv` のまま）
-  const [program, ...baseArgs] = DETECTOR_EXE ? commandBase() : [resolveUv(), 'run', 'main.py'];
   const command = formatCommand(args, commandBase());
   stoppedByUser = false;
 
-  child = spawn(program, [...baseArgs, ...args], {
-    cwd: RUN_DIR,
-    env: childEnv(),
-    detached: true, // 中断をプロセスグループごと送るため（uv の下の python にも届く）
-  });
+  // detached: 中断をプロセスグループごと送るため（uv の下の python にも届く）
+  const spawned = spawnDetector(args, { detached: true });
+  const { program } = spawned;
+  child = spawned.proc;
   activeRun = { command, startedAt: Date.now(), pump };
   let finished = false;
   const finish = (payload) => {
@@ -434,10 +569,7 @@ async function startRun(form) {
   child.stderr.on('data', pump.onStderr);
 
   child.on('error', (e) => {
-    let detail = e.message;
-    if (e.code === 'ENOENT') {
-      detail = tr(DETECTOR_EXE ? 'bundled_detector_missing' : 'uv_missing', { program });
-    }
+    const detail = launchErrorDetail(e, program);
     send('run:log', [{ stream: 'err', text: tr('launch_failed_detail', { detail }) }]);
     // spawn 自体が失敗した場合は close が来ないことがあるので、ここで打ち切る
     finish({

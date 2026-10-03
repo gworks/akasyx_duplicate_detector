@@ -21,8 +21,10 @@
     <nav class="tabs" id="tabs">
       <button type="button" class="tab" data-mode="add" data-i18n="tab_add">Add</button>
       <button type="button" class="tab" data-mode="verify" data-i18n="tab_verify">Verify</button>
+      <button type="button" class="tab" data-mode="adopt" data-i18n="tab_adopt">Register existing files</button>
       <button type="button" class="tab" data-mode="delete-duplicates" data-i18n="tab_delete">Clean up duplicates</button>
       <button type="button" class="tab" data-mode="report" data-i18n="tab_report">Status &amp; history</button>
+      <button type="button" class="tab" data-mode="archives" data-i18n="tab_archives">Archive folders</button>
     </nav>
     <!-- 言語名はそれぞれの言語で書く（どの言語を表示中でも自分の言語を探せるように） -->
     <select class="lang-select" id="lang-select" data-i18n-aria-label="language" aria-label="Language">
@@ -40,7 +42,8 @@
   <main class="layout">
     <!-- ============================ 入力 ============================ -->
     <section class="pane pane-form">
-      <div class="field">
+      <!-- archives タブでは使わない（登録済みの保存フォルダ全体を扱う） -->
+      <div class="field" id="archive-root-field">
         <label class="label" for="archiveRoot"><span data-i18n="archive_root_label">Archive folder</span><span class="req" data-i18n="required">Required</span></label>
         <div class="path-row">
           <input class="input drop" type="text" id="archiveRoot" data-field="archiveRoot"
@@ -115,6 +118,11 @@
         </label>
       </div>
 
+      <!-- ---- adopt ---- -->
+      <div class="mode-panel" data-panel="adopt">
+        <p class="hint block" data-i18n-html="hint_adopt_html"></p>
+      </div>
+
       <!-- ---- delete-duplicates ---- -->
       <div class="mode-panel" data-panel="delete-duplicates">
         <p class="hint block" data-i18n-html="hint_delete_html"></p>
@@ -149,6 +157,17 @@
           <input class="input narrow" type="number" id="reportIngestId" data-field="ingestId"
                  min="1" step="1" data-i18n-placeholder="placeholder_last_runs" />
         </div>
+      </div>
+
+      <!-- ---- archives（#11） ---- -->
+      <div class="mode-panel" data-panel="archives">
+        <p class="hint block" data-i18n-html="hint_archives_html"></p>
+        <div class="archives-head">
+          <code class="data-dir" id="archives-master-db"></code>
+          <button type="button" class="btn" id="archives-refresh" data-i18n="archives_refresh">Refresh</button>
+        </div>
+        <p class="banner" id="archives-message" hidden></p>
+        <ul class="archive-list" id="archive-list"></ul>
       </div>
 
       <details class="advanced">
@@ -214,6 +233,16 @@
       </div>
 
       <p class="banner" id="status" hidden></p>
+
+      <!-- 出力が示す次の操作（Note: 行 → 保存フォルダの一覧 / adopt の案内 → adopt。#11） -->
+      <div class="banner banner-warn next-step" id="next-forget" hidden>
+        <span data-i18n="next_forget"></span>
+        <button type="button" class="btn" id="next-forget-go" data-i18n="next_forget_button">Open archive folders</button>
+      </div>
+      <div class="banner banner-warn next-step" id="next-adopt" hidden>
+        <span id="next-adopt-text"></span>
+        <button type="button" class="btn" id="next-adopt-go" data-i18n="next_adopt_button">Register the files</button>
+      </div>
 
       <div class="progress" id="progress" hidden>
         <div class="progress-count"><strong id="progress-processed">0</strong> <span data-i18n="progress_checked">files checked</span></div>
