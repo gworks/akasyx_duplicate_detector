@@ -34,6 +34,7 @@ from models import (
     PendingAdoption,
     utcnow,
 )
+from utl.helpers import connect_readonly
 
 logger = logging.getLogger(__name__)
 
@@ -670,7 +671,8 @@ def import_legacy_db(session, archive: Archive, legacy_path: str) -> dict | None
         return None
     logger.warning(f"Found a v0.1.x DB; importing it into the master DB: {legacy_path}")
 
-    conn = sqlite3.connect(f"file:{legacy_path}?mode=ro", uri=True)
+    # パスの # ? % をエスケープした URI で開く（保存フォルダのパスに含まれていても別のパスにならないように）
+    conn = connect_readonly(legacy_path)
     conn.row_factory = sqlite3.Row
     counts = {"ingests": 0, "files": 0, "items": 0}
     try:

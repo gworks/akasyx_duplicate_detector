@@ -276,12 +276,16 @@ def _abandon_reservation(session, record: ArchiveFile, dst: str, message: str) -
     実体が保存先に無ければ「未実施」なので行を消して次回やり直せるようにし、
     実体があるなら人の確認が要るので failed で残す。
     """
+    # どのファイルかを必ず出す（CSV を開かなくても分かるように。#18）
+    src = record.origin_path_abs or record.name
     if os.path.lexists(dst):
         record.status = STATUS_FAILED
-        logger.error(f"Move failed but the file exists at the destination: {dst}: {message}")
+        logger.error(f"Move failed but the file exists at the destination: {src} -> {dst}: {message}")
     else:
         session.delete(record)
-        logger.warning(f"Move failed (not performed; reservation cancelled): {message}")
+        # 失敗は取り込みのループが 1 件ごとに WARNING（Failed: パス: メッセージ）で出すので、ここは経緯だけをログファイルに
+        # 残す（#18。二重に出さない・UI の詳細ログに 1 件ごとに流さない）
+        logger.debug(f"Move failed (not performed; reservation cancelled): {src}: {message}")
     session.commit()
 
 
