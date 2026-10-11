@@ -165,5 +165,15 @@
   "result_adopted": "Registreeritud",
   "archives_timeout": "Aeg sai otsa (võrgus olev arhiivikaust ei pruugi vastata).",
   "err_forget_uid": "Eemaldatava arhiivikausta tunnus puudub (värskenda arhiivikaustade loendit): {value}",
-  "archives_no_db": "Arhiivi andmebaasi veel pole. See luuakse esimesel käivitamisel (näiteks Lisa)."
+  "archives_no_db": "Arhiivi andmebaasi veel pole. See luuakse esimesel käivitamisel (näiteks Lisa).",
+  "runbar_running": "Käib: {name}",
+  "runbar_finished": "Lõpetatud: {name}",
+  "runbar_go": "Näita",
+  "runbar_dismiss": "Sulge",
+  "run_elsewhere_running": "„{name}“ käib. Selle väljund ja edenemine on vahekaardil „{name}“. Enne lõppu ei saa teist toimingut alustada, kuid seadeid saab vaadata ja muuta (käimasolevat toimingut see ei mõjuta).",
+  "run_elsewhere_done": "Viimase toimingu „{name}“ väljund on vahekaardil „{name}“.",
+  "archives_running": "Toimingu ajal ei saa loendit laadida. See laaditakse pärast lõppu.",
+  "archives_running_stale": "Toimingu ajal ei saa uuesti laadida. Siin näidatu laaditi enne käivitamist (laaditakse pärast lõppu uuesti).",
+  "status_stop_failed": "Peatamise päringut ei õnnestunud saata (toiming jätkub). Proovige uuesti.",
+  "archive_forget_hint": "Väljundi järgi unustamiseks soovitatud"
 }

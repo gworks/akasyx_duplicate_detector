@@ -165,5 +165,15 @@
   "result_adopted": "Enregistré",
   "archives_timeout": "Délai dépassé (un dossier d’archive sur le réseau ne répond peut-être pas).",
   "err_forget_uid": "L’identifiant du dossier d’archive à oublier est manquant (actualisez la liste des dossiers d’archive) : {value}",
-  "archives_no_db": "La base d’archive n’existe pas encore. Elle est créée lors de la première exécution (par exemple Ajouter)."
+  "archives_no_db": "La base d’archive n’existe pas encore. Elle est créée lors de la première exécution (par exemple Ajouter).",
+  "runbar_running": "En cours : {name}",
+  "runbar_finished": "Terminé : {name}",
+  "runbar_go": "Afficher",
+  "runbar_dismiss": "Fermer",
+  "run_elsewhere_running": "« {name} » est en cours. Sa sortie et sa progression se trouvent dans l’onglet « {name} ». Vous ne pouvez pas lancer une autre opération avant la fin, mais vous pouvez consulter et modifier les réglages (l’opération en cours n’est pas affectée).",
+  "run_elsewhere_done": "La sortie de la dernière exécution de « {name} » se trouve dans l’onglet « {name} ».",
+  "archives_running": "La liste ne peut pas être chargée pendant une opération. Elle sera chargée à la fin de l’opération.",
+  "archives_running_stale": "Impossible de recharger pendant une opération. Ce qui est affiché ici a été chargé avant l’exécution (rechargé à la fin de l’opération).",
+  "status_stop_failed": "Impossible d’envoyer la demande d’arrêt (l’exécution continue). Veuillez réessayer.",
+  "archive_forget_hint": "À oublier selon la sortie"
 }

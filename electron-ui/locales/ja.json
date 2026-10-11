@@ -165,5 +165,15 @@
   "result_adopted": "登録",
   "archives_timeout": "時間切れになりました（ネットワーク上の保存フォルダが応答していない可能性があります）。",
   "err_forget_uid": "登録を外す保存フォルダの識別子がありません（保存フォルダ一覧を読み直してください）: {value}",
-  "archives_no_db": "正本 DB はまだありません。最初の実行（取り込みなど）で作られます。"
+  "archives_no_db": "正本 DB はまだありません。最初の実行（取り込みなど）で作られます。",
+  "runbar_running": "「{name}」を実行中",
+  "runbar_finished": "「{name}」が終わりました",
+  "runbar_go": "表示",
+  "runbar_dismiss": "閉じる",
+  "run_elsewhere_running": "「{name}」を実行中です。出力と進み具合は「{name}」タブにあります。実行中はほかの操作を始められませんが、設定は見たり変えたりできます（走っている実行には影響しません）。",
+  "run_elsewhere_done": "前回の「{name}」の出力は「{name}」タブにあります。",
+  "archives_running": "実行中は一覧を読み込めません。終わったら読み込みます。",
+  "archives_running_stale": "実行中は読み直せません。ここに出しているのは実行前に読んだ結果です（終わったら読み直します）。",
+  "status_stop_failed": "中断を送れませんでした（実行は続いています）。もう一度押してください。",
+  "archive_forget_hint": "出力で登録を外すよう案内された"
 }

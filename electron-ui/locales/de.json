@@ -165,5 +165,15 @@
   "result_adopted": "Registriert",
   "archives_timeout": "Zeitüberschreitung (ein Archivordner im Netzwerk antwortet möglicherweise nicht).",
   "err_forget_uid": "Die Kennung des zu entfernenden Archivordners fehlt (Liste der Archivordner neu laden): {value}",
-  "archives_no_db": "Die Archivdatenbank existiert noch nicht. Sie wird beim ersten Ausführen (z. B. Hinzufügen) erstellt."
+  "archives_no_db": "Die Archivdatenbank existiert noch nicht. Sie wird beim ersten Ausführen (z. B. Hinzufügen) erstellt.",
+  "runbar_running": "Läuft: {name}",
+  "runbar_finished": "Beendet: {name}",
+  "runbar_go": "Anzeigen",
+  "runbar_dismiss": "Schließen",
+  "run_elsewhere_running": "„{name}“ läuft. Ausgabe und Fortschritt stehen im Tab „{name}“. Bis zum Ende kann kein anderer Vorgang gestartet werden, Einstellungen lassen sich aber ansehen und ändern (der laufende Vorgang ist davon nicht betroffen).",
+  "run_elsewhere_done": "Die Ausgabe des letzten Laufs von „{name}“ steht im Tab „{name}“.",
+  "archives_running": "Während ein Vorgang läuft, kann die Liste nicht geladen werden. Sie wird nach dem Ende geladen.",
+  "archives_running_stale": "Während ein Vorgang läuft, kann nicht neu geladen werden. Was hier steht, wurde vor dem Lauf geladen (wird nach dem Ende neu geladen).",
+  "status_stop_failed": "Die Abbruchanforderung konnte nicht gesendet werden (der Lauf geht weiter). Bitte erneut versuchen.",
+  "archive_forget_hint": "Laut Ausgabe zum Vergessen vorgeschlagen"
 }

@@ -39,6 +39,20 @@
 
   <p class="banner banner-error" id="env-warning" hidden></p>
 
+  <!-- 実行中の帯（#19）: 実行したのとは別のタブを開いているとき、実行中の機能・進み具合・中断を出す（実行したタブでは
+       パネルにあるので出さない）。他のタブにいる間に終わったら、見に行くまで終わったことを残す -->
+  <!-- 読み上げは題名（実行中・終わった）だけ。経過時間や件数は毎秒変わるので live にしない -->
+  <div class="runbar" id="runbar" hidden>
+    <span class="spinner" id="runbar-spinner"></span>
+    <span class="runbar-title" id="runbar-title" role="status"></span>
+    <span class="runbar-progress" id="runbar-progress"></span>
+    <span class="elapsed" id="runbar-elapsed"></span>
+    <code class="runbar-command" id="runbar-command"></code>
+    <button type="button" class="btn" id="runbar-go" data-i18n="runbar_go">Show</button>
+    <button type="button" class="btn stop" id="runbar-stop" data-i18n="stop">Stop</button>
+    <button type="button" class="btn ghost" id="runbar-dismiss" data-i18n-aria-label="runbar_dismiss" aria-label="Dismiss">×</button>
+  </div>
+
   <main class="layout">
     <!-- ============================ 入力 ============================ -->
     <section class="pane pane-form">
@@ -232,53 +246,63 @@
         <span class="elapsed" id="elapsed"></span>
       </div>
 
-      <p class="banner" id="status" hidden></p>
-
-      <!-- 出力が示す次の操作（Note: 行 → 保存フォルダの一覧 / adopt の案内 → adopt。#11） -->
-      <div class="banner banner-warn next-step" id="next-forget" hidden>
-        <span data-i18n="next_forget"></span>
-        <button type="button" class="btn" id="next-forget-go" data-i18n="next_forget_button">Open archive folders</button>
-      </div>
-      <div class="banner banner-warn next-step" id="next-adopt" hidden>
-        <span id="next-adopt-text"></span>
-        <button type="button" class="btn" id="next-adopt-go" data-i18n="next_adopt_button">Register the files</button>
+      <!-- 実行中・前回の実行の出力を、実行したのとは別のタブで見ているとき（#19） -->
+      <div class="banner banner-info next-step" id="run-elsewhere" hidden>
+        <span id="run-elsewhere-text"></span>
+        <button type="button" class="btn" id="run-elsewhere-go" data-i18n="runbar_go">Show</button>
       </div>
 
-      <!-- 進み具合（#18）: 段階・件数と割合・残り時間・処理中のファイル・結果ごとの件数・失敗の一覧 -->
-      <div class="progress" id="progress" hidden>
-        <ol class="stages" id="progress-stages" hidden>
-          <li data-stage="scan" data-i18n="stage_scan">List files</li>
-          <li data-stage="ingest" data-i18n="stage_ingest">Check and move</li>
-          <li data-stage="cleanup" data-i18n="stage_cleanup">Clean up</li>
-        </ol>
-        <div class="progress-line">
-          <strong class="progress-count" id="progress-count"></strong>
-          <span class="progress-eta" id="progress-eta"></span>
+      <!-- 出力はそれを実行したタブのもの（#19。他のタブでは隠す） -->
+      <div class="run-output" id="run-output">
+        <p class="banner" id="status" hidden></p>
+
+        <!-- 出力が示す次の操作（Note: 行 → 保存フォルダの一覧 / adopt の案内 → adopt。#11） -->
+        <div class="banner banner-warn next-step" id="next-forget" hidden>
+          <span data-i18n="next_forget"></span>
+          <button type="button" class="btn" id="next-forget-go" data-i18n="next_forget_button">Open archive folders</button>
         </div>
-        <div class="bar" id="progress-bar" hidden><div class="bar-fill" id="progress-bar-fill"></div></div>
-        <div class="progress-current" id="progress-current" hidden></div>
-        <div class="chips" id="progress-chips"></div>
-        <details class="failures" id="progress-failures" hidden>
-          <summary id="progress-failures-summary"></summary>
-          <ul class="failure-list" id="progress-failure-list"></ul>
-          <p class="failure-omitted" id="progress-failures-omitted" hidden></p>
-        </details>
-      </div>
-
-      <div class="log-head">
-        <button type="button" class="log-toggle" id="log-toggle" aria-expanded="true" aria-controls="log">
-          <span class="log-toggle-mark" aria-hidden="true"></span><span data-i18n="output_label">Output</span>
-        </button>
-        <div class="log-actions">
-          <button type="button" class="btn ghost" id="open-csv" hidden data-i18n="open_csv">Open CSV</button>
-          <button type="button" class="btn ghost" id="reveal-log" hidden data-i18n="reveal_log">Open log folder</button>
-          <button type="button" class="btn ghost" id="clear-log" data-i18n="clear">Clear</button>
+        <div class="banner banner-warn next-step" id="next-adopt" hidden>
+          <span id="next-adopt-text"></span>
+          <button type="button" class="btn" id="next-adopt-go" data-i18n="next_adopt_button">Register the files</button>
         </div>
+
+        <!-- 進み具合（#18）: 段階・件数と割合・残り時間・処理中のファイル・結果ごとの件数・失敗の一覧 -->
+        <div class="progress" id="progress" hidden>
+          <ol class="stages" id="progress-stages" hidden>
+            <li data-stage="scan" data-i18n="stage_scan">List files</li>
+            <li data-stage="ingest" data-i18n="stage_ingest">Check and move</li>
+            <li data-stage="cleanup" data-i18n="stage_cleanup">Clean up</li>
+          </ol>
+          <div class="progress-line">
+            <strong class="progress-count" id="progress-count"></strong>
+            <span class="progress-eta" id="progress-eta"></span>
+          </div>
+          <div class="bar" id="progress-bar" hidden><div class="bar-fill" id="progress-bar-fill"></div></div>
+          <div class="progress-current" id="progress-current" hidden></div>
+          <div class="chips" id="progress-chips"></div>
+          <details class="failures" id="progress-failures" hidden>
+            <summary id="progress-failures-summary"></summary>
+            <ul class="failure-list" id="progress-failure-list"></ul>
+            <p class="failure-omitted" id="progress-failures-omitted" hidden></p>
+          </details>
+        </div>
+
+        <div class="log-head">
+          <button type="button" class="log-toggle" id="log-toggle" aria-expanded="true" aria-controls="log">
+            <span class="log-toggle-mark" aria-hidden="true"></span><span data-i18n="output_label">Output</span>
+          </button>
+          <div class="log-actions">
+            <button type="button" class="btn ghost" id="open-csv" hidden data-i18n="open_csv">Open CSV</button>
+            <button type="button" class="btn ghost" id="reveal-log" hidden data-i18n="reveal_log">Open log folder</button>
+            <button type="button" class="btn ghost" id="clear-log" data-i18n="clear">Clear</button>
+          </div>
+        </div>
+        <pre class="log" id="log"></pre>
       </div>
-      <pre class="log" id="log"></pre>
     </section>
   </main>
 
+  <script src="run-view.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
