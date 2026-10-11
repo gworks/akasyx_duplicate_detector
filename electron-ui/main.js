@@ -10,6 +10,8 @@ const { scanLine, parseArchivesJson, createRunState, countsAsWarning } = require
 const i18n = require('./i18n');
 // 実行ボタンの印（#20）。画面と同じファイルを使い、組んだ引数から決める
 const { argsEffect, sameEffect } = require('./renderer/modes');
+// 実行画面に出す今の既定の 1 行（#21）。組んだ引数から作る
+const { summarizeArgs, previewDefaults } = require('./defaults-summary');
 
 // electron-ui/ はリポジトリルート直下に置く（設計書 §16）
 const REPO_ROOT = path.dirname(__dirname);
@@ -427,11 +429,14 @@ ipcMain.handle('dialog:pick', async (_event, options = {}) => {
 });
 
 ipcMain.handle('command:preview', (_event, form) => {
+  // 今の既定の 1 行は組んだ引数から作る。必須の欄が空でコマンドを組めないときも出す（仮の値で組む。値が不正なら出さない）
   try {
     const args = buildArgs(form);
-    return { command: formatCommand(args, commandBase()), error: null, effect: argsEffect(args) };
+    return {
+      command: formatCommand(args, commandBase()), error: null, effect: argsEffect(args), defaults: summarizeArgs(args),
+    };
   } catch (e) {
-    if (e instanceof FormError) return { command: null, error: tr(e.key, e.vars) };
+    if (e instanceof FormError) return { command: null, error: tr(e.key, e.vars), defaults: previewDefaults(form) };
     throw e;
   }
 });
@@ -556,7 +561,10 @@ ipcMain.handle('archives:list', (_event, form) => {
         return;
       }
       try {
-        done({ ...parseArchivesJson(out), error: null });
+        const parsed = parseArchivesJson(out);
+        // field: パス欄に入れる値（保存用フォルダの欄の候補に出す。画面で 1 件ずつ問い合わせなくて済むように。#21）
+        parsed.archives = parsed.archives.map((a) => ({ ...a, field: toFieldValue(a.root) }));
+        done({ ...parsed, error: null });
       } catch (e) {
         done({ archives: null, error: tr('archives_error', { detail: e.message }) });
       }

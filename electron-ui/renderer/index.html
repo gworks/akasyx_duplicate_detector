@@ -38,6 +38,8 @@
         <button type="button" class="tab" data-mode="adopt"><span data-i18n="tab_adopt">Register existing files</span></button>
       </div>
     </nav>
+    <!-- 設定画面（#21）の入口。言語の選択の隣 -->
+    <button type="button" class="btn ghost settings-open" id="open-settings"><span aria-hidden="true">⚙</span> <span data-i18n="settings_open">Settings</span></button>
     <!-- 言語名はそれぞれの言語で書く（どの言語を表示中でも自分の言語を探せるように） -->
     <select class="lang-select" id="lang-select" data-i18n-aria-label="language" aria-label="Language">
       <option value="ja">日本語</option>
@@ -97,51 +99,23 @@
           <input type="checkbox" id="dryRun" data-field="dryRun" />
           <span data-i18n-html="dry_run_html">Dry run</span>
         </label>
-
-        <fieldset class="group">
-          <legend data-i18n="legend_destination">Destination</legend>
-          <p class="hint block" data-i18n-html="hint_destination_html"></p>
-          <div class="field inline">
-            <label class="label small" for="folderLimit" data-i18n="folder_limit_label">Max. files placed directly in one folder</label>
-            <input class="input narrow" type="number" id="folderLimit" data-field="folderLimit" min="1" step="1" value="500" />
-          </div>
-        </fieldset>
-
-        <fieldset class="group">
-          <legend data-i18n="legend_options">Options</legend>
-          <div class="field inline">
-            <label class="label small" for="minSize" data-i18n="min_size_label">Minimum size in bytes</label>
-            <input class="input narrow" type="number" id="minSize" data-field="minSize" min="0" step="1" value="1" />
-          </div>
-          <label class="check">
-            <input type="checkbox" id="withMeta" data-field="withMeta" />
-            <span data-i18n-html="with_meta_html"></span>
-          </label>
-          <label class="check">
-            <input type="checkbox" id="followSymlinks" data-field="followSymlinks" />
-            <span data-i18n="follow_symlinks">Follow symbolic links</span>
-          </label>
-          <label class="check">
-            <input type="checkbox" id="pruneEmptyDirs" data-field="pruneEmptyDirs" checked />
-            <span data-i18n-html="prune_empty_dirs_add_html"></span>
-          </label>
-        </fieldset>
+        <!-- 今の既定（設定画面の値）を 1 行で出す（#21）。既定から変えた項目は目立たせる -->
+        <div class="defaults-line" data-defaults-for="add">
+          <span class="defaults-label" data-i18n="defaults_label">Defaults:</span>
+          <span class="defaults-items"></span>
+          <button type="button" class="btn ghost defaults-change" data-settings-for="add" data-i18n="defaults_change">Change settings</button>
+        </div>
       </div>
 
       <!-- ---- verify ---- -->
       <div class="mode-panel" data-panel="verify">
         <p class="hint block" data-i18n-html="hint_verify_html"></p>
-        <fieldset class="group">
-          <legend data-i18n="legend_flag_quarantine">Mark these findings for quarantine</legend>
-          <label class="check"><input type="checkbox" data-group="flagQuarantine" value="missing" /><span data-i18n-html="flag_missing_html"><code>missing</code></span></label>
-          <label class="check"><input type="checkbox" data-group="flagQuarantine" value="unregistered" /><span data-i18n-html="flag_unregistered_html"><code>unregistered</code></span></label>
-          <label class="check"><input type="checkbox" data-group="flagQuarantine" value="archive_duplicate" /><span data-i18n-html="flag_archive_duplicate_html"><code>archive_duplicate</code></span></label>
-          <label class="check"><input type="checkbox" data-group="flagQuarantine" value="hash_mismatch" /><span data-i18n-html="flag_hash_mismatch_html"><code>hash_mismatch</code></span></label>
-        </fieldset>
-        <label class="check">
-          <input type="checkbox" id="verifyFollowSymlinks" data-field="followSymlinks" />
-          <span data-i18n="follow_symlinks">Follow symbolic links</span>
-        </label>
+        <!-- 今の既定（設定画面の値）を 1 行で出す（#21）。既定から変えた項目は目立たせる -->
+        <div class="defaults-line" data-defaults-for="verify">
+          <span class="defaults-label" data-i18n="defaults_label">Defaults:</span>
+          <span class="defaults-items"></span>
+          <button type="button" class="btn ghost defaults-change" data-settings-for="verify" data-i18n="defaults_change">Change settings</button>
+        </div>
       </div>
 
       <!-- ---- adopt ---- -->
@@ -152,23 +126,17 @@
       <!-- ---- delete-duplicates ---- -->
       <div class="mode-panel" data-panel="delete-duplicates">
         <p class="hint block" data-i18n-html="hint_delete_html"></p>
-        <div class="field">
-          <label class="label small" for="trashDir" data-i18n="trash_dir_label">Move-aside folder</label>
-          <div class="path-row">
-            <input class="input drop" type="text" id="trashDir" data-field="trashDir"
-                   data-i18n-placeholder="placeholder_trash_dir" spellcheck="false" />
-            <button type="button" class="btn" data-pick="trashDir" data-pick-title="pick_trash_dir" data-i18n="browse">Browse…</button>
-          </div>
+        <!-- 今の既定（設定画面の値）を 1 行で出す（#21）。既定から変えた項目は目立たせる -->
+        <div class="defaults-line" data-defaults-for="delete-duplicates">
+          <span class="defaults-label" data-i18n="defaults_label">Defaults:</span>
+          <span class="defaults-items"></span>
+          <button type="button" class="btn ghost defaults-change" data-settings-for="delete-duplicates" data-i18n="defaults_change">Change settings</button>
         </div>
         <div class="field inline">
           <label class="label small" for="ingestId" data-i18n="ingest_id_label">Only this run ID</label>
           <input class="input narrow" type="number" id="ingestId" data-field="ingestId" min="1" step="1"
                  data-i18n-placeholder="placeholder_all_unprocessed" />
         </div>
-        <label class="check">
-          <input type="checkbox" id="delPruneEmptyDirs" data-field="pruneEmptyDirs" />
-          <span data-i18n="prune_empty_dirs_delete">Delete source folders that become empty</span>
-        </label>
         <label class="check danger big">
           <input type="checkbox" id="yes" data-field="yes" />
           <span data-i18n-html="yes_html"><strong>Really delete (--yes)</strong></span>
@@ -196,49 +164,6 @@
         <ul class="archive-list" id="archive-list"></ul>
       </div>
 
-      <details class="advanced">
-        <summary data-i18n="advanced_summary">Advanced settings</summary>
-        <div class="field">
-          <span class="label small" data-i18n="data_dir_label">Data location</span>
-          <div class="path-row">
-            <code class="data-dir" id="data-dir"></code>
-            <button type="button" class="btn" id="open-data-dir" data-i18n="open_data_dir">Show in Finder</button>
-          </div>
-          <p class="hint" data-i18n="hint_data_dir"></p>
-        </div>
-        <div class="field">
-          <label class="label small" for="archiveDb" data-i18n="archive_db_label">Archive database</label>
-          <div class="path-row">
-            <input class="input drop" type="text" id="archiveDb" data-field="archiveDb"
-                   data-i18n-placeholder="placeholder_archive_db" spellcheck="false" />
-          </div>
-          <p class="hint" data-i18n="hint_archive_db"></p>
-        </div>
-        <div class="field">
-          <label class="label small" for="crawlerRepo" data-i18n="crawler_repo_label">Path to akasyx_crawler</label>
-          <div class="path-row">
-            <input class="input drop" type="text" id="crawlerRepo" data-field="crawlerRepo"
-                   data-i18n-placeholder="placeholder_crawler_repo" spellcheck="false" />
-            <button type="button" class="btn" data-pick="crawlerRepo" data-pick-title="pick_crawler_repo" data-i18n="browse">Browse…</button>
-          </div>
-        </div>
-        <div class="field">
-          <label class="label small" for="dbDir" data-i18n="db_dir_label">Crawler database folder</label>
-          <div class="path-row">
-            <input class="input drop" type="text" id="dbDir" data-field="dbDir"
-                   data-i18n-placeholder="placeholder_db_dir" spellcheck="false" />
-            <button type="button" class="btn" data-pick="dbDir" data-pick-title="pick_db_dir" data-i18n="browse">Browse…</button>
-          </div>
-        </div>
-        <div class="field">
-          <label class="label small" for="logDir" data-i18n="log_dir_label">Log and CSV folder</label>
-          <div class="path-row">
-            <input class="input drop" type="text" id="logDir" data-field="logDir"
-                   data-i18n-placeholder="placeholder_log_dir" spellcheck="false" />
-            <button type="button" class="btn" data-pick="logDir" data-pick-title="pick_log_dir" data-i18n="browse">Browse…</button>
-          </div>
-        </div>
-      </details>
     </section>
 
     <!-- ============================ 実行 ============================ -->
@@ -319,6 +244,137 @@
       </div>
     </section>
   </main>
+
+  <!-- 設定画面（#21）: ヘッダー右の歯車で、今の画面の上に重ねて開く（<dialog> の showModal。Esc で閉じる・フォーカスを
+       閉じ込める・背後を操作させない・閉じたらフォーカスを戻すのはブラウザに任せる）。実行中でも開け、走っている実行には
+       影響しない（コマンドは始めたときに決まる）。機能ごとの既定の区画には data-for-mode を付け、フォームを集めるときは
+       .mode-panel と同じく、開いている機能の区画の値だけを使う -->
+  <dialog class="settings-dialog" id="settings" aria-labelledby="settings-title">
+    <section class="settings-panel">
+      <div class="settings-head">
+        <h2 class="settings-title" id="settings-title" data-i18n="settings_title">Settings</h2>
+        <button type="button" class="btn ghost" id="close-settings" data-i18n-aria-label="settings_close" aria-label="Close">×</button>
+      </div>
+      <div class="settings-body">
+        <h3 class="settings-section" data-settings-section="modes" data-i18n="settings_mode_defaults">Defaults for each operation</h3>
+        <p class="hint block" data-i18n="hint_mode_defaults"></p>
+
+        <div class="settings-mode" data-for-mode="add">
+          <h4 class="settings-mode-title" data-i18n="tab_add">Add</h4>
+          <fieldset class="group">
+            <legend data-i18n="legend_destination">Destination</legend>
+            <p class="hint block" data-i18n-html="hint_destination_html"></p>
+            <div class="field inline">
+              <label class="label small" for="folderLimit" data-i18n="folder_limit_label">Max. files placed directly in one folder</label>
+              <input class="input narrow" type="number" id="folderLimit" data-field="folderLimit" min="1" step="1" value="500" />
+            </div>
+          </fieldset>
+
+          <fieldset class="group">
+            <legend data-i18n="legend_options">Options</legend>
+            <div class="field inline">
+              <label class="label small" for="minSize" data-i18n="min_size_label">Minimum size in bytes</label>
+              <input class="input narrow" type="number" id="minSize" data-field="minSize" min="0" step="1" value="1" />
+            </div>
+            <label class="check">
+              <input type="checkbox" id="withMeta" data-field="withMeta" />
+              <span data-i18n-html="with_meta_html"></span>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="followSymlinks" data-field="followSymlinks" />
+              <span data-i18n="follow_symlinks">Follow symbolic links</span>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="pruneEmptyDirs" data-field="pruneEmptyDirs" checked />
+              <span data-i18n-html="prune_empty_dirs_add_html"></span>
+            </label>
+          </fieldset>
+        </div>
+
+        <div class="settings-mode" data-for-mode="verify">
+          <h4 class="settings-mode-title" data-i18n="tab_verify">Verify</h4>
+          <fieldset class="group">
+            <legend data-i18n="legend_flag_quarantine">Mark these findings for quarantine</legend>
+            <label class="check"><input type="checkbox" data-group="flagQuarantine" value="missing" /><span data-i18n-html="flag_missing_html"><code>missing</code></span></label>
+            <label class="check"><input type="checkbox" data-group="flagQuarantine" value="unregistered" /><span data-i18n-html="flag_unregistered_html"><code>unregistered</code></span></label>
+            <label class="check"><input type="checkbox" data-group="flagQuarantine" value="archive_duplicate" /><span data-i18n-html="flag_archive_duplicate_html"><code>archive_duplicate</code></span></label>
+            <label class="check"><input type="checkbox" data-group="flagQuarantine" value="hash_mismatch" /><span data-i18n-html="flag_hash_mismatch_html"><code>hash_mismatch</code></span></label>
+          </fieldset>
+          <label class="check">
+            <input type="checkbox" id="verifyFollowSymlinks" data-field="followSymlinks" />
+            <span data-i18n="follow_symlinks">Follow symbolic links</span>
+          </label>
+        </div>
+
+        <div class="settings-mode" data-for-mode="delete-duplicates">
+          <h4 class="settings-mode-title" data-i18n="tab_delete">Clean up duplicates</h4>
+          <div class="field">
+            <label class="label small" for="trashDir" data-i18n="trash_dir_label">Move-aside folder</label>
+            <div class="path-row">
+              <input class="input drop" type="text" id="trashDir" data-field="trashDir"
+                     data-i18n-placeholder="placeholder_trash_dir" spellcheck="false" />
+              <button type="button" class="btn" data-pick="trashDir" data-pick-title="pick_trash_dir" data-i18n="browse">Browse…</button>
+            </div>
+          </div>
+          <label class="check">
+            <input type="checkbox" id="delPruneEmptyDirs" data-field="pruneEmptyDirs" />
+            <span data-i18n="prune_empty_dirs_delete">Delete source folders that become empty</span>
+          </label>
+        </div>
+
+        <h3 class="settings-section" data-settings-section="system" data-i18n="settings_system">System</h3>
+        <div class="field">
+          <label class="label small" for="defaultArchiveRoot" data-i18n="default_archive_label">Default archive folder</label>
+          <!-- 登録済みの保存フォルダから選ぶ（一覧は保存フォルダ一覧・この画面を開いたときに読む）。起動時に保存用フォルダの
+               欄が空なら、これを入れる（前回入力した値は上書きしない。#21） -->
+          <select class="input" id="defaultArchiveRoot" data-field="defaultArchiveRoot">
+            <option value="" data-i18n="default_archive_none">(None)</option>
+          </select>
+          <p class="hint" data-i18n="hint_default_archive"></p>
+        </div>
+        <div class="field">
+          <span class="label small" data-i18n="data_dir_label">Data location</span>
+          <div class="path-row">
+            <code class="data-dir" id="data-dir"></code>
+            <button type="button" class="btn" id="open-data-dir" data-i18n="open_data_dir">Show in Finder</button>
+          </div>
+          <p class="hint" data-i18n="hint_data_dir"></p>
+        </div>
+        <div class="field">
+          <label class="label small" for="archiveDb" data-i18n="archive_db_label">Archive database</label>
+          <div class="path-row">
+            <input class="input drop" type="text" id="archiveDb" data-field="archiveDb"
+                   data-i18n-placeholder="placeholder_archive_db" spellcheck="false" />
+          </div>
+          <p class="hint" data-i18n="hint_archive_db"></p>
+        </div>
+        <div class="field">
+          <label class="label small" for="crawlerRepo" data-i18n="crawler_repo_label">Path to akasyx_crawler</label>
+          <div class="path-row">
+            <input class="input drop" type="text" id="crawlerRepo" data-field="crawlerRepo"
+                   data-i18n-placeholder="placeholder_crawler_repo" spellcheck="false" />
+            <button type="button" class="btn" data-pick="crawlerRepo" data-pick-title="pick_crawler_repo" data-i18n="browse">Browse…</button>
+          </div>
+        </div>
+        <div class="field">
+          <label class="label small" for="dbDir" data-i18n="db_dir_label">Crawler database folder</label>
+          <div class="path-row">
+            <input class="input drop" type="text" id="dbDir" data-field="dbDir"
+                   data-i18n-placeholder="placeholder_db_dir" spellcheck="false" />
+            <button type="button" class="btn" data-pick="dbDir" data-pick-title="pick_db_dir" data-i18n="browse">Browse…</button>
+          </div>
+        </div>
+        <div class="field">
+          <label class="label small" for="logDir" data-i18n="log_dir_label">Log and CSV folder</label>
+          <div class="path-row">
+            <input class="input drop" type="text" id="logDir" data-field="logDir"
+                   data-i18n-placeholder="placeholder_log_dir" spellcheck="false" />
+            <button type="button" class="btn" data-pick="logDir" data-pick-title="pick_log_dir" data-i18n="browse">Browse…</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </dialog>
 
   <script src="modes.js"></script>
   <script src="run-view.js"></script>
