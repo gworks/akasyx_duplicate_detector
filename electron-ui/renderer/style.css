@@ -71,7 +71,12 @@ code, .log, .command-text {
 .brand { font-weight: 600; font-size: 14px; }
 .version { color: var(--ink-dim); font-weight: 400; margin-left: 6px; font-size: 12px; }
 
-.tabs { display: flex; flex-wrap: wrap; gap: 4px; }
+/* タブは 2 段目に全幅で並べる（目的の見出しと印で幅が要るため。#20） */
+.topbar { flex-wrap: wrap; row-gap: 8px; }
+.tabs { display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: center; order: 3; flex-basis: 100%; }
+/* 目的のまとまり（#20）。見出しの文字を区切りにする（狭い窓で折り返しても行頭に線が残らないように） */
+.tab-group { display: flex; align-items: center; gap: 2px; }
+.tab-group-label { font-size: 11px; font-weight: 600; color: var(--ink-dim); margin-right: 4px; white-space: nowrap; }
 .lang-select {
   margin-left: auto;
   font: inherit;
@@ -84,7 +89,7 @@ code, .log, .command-text {
 }
 .tab {
   font: inherit;
-  padding: 5px 13px;
+  padding: 5px 9px;
   border: 1px solid transparent;
   border-radius: var(--radius);
   background: transparent;
@@ -92,6 +97,14 @@ code, .log, .command-text {
   cursor: pointer;
 }
 .tab:hover { background: var(--chip); color: var(--ink); }
+/* タブの印: ファイルを動かす・DB を変える（#20）。選ばれたタブの上でも読めるよう枠線で出す */
+.tab-effect {
+  margin-left: 6px; padding: 0 5px; border-radius: 999px;
+  font-size: 10.5px; font-weight: 600; border: 1px solid currentColor; vertical-align: 1px;
+}
+.tab-effect.files { color: var(--danger); }
+.tab-effect.db { color: var(--warn); }
+.tab[aria-selected="true"] .tab-effect { color: var(--accent-ink); }
 .tab[aria-selected="true"] {
   background: var(--accent);
   border-color: var(--accent);
@@ -193,12 +206,26 @@ code, .log, .command-text {
 .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
 .btn.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent); }
 .btn.stop { color: var(--danger); border-color: var(--danger); }
+/* 実行ボタン: 今のフォームで実際に起きること（#20）。ファイルを動かす=注意の色 / DB を変える=警告の色 / 見るだけ=今の青 */
+.btn.primary.effect-files { background: var(--danger); border-color: var(--danger); color: var(--pane); }
+.btn.primary.effect-db { background: var(--warn); border-color: var(--warn); color: var(--pane); }
+/* 上の .btn.primary:hover（青）に負けないよう、乗せたときも同じ色のまま明るくする */
+.btn.primary.effect-files:hover:not(:disabled) { background: var(--danger); }
+.btn.primary.effect-db:hover:not(:disabled) { background: var(--warn); }
 .btn.ghost { padding: 4px 9px; font-size: 12px; color: var(--ink-dim); }
 .kbd { font-size: 11px; opacity: .75; margin-left: 4px; }
 
 /* ---- コマンドプレビュー ---- */
-.command { border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 10px; }
-.command-head { display: flex; align-items: center; justify-content: space-between; }
+.command { border: 1px solid var(--line); border-radius: var(--radius); padding: 6px 10px; flex: none; }
+/* 実行されるコマンドは既定でたたむ（#20）。見出しを押すと開く */
+.command-head { display: flex; align-items: center; justify-content: space-between; cursor: pointer; list-style: none; }
+.command-head::-webkit-details-marker { display: none; }
+.command-head .label::before { content: "▸"; display: inline-block; width: 1em; color: var(--ink-dim); }
+.command[open] .command-head .label::before { content: "▾"; }
+.command-head .label { margin-bottom: 0; }
+.command-body { display: flex; align-items: flex-start; gap: 8px; }
+.command-body .command-text { flex: 1; min-width: 0; }
+.run-invalid { margin: -4px 0 0; font-size: 12px; color: var(--warn); }
 .cwd { font-weight: 400; margin-left: 8px; opacity: .8; }
 .command-text {
   display: block;
