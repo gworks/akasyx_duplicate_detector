@@ -231,20 +231,35 @@ function killGroup(proc, signal) {
   return Promise.resolve();
 }
 
-/** 実行中の子プロセスへ SIGINT を送ります（uv とその下の python の両方に届かせる）。 */
+/**
+ * 実行中の子プロセスへ SIGINT を送ります（uv とその下の python の両方に届かせる）。1 つの実行には 1 度だけ送る
+ * （2 度目の SIGINT は detector の後片付けを途中で止めうる。中断ボタンもアプリの終了も、ここを通る）。
+ * true=送った（前に送ったものを含む） / false=送れなかった / null=もう居ない（終わるところ。exit がこの後に届く）。
+ */
 function interrupt() {
-  if (!child) return false;
+  if (!child) return null;
+  if (stoppedByUser) return true;
+  const sent = sendInterrupt();
+  if (sent) stoppedByUser = true;
+  return sent;
+}
+
+function sendInterrupt() {
   try {
     // detached:true で自前のプロセスグループにしてあるので、グループごと送る
     process.kill(-child.pid, 'SIGINT');
+    return true;
   } catch {
-    try {
-      child.kill('SIGINT');
-    } catch {
-      return false;
-    }
+    // グループに送れない（Windows にはプロセスグループが無く、ESRCH になる）。子プロセスへ直接送る
   }
-  return true;
+  const exited = () => child.exitCode !== null || child.signalCode !== null;
+  if (exited()) return null;
+  try {
+    if (child.kill('SIGINT')) return true;
+  } catch {
+    // 下で終わったかどうかを見る
+  }
+  return exited() ? null : false;
 }
 
 // --- 子プロセスの出力を間引いて renderer へ ---------------------------------
@@ -377,7 +392,12 @@ function appContext() {
     platform: process.platform,
     // macOS でウィンドウを閉じても子プロセスは走り続けるので、開き直した画面に状態を返す
     run: activeRun
-      ? { command: activeRun.command, mode: activeRun.mode, startedAt: activeRun.startedAt, ...activeRun.pump.snapshot() }
+      ? {
+        command: activeRun.command, mode: activeRun.mode, logDir: activeRun.logDir, archiveDb: activeRun.archiveDb,
+        startedAt: activeRun.startedAt,
+        stopRequested: stoppedByUser, // 中断を頼んだ後に開き直した画面で、もう一度押させない（#19）
+        ...activeRun.pump.snapshot(),
+      }
       : null,
   };
 }
@@ -601,15 +621,19 @@ async function startRun(form) {
   child = spawned.proc;
   // spawn の後に作る（集計は 1 秒ごとのタイマーを持ち、finish で止める。spawn が例外で抜けると止める人がいない）
   const pump = createStreamPump(send);
-  // mode は開き直した画面が詳細ログを開くかたたむかを決めるのに使う（#18）
-  activeRun = { command, mode: form.mode, startedAt: Date.now(), pump };
+  // 実行の素性。開き直した画面（appContext().run）と終了の通知（run:exit）の両方で同じものを渡す。
+  // mode は開き直した画面が詳細ログを開くかたたむかを決めるのに使う（#18）。logDir・archiveDb は、実行中に変えた
+  // 設定ではなくこの実行のログを開き、この実行の DB の一覧にだけ案内の印を付けるため（#19。画面の欄の値のまま）
+  const identity = { mode: form.mode, logDir: form.logDir || '', archiveDb: form.archiveDb || '' };
+  activeRun = { command, ...identity, startedAt: Date.now(), pump };
   let finished = false;
   const finish = (payload) => {
     if (finished) return;
     finished = true;
     child = null;
     activeRun = null;
-    send('run:exit', { ...payload, ...pump.finish() });
+    // 開き直した画面が実行を取り戻す前に終わったときも、出力の持ち主とその実行のログ・DB が分かるように（#19）
+    send('run:exit', { ...payload, ...pump.finish(), ...identity });
   };
   child.stdout.setEncoding('utf-8');
   child.stderr.setEncoding('utf-8');
@@ -643,8 +667,9 @@ async function startRun(form) {
 }
 
 ipcMain.handle('run:stop', () => {
-  if (!child) return false;
-  stoppedByUser = true;
-  // detector は KeyboardInterrupt を受けて status='interrupted' で後片付けする
+  // 子プロセスがもう無い（終わって run:exit を送るところ）ときは interrupt() が null を返す（送れなかった false とは分ける）
+  // detector は KeyboardInterrupt を受けて status='interrupted' で後片付けする。送れなかったら中断を頼んだことにしない
+  // （終わり方を「中断しました」と出さない・開き直した画面でもう一度押せるように。#19）
+  // 1 度だけ送る守りは interrupt() が持つ（画面の状態に頼らない）
   return interrupt();
 });

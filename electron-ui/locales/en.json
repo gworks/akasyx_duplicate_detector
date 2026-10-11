@@ -165,5 +165,15 @@
   "result_adopted": "Registered",
   "archives_timeout": "Timed out (an archive folder on the network may not be responding).",
   "err_forget_uid": "The uid of the archive folder to forget is missing or invalid (reload the list of archive folders): {value}",
-  "archives_no_db": "The archive database does not exist yet. It is created by the first run (such as Add)."
+  "archives_no_db": "The archive database does not exist yet. It is created by the first run (such as Add).",
+  "runbar_running": "Running: {name}",
+  "runbar_finished": "Finished: {name}",
+  "runbar_go": "Show",
+  "runbar_dismiss": "Dismiss",
+  "run_elsewhere_running": "\"{name}\" is running. Its output and progress are on the \"{name}\" tab. You cannot start another operation until it finishes, but you can view and change settings (the running operation is not affected).",
+  "run_elsewhere_done": "The output of the last \"{name}\" run is on the \"{name}\" tab.",
+  "archives_running": "The list cannot be loaded while an operation is running. It will load when the operation finishes.",
+  "archives_running_stale": "Cannot reload while an operation is running. What is shown here was loaded before the run (it will reload when the operation finishes).",
+  "status_stop_failed": "Could not send the stop request (the run is still going). Please try again.",
+  "archive_forget_hint": "Suggested for forgetting in the output"
 }

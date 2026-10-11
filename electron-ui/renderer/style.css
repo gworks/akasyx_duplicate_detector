@@ -121,6 +121,8 @@ code, .log, .command-text {
   overflow: auto;
 }
 .pane-run { display: flex; flex-direction: column; gap: 10px; overflow: hidden; }
+/* 出力は実行したタブでだけ見せる（#19）。中身の並びは .pane-run と同じ */
+.run-output { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 10px; }
 
 /* ---- フォーム ---- */
 .field { margin-bottom: 14px; }
@@ -234,6 +236,34 @@ code, .log, .command-text {
 .banner-info { color: var(--ink-dim); }
 #env-warning { flex: none; margin: 0 12px; }
 
+/* 実行中の帯（#19）。どのタブでもヘッダの下に出す */
+.runbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 12px 12px 0;
+  padding: 7px 11px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--pane);
+  font-size: 12.5px;
+}
+.runbar.finished { border-color: currentColor; }
+.runbar-title { font-weight: 600; flex: none; }
+/* 長い知らせ・終わり方でボタン（表示・中断・閉じる）を押し出さない。全文は title で見られる */
+.runbar-progress {
+  flex: 0 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.runbar-command {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 11.5px; color: var(--ink-dim);
+}
+.runbar .btn { flex: none; }
+
 .progress { display: flex; flex-direction: column; gap: 6px; flex: none; }
 .stages { display: flex; gap: 4px; margin: 0; padding: 0; list-style: none; font-size: 11.5px; color: var(--ink-dim); }
 .stages li { padding: 2px 8px; border-radius: 999px; background: var(--chip); }
@@ -310,6 +340,8 @@ code, .log, .command-text {
 .archive-meta { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 4px; }
 .archive-meta .chip.absent { color: var(--warn); }
 .archive-meta .chip.pending { color: var(--error); }
+/* 出力が登録を外すよう案内した（#19）。問題の印（pending）とは色を分ける */
+.archive-meta .chip.hint { color: var(--accent); outline: 1px solid var(--accent); }
 .archive-item .btn { flex: none; }
 
 /* 出力が示す次の操作 */

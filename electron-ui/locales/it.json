@@ -165,5 +165,15 @@
   "result_adopted": "Registrato",
   "archives_timeout": "Tempo scaduto (una cartella di archivio in rete potrebbe non rispondere).",
   "err_forget_uid": "Manca l’identificativo della cartella di archivio da rimuovere (aggiorna l’elenco delle cartelle di archivio): {value}",
-  "archives_no_db": "Il database di archivio non esiste ancora. Viene creato alla prima esecuzione (ad esempio Aggiungi)."
+  "archives_no_db": "Il database di archivio non esiste ancora. Viene creato alla prima esecuzione (ad esempio Aggiungi).",
+  "runbar_running": "In corso: {name}",
+  "runbar_finished": "Terminato: {name}",
+  "runbar_go": "Mostra",
+  "runbar_dismiss": "Chiudi",
+  "run_elsewhere_running": "«{name}» è in corso. Output e avanzamento sono nella scheda «{name}». Non è possibile avviare un’altra operazione finché non termina, ma è possibile vedere e modificare le impostazioni (l’operazione in corso non ne risente).",
+  "run_elsewhere_done": "L’output dell’ultima esecuzione di «{name}» è nella scheda «{name}».",
+  "archives_running": "Durante un’operazione l’elenco non può essere caricato. Verrà caricato al termine.",
+  "archives_running_stale": "Durante un’operazione non è possibile ricaricare. Ciò che è mostrato qui è stato caricato prima dell’esecuzione (verrà ricaricato al termine).",
+  "status_stop_failed": "Impossibile inviare la richiesta di interruzione (l’esecuzione continua). Riprovare.",
+  "archive_forget_hint": "Da dimenticare secondo l’output"
 }

@@ -32,6 +32,11 @@ const dom = {
   archivesRefresh: el('archives-refresh'),
   nextForget: el('next-forget'), nextForgetGo: el('next-forget-go'),
   nextAdopt: el('next-adopt'), nextAdoptText: el('next-adopt-text'), nextAdoptGo: el('next-adopt-go'),
+  runbar: el('runbar'), runbarSpinner: el('runbar-spinner'), runbarTitle: el('runbar-title'),
+  runbarProgress: el('runbar-progress'), runbarElapsed: el('runbar-elapsed'), runbarCommand: el('runbar-command'),
+  runbarGo: el('runbar-go'), runbarStop: el('runbar-stop'), runbarDismiss: el('runbar-dismiss'),
+  runOutput: el('run-output'), runElsewhere: el('run-elsewhere'), runElsewhereText: el('run-elsewhere-text'),
+  runElsewhereGo: el('run-elsewhere-go'),
 };
 
 let context = { repoRoot: '', dataDir: '', version: '', detectorFound: true };
@@ -51,10 +56,29 @@ let failureListReceived = false; // この実行で一覧が 1 度でも届い�
 let archivesState = null;  // 保存フォルダの一覧: { masterDb, archives, error } / 読み込み中は { loading: true }
 let nextAdoptPath = null;  // 出力の案内が示す、adopt が要るフォルダ
 let commandValid = false;  // 今のフォームから実行できるコマンドが組めるか
+// 出力の持ち主（#19）。実行は 1 本だけで、出力・進み具合はそれを実行したタブのもの。他のタブを見ている間は隠す
+let runMode = null;        // 実行中・前回の実行のタブ（まだ無い・クリアした後は null）
+let runCommand = '';       // 実行中のコマンド（main が組んだもの。他のタブで設定を変えても変わらない）
+// 実行を始めたときのログの場所の欄の値（実行中に設定を変えても、その実行のログを開く）。既定の場所への解決は
+// 開くときに行う（開き直した直後は、まだデータの場所を知らないことがある）。null は持ち主の実行が無い
+let runLogDir = null;
+// 帯の題名（読み上げの対象）。帯が出たときは次の描画で入れる（その間に描き直されたら最後の文言を入れる）
+let runbarTitleText = '';
+let runbarTitlePending = false;
+let initialized = false;   // init が設定とタブを戻し終えたか（それまでに届いた終了の通知は、戻した後のタブで判定する）
+let runSerial = 0;         // 実行中にした回数（中断の応答がどの実行へのものかを見分ける）
+let runArchiveDb = null;   // 実行を始めたときの正本 DB の欄の値（Note: 行の保存フォルダ ID はこの DB のもの）
+// 出力の Note: 行が登録を外すよう案内した保存フォルダの ID（Set）。出力は実行したタブにしか出ないので、
+// 保存フォルダ一覧の行にも印を付ける（#19）。ID は runArchiveDb の DB のもの
+let forgetHint = null;
+let stopRequested = false; // 中断を頼んだ（終わるまで中断は押せない）
+let starting = false;      // 実行を頼み、始まったという応答を待っている（中断は main が無視するので押させない）
+let finishedUnseen = false; // 他のタブにいる間に終わり、まだ見に行っていない
 
 /** 実行ボタン。一覧の問い合わせ中も main は実行を断るので、押せないようにしておく。 */
 function updateRunButton() {
-  dom.run.disabled = running || !commandValid || listInFlight;
+  // 実行を頼んで応答を待つ間（starting）も押させない（応答より先に終了の通知が届いて running が下りても）
+  dom.run.disabled = running || starting || !commandValid || listInFlight;
 }
 
 // ------------------------------------------------------------------ 言語
@@ -88,6 +112,7 @@ function applyLanguage(next) {
   if (lastStatus) setStatus(lastStatus.level, lastStatus.key, lastStatus.vars);
   renderArchives();
   renderNextAdopt();
+  renderRunView();
 }
 
 async function changeLanguage(next) {
@@ -129,9 +154,15 @@ function setMode(next) {
     panel.classList.toggle('active', panel.dataset.panel === next);
   }
   dom.archiveRootField.hidden = next === 'archives';
+  // 実行したタブを開いたら、終わった印の帯は役目を終える
+  if (next === runMode) finishedUnseen = false;
+  renderRunView();
   refreshPreview();
   persist();
-  if (next === 'archives' && !running) loadArchives();
+  if (next === 'archives') {
+    if (running) renderArchives(); // 実行中は読まない。読めないことを出す
+    else loadArchives();
+  }
 }
 
 // ------------------------------------------------------------ 設定の保存
@@ -234,19 +265,45 @@ function logFragment(entries) {
   return fragment;
 }
 
+// 詳細ログの末尾を追いかけるか。見えている間の位置でだけ決める（他のタブを見ている・たたんでいる間は
+// 高さが 0 で位置を測れず、隠すとスクロール位置も失われる。見えるようになったら followLog で末尾へ戻す。#19）
+let logFollow = true;
+let logScrollTop = 0; // 末尾を追っていないときに読んでいた位置
+const logVisible = () => dom.log.clientHeight > 0;
+
+/** 見えている間の位置を覚える（スクロールしたとき・行を足す前）。 */
+function noteLogPosition() {
+  if (!logVisible()) return;
+  logFollow = dom.log.scrollHeight - dom.log.scrollTop - dom.log.clientHeight < 40;
+  logScrollTop = dom.log.scrollTop;
+}
+
+/** 末尾を追っているなら末尾へ（行を足したとき・開いたとき）。追っていないときは位置に触らない。 */
+function followLog() {
+  if (logFollow && logVisible()) dom.log.scrollTop = dom.log.scrollHeight;
+}
+
+/** 隠していた出力を見せ直したとき。隠すと位置が失われるので、末尾へか、読んでいた位置へ戻す。 */
+function restoreLogPosition() {
+  if (!logVisible()) return;
+  dom.log.scrollTop = logFollow ? dom.log.scrollHeight : logScrollTop;
+}
+
 function appendLog(entries) {
-  const atBottom = dom.log.scrollHeight - dom.log.scrollTop - dom.log.clientHeight < 40;
+  noteLogPosition();
   dom.log.append(logFragment(entries));
   if (logLines > LOG_LIMIT) {
     for (let i = 0; i < LOG_TRIM && dom.log.firstChild; i += 1) dom.log.firstChild.remove();
     logLines -= LOG_TRIM;
   }
-  if (atBottom) dom.log.scrollTop = dom.log.scrollHeight;
+  followLog();
 }
 
 function clearLogLines() {
   dom.log.replaceChildren();
   logLines = 0;
+  logFollow = true;
+  logScrollTop = 0;
 }
 
 function clearLog() {
@@ -267,11 +324,29 @@ function clearLog() {
   dom.nextForget.hidden = true;
   nextAdoptPath = null;
   renderNextAdopt();
+  // 消した出力の持ち主は無くなる（どのタブでも出力の場所を出す）
+  releaseOutput();
+}
+
+/** 出力の持ち主（実行したタブとその実行のログの場所）を手放す。消したとき・始まらなかったとき。 */
+function releaseOutput() {
+  runMode = null;
+  runLogDir = null;
+  runArchiveDb = null;
+  forgetHint = null;
+  finishedUnseen = false;
+  dom.elapsed.textContent = ''; // 前の実行の経過時間を、どのタブにも残さない
+  renderRunView();
+  if (mode === 'archives') renderArchives(); // 出力と一緒に案内の印も消す
 }
 
 /** 出力が示す次の操作（#11）。Note: 行 → 保存フォルダの一覧、adopt の案内 → adopt タブ。 */
 function showNextSteps(result) {
-  dom.nextForget.hidden = !(result.forgetIds && result.forgetIds.length);
+  const ids = result.forgetIds || [];
+  dom.nextForget.hidden = !ids.length;
+  // 案内の印はこの出力のもの（新しい実行を始めて出力を消したら一緒に消える）
+  forgetHint = ids.length ? new Set(ids.map(Number)) : null;
+  if (mode === 'archives') renderArchives();
   nextAdoptPath = result.adoptPath || null;
   renderNextAdopt();
 }
@@ -287,7 +362,7 @@ function renderNextAdopt() {
 // archivesState.loading は表示だけに使う（busy で待っている間も「読み込み中」と出すが、何も止めない）
 let listInFlight = false;
 let reloadAfterList = false; // 飛んでいる間に正本 DB の指定が変わった（その結果は捨てて読み直す）
-let retryTimer = null;       // busy のときの読み直し。ほかの処理からは消さない
+let retryTimer = null;       // busy のときの読み直し。実行が始まったら取り消す（終わったら読み直す）
 
 /** archives --json で一覧を読み直します。実行中は読まない（終わったら読み直す）。 */
 async function loadArchives() {
@@ -300,9 +375,11 @@ async function loadArchives() {
   listInFlight = true;
   archivesState = { loading: true };
   renderArchives();
+  // 一覧を読んだときの正本 DB の欄の値（出力の案内と同じ DB の一覧かを、後で欄を書きかけても取り違えないように）
+  const fieldDb = el('archiveDb').value.trim();
   let result;
   try {
-    result = await api.listArchives(collectForm());
+    result = { ...(await api.listArchives(collectForm())), fieldDb };
   } catch (e) {
     result = { archives: null, error: t('archives_error', { detail: e.message || String(e) }) };
   } finally {
@@ -311,8 +388,8 @@ async function loadArchives() {
   if (reloadAfterList) {
     reloadAfterList = false;
     archivesState = null;
-    if (mode === 'archives') loadArchives();
-    else renderArchives();
+    if (mode === 'archives' && !running) loadArchives();
+    else renderArchives(); // 実行中は読まない（実行中の断りを出す）
     return;
   }
   if (result.busy) {
@@ -363,25 +440,31 @@ function renderArchives() {
   const state = archivesState;
   dom.archivesRefresh.disabled = running || listInFlight;
   updateRunButton();
-  const message = (level, text) => {
+  // 実行中は一覧を読まない（main が断る。終わったら読み直す。#19）。前に読んだ結果は残すが、実行中に出すものは
+  // どれも（一覧・0 件・DB が無い・エラー）実行前に読んだものだと分かるように断りを付ける
+  const stale = running && state && !state.loading;
+  const message = (level, text = '') => {
     dom.archivesMessage.className = `banner banner-${level}`;
-    dom.archivesMessage.textContent = text;
+    dom.archivesMessage.textContent = [stale ? t('archives_running_stale') : '', text].filter(Boolean).join('\n');
     dom.archivesMessage.hidden = false;
   };
   dom.archivesMessage.hidden = true;
   dom.archiveList.replaceChildren();
   dom.archivesMasterDb.textContent = state && state.masterDb ? t('archives_master_db', { path: state.masterDb }) : '';
-  if (!state) return;
+  if (!state) return running ? message('info', t('archives_running')) : undefined;
   if (state.loading) return message('info', t('archives_loading'));
   // 読めなかったときは空の一覧を出さない（「登録が 0 件」と取り違えないため）
   if (state.error) return message('error', state.error);
   if (!state.dbExists) return message('info', t('archives_no_db'));
   if (!state.archives.length) return message('info', t('archives_empty'));
 
-  dom.archiveList.replaceChildren(...state.archives.map((a) => renderArchiveItem(a, state)));
+  if (stale) message('info'); // 断りだけ
+  // 実行の出力が登録を外すよう案内したもの。同じ正本 DB の一覧のときだけ（ID は DB ごとに振られる）
+  const hinted = forgetHint && state.fieldDb === runArchiveDb ? forgetHint : null;
+  dom.archiveList.replaceChildren(...state.archives.map((a) => renderArchiveItem(a, state, hinted)));
 }
 
-function renderArchiveItem(a, state) {
+function renderArchiveItem(a, state, hinted) {
   const item = document.createElement('li');
   item.className = 'archive-item';
   const body = document.createElement('div');
@@ -403,6 +486,7 @@ function renderArchiveItem(a, state) {
     meta.append(chip(t('archive_forgotten', { files: Number(a.forgotten_files).toLocaleString(lang) })));
   }
   if (a.pending_adoption) meta.append(chip(t('archive_pending_adoption'), 'pending'));
+  if (hinted && hinted.has(Number(a.id))) meta.append(chip(t('archive_forget_hint'), 'hint'));
   if (a.last_used_at) {
     const used = new Date(a.last_used_at);
     if (!Number.isNaN(used.getTime())) {
@@ -438,6 +522,7 @@ function setStatus(level, key, vars = {}) {
   dom.status.className = `banner banner-${level}`;
   dom.status.textContent = t(key, resolved);
   dom.status.hidden = false;
+  renderRunView(); // 終わった印の帯は状態の帯と同じ文言・色
 }
 
 /**
@@ -447,9 +532,15 @@ function setStatus(level, key, vars = {}) {
 const logOpenFor = (mode) => mode !== 'add';
 
 function setLogOpen(open) {
+  const wasOpen = !dom.log.hidden;
   dom.log.hidden = !open;
   dom.logToggle.setAttribute('aria-expanded', String(open));
-  if (open) dom.log.scrollTop = dom.log.scrollHeight;
+  // たたんだ状態から開いたら末尾を見せる（他のタブにいる間に開いたときは、実行したタブを開いたときに末尾へ）。
+  // 既に開いていれば、読んでいる位置はそのまま（終わったときに開き直す経路など）
+  if (open && !wasOpen) {
+    logFollow = true;
+    followLog();
+  }
 }
 
 /** 秒数を「約 2 時間 5 分」のように丸めて出します。 */
@@ -549,6 +640,7 @@ function renderProgress(progress) {
       return chip;
     })
   );
+  renderRunView(); // 帯の進み具合も同じ文言で出す
 }
 
 /** 失敗したファイルの一覧（#18）。CSV を開かなくても、どのファイルが何で失敗したかが分かるように。 */
@@ -585,27 +677,139 @@ function finishFailures(omitted) {
 /** 実行中表示の切り替え。since を渡すと（開き直し時など）その時刻からの経過で表示する。 */
 function setRunning(next, since = Date.now()) {
   running = next;
+  if (next) runSerial += 1;
+  if (!next) stopRequested = false; // 中断を頼んだ印は、実行が終わるまで下ろさない
   updateRunButton();
-  dom.stop.disabled = !next;
-  dom.spinner.hidden = !next;
-  for (const tab of dom.tabs.querySelectorAll('.tab')) tab.disabled = next;
+  // タブは実行中も切り替えられる（#19）。止めるのは実行と、DB を変える操作（登録を外す）・一覧の読み直しだけ
+  // （実行は 1 本だけで、main も実行中は断る）
   for (const button of dom.archiveList.querySelectorAll('button')) button.disabled = next;
-  dom.archivesRefresh.disabled = next;
+  dom.archivesRefresh.disabled = next || listInFlight;
+  if (next) {
+    // busy で予約した読み直しは実行中は何もしないので取り消し、「読み込み中」のまま残さない（終わったら読み直す）
+    clearTimeout(retryTimer);
+    if (!listInFlight && archivesState && archivesState.loading) archivesState = null;
+    if (mode === 'archives') renderArchives(); // 「実行中は読み直せない」の案内を出す（終わったときは下の loadArchives が描く）
+  }
 
   clearInterval(elapsedTimer);
   if (next) {
     startedAt = since;
     const renderElapsed = () => {
       const seconds = Math.floor((Date.now() - startedAt) / 1000);
-      dom.elapsed.textContent = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+      const text = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+      dom.elapsed.textContent = text;
+      dom.runbarElapsed.textContent = text;
     };
     renderElapsed();
     elapsedTimer = setInterval(renderElapsed, 1000);
-  } else {
+  }
+  renderRunView();
+  if (!next) {
     refreshPreview();
     // 登録を外した後など、一覧を見ているなら読み直す
     if (mode === 'archives') loadArchives();
   }
+}
+
+/** タブの表示名（実行中の帯・案内に出す）。 */
+const modeLabel = (m) => {
+  const tab = dom.tabs.querySelector(`.tab[data-mode="${m}"]`);
+  return tab ? t(tab.dataset.i18n) : m;
+};
+
+/**
+ * 実行中の帯・出力の見せ方（#19）。出力と進み具合は実行したタブ（runMode）でだけ見せ、他のタブでは案内を出す。
+ * どこで何を出すかは run-view.js が決める（node のテストあり）。
+ */
+function renderRunView() {
+  const v = RunView.runView({ mode, runMode, running, stopRequested, finishedUnseen, starting });
+  const name = runMode ? modeLabel(runMode) : '';
+
+  const outputShown = dom.runOutput.hidden && v.showOutput;
+  dom.runOutput.hidden = !v.showOutput;
+  if (outputShown) restoreLogPosition(); // 隠している間に失ったスクロール位置を戻す
+  dom.runElsewhere.hidden = !v.showElsewhere;
+  if (v.showElsewhere) {
+    dom.runElsewhereText.textContent = t(running ? 'run_elsewhere_running' : 'run_elsewhere_done', { name });
+  }
+  dom.stop.hidden = !v.paneStop;
+  dom.stop.disabled = !v.paneStopEnabled;
+  dom.spinner.hidden = !v.paneSpinner;
+  dom.elapsed.hidden = !v.showOutput; // 終わった後も、かかった時間は実行したタブに残す
+
+  const barShown = dom.runbar.hidden && v.runbar;
+  dom.runbar.hidden = !v.runbar;
+  if (!v.runbar) return;
+  // 出たときは同じ文言でも読み上げさせる。同じタスクの中で空にして戻しても変化と見なされないので、次の描画で入れる
+  const finished = v.runbar === 'finished';
+  // 終わった印は状態の帯と同じ色・文言（実行したタブで出しているもの）
+  dom.runbar.className = finished && lastStatus ? `runbar finished banner-${lastStatus.level}` : 'runbar';
+  dom.runbarSpinner.hidden = finished;
+  dom.runbarElapsed.hidden = finished;
+  // 題名は読み上げの対象（role=status）。同じ文言を入れ直すと読み上げが繰り返されるので、変わったときだけ
+  setRunbarTitle(t(finished ? 'runbar_finished' : 'runbar_running', { name }), barShown);
+  // 実行中は進み具合（件数と残り時間）、終わった後は終わり方。中断を頼んだ・送れなかったなど、状態の帯に
+  // 知らせ（info 以外）が出ているときは、他のタブからも見えるように帯にも出す（状態の帯は実行したタブにしか無い）
+  const notice = !finished && lastStatus && lastStatus.level !== 'info' ? dom.status.textContent : '';
+  dom.runbarProgress.textContent = finished
+    ? (lastStatus ? dom.status.textContent : '')
+    : [lastProgress ? [dom.count.textContent, dom.eta.textContent].filter(Boolean).join(' · ') : '', notice]
+      .filter(Boolean).join(' — ');
+  dom.runbarProgress.title = dom.runbarProgress.textContent;
+  dom.runbarCommand.hidden = finished;
+  dom.runbarCommand.textContent = runCommand;
+  dom.runbarCommand.title = runCommand;
+  dom.runbarGo.hidden = !v.runbarGo;
+  dom.runbarStop.hidden = finished;
+  dom.runbarStop.disabled = !v.runbarStopEnabled;
+  dom.runbarDismiss.hidden = !finished;
+}
+
+/** 帯の題名（読み上げの対象）を入れる。shown は帯が今出たか（そのときは同じ文言でも次の描画で入れて読み上げさせる）。 */
+function setRunbarTitle(text, shown) {
+  runbarTitleText = text;
+  if (shown && !runbarTitlePending) {
+    dom.runbarTitle.textContent = '';
+    runbarTitlePending = true;
+    requestAnimationFrame(() => {
+      runbarTitlePending = false;
+      dom.runbarTitle.textContent = runbarTitleText;
+    });
+  } else if (!runbarTitlePending && dom.runbarTitle.textContent !== text) {
+    dom.runbarTitle.textContent = text;
+  }
+}
+
+/**
+ * 中断を頼む（実行ボタンの隣・他のタブの帯のどちらからでも）。
+ * 守ること: 一度頼んだら、終わるまでもう一度は押させない（2 度目の中断は detector の後片付けを途中で止めうる）。
+ * 押せるように戻すのは、main が「送れなかった」（false）と確かに答えたときだけ。null（子プロセスがもう無い・
+ * 終わるところ）や、応答そのものが失敗した（送れたかどうか分からない）ときは押せないまま、終わり方の表示に任せる。
+ */
+async function requestStop() {
+  const run = runSerial; // 頼んだときの実行（応答が届くまでに終わって次の実行が始まっていたら、その応答は使わない）
+  stopRequested = true;
+  setStatus('warn', 'status_stop_requested');
+  let sent;
+  try {
+    sent = await api.stop();
+  } catch {
+    return; // 送れたかどうか分からない
+  }
+  if (sent !== false || !running || runSerial !== run) return;
+  stopRequested = false;
+  setStatus('warn', 'status_stop_failed'); // 実行は続いている
+}
+
+/**
+ * main が記録している実行の素性（実行したタブ・始めたときのログの場所と正本 DB の欄の値）を、出力の持ち主として受け取る。
+ * 開き直したとき（resumeRun）と、取り戻す前に終わったとき（onExit）の両方で使う。開き直す前に欄を変えていても、
+ * その実行のログを開き、その実行の DB の一覧にだけ案内の印を付ける
+ */
+function adoptRun(run) {
+  runMode = run.mode || mode;
+  runLogDir = String(run.logDir || '').trim();
+  runArchiveDb = String(run.archiveDb || '').trim();
 }
 
 /** ウィンドウを閉じて開き直したとき、走り続けている実行の表示と「中断」を取り戻す。 */
@@ -617,8 +821,15 @@ function resumeRun(run) {
     { stream: 'meta', text: t('reopened_note') },
   ]));
   setStatus('info', 'status_running');
+  adoptRun(run);
+  runCommand = run.command || '';
   // 実行中にしてから描く（残り時間と処理中のファイルは実行中だけ出す）
   setRunning(true, run.startedAt);
+  if (run.stopRequested) {
+    // 閉じる前に中断を頼んでいた。もう一度押させない（2 度目の中断は detector の後片付けを途中で止めうる）
+    stopRequested = true;
+    setStatus('warn', 'status_stop_requested');
+  }
   if (!lastProgress && (run.stage || run.processed)) {
     renderProgress(run);
   } else if (lastProgress) {
@@ -635,16 +846,31 @@ function resumeRun(run) {
 
 /** 実行します。extra はフォームに無い指定（一覧の行から登録を外すときの forgetId など）。 */
 async function start(extra = {}) {
-  if (running) return;
-  clearLog();
+  if (running || starting) return;
+  clearLog(); // 前の出力と、その出力が付けた案内の印を消す（印は出力と運命をともにする）
   const form = { ...collectForm(), ...extra };
+  adoptRun(form);
+  // コマンドは main の応答で決まる（プレビューには一覧の行から外す指定などが入っていない）
+  runCommand = '';
   setLogOpen(logOpenFor(form.mode));
   // 応答を待つ前に実行中にする。spawn 失敗（uv 不在など）では応答より先に run:exit が届くことがあり、
   // 応答側で後から実行中に戻すと、子プロセスが無いのに操作不能になる
+  starting = true;
   setRunning(true);
   setStatus('info', 'status_starting');
-  const result = await api.start(form);
+  let result;
+  try {
+    result = await api.start(form);
+  } catch (e) {
+    // main の処理が例外で抜けた。始まらなかったものとして扱う（実行中のまま操作できなくならないように）
+    result = { started: false, error: t('launch_failed_detail', { detail: e.message || String(e) }) };
+  } finally {
+    starting = false;
+    updateRunButton();
+  }
   if (!result.started) {
+    // 始まらなかった実行は出力の持ち主にしない（断りの帯はどのタブでも見える）
+    releaseOutput();
     setRunning(false);
     setLogOpen(true); // 始まらなかった（確認で取り消した・断られた）。たたんだままにしない
     // error は main が今の言語に訳した文言。キーとして引いても見つからないのでそのまま出る
@@ -652,6 +878,8 @@ async function start(extra = {}) {
     return;
   }
   appendLog([{ stream: 'meta', text: `$ ${result.command}` }]);
+  runCommand = result.command; // main が実際に組んだもの
+  renderRunView();
   if (form.mode !== 'archives') rememberRecent((form.archiveRoot || '').trim());
   persist();
   // 応答より先に終了通知を受けて片付いていたら（onExit が running を落としている）、状態を上書きしない
@@ -659,8 +887,9 @@ async function start(extra = {}) {
   setStatus('info', 'status_running');
 }
 
-function logDir() {
-  const custom = el('logDir').value.trim();
+/** ログ・CSV の場所。value は詳細設定の欄の値（空なら既定の場所）。 */
+function logDir(value = el('logDir').value) {
+  const custom = String(value || '').trim();
   return custom || `${context.dataDir}/log`;
 }
 
@@ -761,7 +990,7 @@ function wireForm() {
   dom.langSelect.addEventListener('change', () => changeLanguage(dom.langSelect.value));
   dom.tabs.addEventListener('click', (e) => {
     const tab = e.target.closest('.tab');
-    if (tab && !tab.disabled) setMode(tab.dataset.mode);
+    if (tab) setMode(tab.dataset.mode);
   });
 }
 
@@ -781,15 +1010,21 @@ function wireRunControls() {
     renderNextAdopt();
     setMode('adopt');
   });
-  dom.stop.addEventListener('click', () => {
-    api.stop();
-    dom.stop.disabled = true;
-    setStatus('warn', 'status_stop_requested');
+  dom.stop.addEventListener('click', requestStop);
+  dom.runbarStop.addEventListener('click', requestStop);
+  // 実行したタブへ（帯・他のタブの案内から）
+  const showRun = () => runMode && setMode(runMode);
+  dom.runbarGo.addEventListener('click', showRun);
+  dom.runElsewhereGo.addEventListener('click', showRun);
+  dom.runbarDismiss.addEventListener('click', () => {
+    finishedUnseen = false;
+    renderRunView();
   });
   // 実行中のクリアはログの行だけ消す。進み具合と失敗の一覧はその実行のもので、main は失敗の一覧を
   // 増えたときにしか送らないので、ここで消すと二度と戻らない
   dom.clearLog.addEventListener('click', () => (running ? clearLogLines() : clearLog()));
   dom.logToggle.addEventListener('click', () => setLogOpen(dom.log.hidden));
+  dom.log.addEventListener('scroll', noteLogPosition, { passive: true });
   dom.copyCommand.addEventListener('click', () => {
     const text = dom.commandText.textContent;
     if (text && !dom.commandText.classList.contains('invalid')) {
@@ -800,7 +1035,7 @@ function wireRunControls() {
     }
   });
   dom.openCsv.addEventListener('click', () => lastCsvPath && api.reveal(lastCsvPath));
-  dom.revealLog.addEventListener('click', () => api.open(logDir()));
+  dom.revealLog.addEventListener('click', () => api.open(logDir(runLogDir ?? undefined)));
   dom.openDataDir.addEventListener('click', () => api.openDataDir());
   document.addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
@@ -816,6 +1051,8 @@ function wireRunEvents() {
   api.onExit((result) => {
     // 開き直し直後、getContext() の後〜復元前に終わった場合に古い状態で復元しないようにする
     context.run = null;
+    // 実行の素性は main の記録を正とする（開き直した直後、実行を取り戻す前に終わったときもここで決まる）
+    if (result.mode) adoptRun(result);
     setRunning(false);
     // 実行中の印・残り時間・処理中のファイルを消して描き直す（段階の完了は detector が出したとおり）
     if (result.stage) renderProgress(result);
@@ -830,12 +1067,14 @@ function wireRunEvents() {
     const { level, key, vars } = result.meaning;
     // 警告の数は main が数える（開き直す前に出たもの・実行中にクリアした行のものも含む）
     if (result.stoppedByUser || level !== 'ok' || result.warnings > 0) setLogOpen(true);
-    if (result.stoppedByUser) {
-      setStatus('warn', 'status_stopped');
-      return;
-    }
+    if (result.stoppedByUser) setStatus('warn', 'status_stopped');
     // 終了の意味は main からキーで届く（言語を切り替えても訳し直せるように）
-    setStatus(level, 'status_exit', { text: { key, vars }, code: result.code });
+    else setStatus(level, 'status_exit', { text: { key, vars }, code: result.code });
+    // 他のタブにいる間に終わったら、見に行くまで帯に残す（#19）。終わり方の状態を決めた後で出す
+    // （先に出すと、実行中・中断を頼んだときの色と文言で一度描いてしまう）
+    // init がタブを戻す前なら、まだ見ていないものとし、戻した後のタブで判定する（setMode が実行したタブなら消す）
+    finishedUnseen = runMode !== null && (!initialized || mode !== runMode);
+    renderRunView();
   });
 }
 
@@ -858,4 +1097,7 @@ async function init() {
   setMode(mode);
 }
 
-init();
+// 途中で失敗しても、終了の通知を「init の前」として扱い続けないように
+init().finally(() => {
+  initialized = true;
+});
