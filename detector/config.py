@@ -404,6 +404,8 @@ def setup_logging(config: DetectorConfig) -> None:
     file_handler.setLevel(logging.DEBUG)
     console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setLevel(logging.INFO)
+    # extra={"file_only": True} の記録はファイルにだけ書く（UI から起動したときの 1 件ごとの失敗など。#18）
+    console_handler.addFilter(lambda record: not getattr(record, "file_only", False))
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

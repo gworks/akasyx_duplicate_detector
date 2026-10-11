@@ -358,3 +358,17 @@ def test_legacy_import_decides_stored_in_one_batch(session, archive, tmp_path, m
     assert got == {"a.txt": "stored", "b.txt": "stored", "c.txt": "unregistered", "d.txt": "missing", "e.txt": "stored"}
     item = session.query(IngestItem).one()  # 明細の参照先は付け直した id
     assert session.get(ArchiveFile, item.archive_file_id).name == "a.txt"
+
+
+def test_legacy_db_in_folder_with_uri_characters(session, tmp_path):
+    """保存フォルダのパスに URI で意味を持つ文字（# ? %）があっても、v0.1.x の DB を取り込める。"""
+    root = tmp_path / "Project #2 ?x %41"
+    root.mkdir()
+    legacy = legacy_db_path(str(root))
+    _make_legacy_db(legacy, str(root))
+
+    row = archives.resolve_archive(session, str(root))
+
+    files = session.query(ArchiveFile).filter_by(archive_id=row.id).all()
+    assert [f.stored_path_rel for f in files] == ["inbox/a.txt"]
+    assert not os.path.exists(legacy)

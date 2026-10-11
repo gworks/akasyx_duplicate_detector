@@ -1,6 +1,8 @@
 # ingest.py - add の判定ループ（設計書 §7.1）
+import json
 import logging
 import os
+import sqlite3
 from datetime import datetime
 
 from sqlalchemy import and_, case, or_
@@ -193,16 +195,100 @@ def own_data_matcher(config, source: str | None = None):
     return is_own
 
 
-def _collect_files(config):
-    """投入元を走査して ScannedFile のイテレータと crawler スキャン情報を返します。"""
+def _print_stage(stage: str) -> None:
+    """段階の切り替わりを UI に知らせます（#18。electron-ui/detector-output.js の STAGE_LINE）。
+
+    scan（一覧作成）→ ingest（判定と移動）→ cleanup（後片付け）→ done（すべて済んだ）。次の段階を出すのは、
+    前の段階が最後まで済んだときだけ。
+
+    すぐ flush する。stdout がパイプでバッファされていると、続けて起動する crawler の出力より後に届き、
+    一覧作成の進み具合が前の段階のものに見える。
+    """
+    print(f"Stage: {stage}", flush=True)
+
+
+# UI（electron-ui/main.js）から起動したときだけ 1 にする。1 件ごとの JSON の行（処理中のファイル・失敗）と、区切りの行
+# （Crawler finished / Ingest finished）は UI 向けで、CLI の端末では読みにくいだけなので出さない（CLI では失敗は
+# パス入りの WARNING と CSV で分かる）。
+# 段階・全体の件数・Progress の行は短く人が読めるので、CLI でも出す
+UI_PROGRESS_ENV = "AKASYX_UI_PROGRESS"
+
+
+def _ui_progress() -> bool:
+    """UI から起動されたか（1 件ごとの JSON の行・区切りの行を出すか）。run_add で 1 回だけ読み、その値を使い回す。"""
+    return os.environ.get(UI_PROGRESS_ENV) == "1"
+
+
+def _print_path_line(label: str, **fields) -> None:
+    """パスを含む行を 1 行の JSON で出します（#18。UI から起動したときだけ呼ぶ）。
+
+    ファイル名に改行や `: ` が入っても行が割れず、UI が読み違えない。ASCII だけにするのは、
+    端末や UI の文字コードに左右されず、文字コードとして不正な名前（surrogateescape）でも出せるようにするため。
+    flush するのは、PYTHONUNBUFFERED が効かない起動のされ方でも、処理中のファイルが遅れて届かないようにするため。
+    """
+    print(f"{label}: {json.dumps(fields, ensure_ascii=True)}", flush=True)
+
+
+def _count_total(scan) -> int | None:
+    """処理する件数。数えられなければ None（0 件や 100% と出さず、件数なしで進める。#18）。"""
+    if scan is None:
+        return 1  # 単一ファイル
+    try:
+        return crawler_client.count_files(scan.db_path, scan.scan_id)
+    except (sqlite3.Error, OSError, ValueError) as e:
+        # ValueError: DB の場所から URI を作れない（Windows の対になっていないサロゲートなど。UnicodeEncodeError）
+        logger.warning(f"Could not count the files to process; progress is shown without the total: {e}")
+        return None
+
+
+def _collect_files(config, ui_lines: bool = False):
+    """投入元を走査して ScannedFile のイテレータと crawler スキャン情報を返します。
+
+    ui_lines は UI 向けの行を出すか（run_add で 1 回だけ読んだ値。途中で食い違わないように）。
+    """
     source = config.source_path
     if os.path.isdir(source):
-        # .DS_Store 等の OS メタデータは保存する価値が無く、取り込むと保存フォルダが汚れる
-        scan = crawler_client.run_crawler(source, config, extra_excludes=OS_JUNK_FILES)
+        _print_stage("scan")
+        try:
+            # .DS_Store 等の OS メタデータは保存する価値が無く、取り込むと保存フォルダが汚れる
+            scan = crawler_client.run_crawler(source, config, extra_excludes=OS_JUNK_FILES)
+        finally:
+            # crawler の出力はここまで。失敗しても出す（この後の detector 自身の行を、UI が crawler の出力と
+            # 取り違えないように。#18。electron-ui/detector-output.js の CRAWLER_FINISHED_LINE）。UI 向けの区切り
+            if ui_lines:
+                print("Crawler finished", flush=True)
+        # 完走を確かめてから段階を進める（完走していなければ、止まったのは一覧作成。判定には入らない）
         crawler_client.ensure_completed(scan)
-        return crawler_client.read_files(scan.db_path, scan.scan_id), scan
-    # 単一ファイルは crawler を使わず直接読む（設計書 §6.4）
-    return iter([crawler_client.scan_single_file(source)]), None
+        _print_stage("ingest")
+        return _announce_each(crawler_client.read_files(scan.db_path, scan.scan_id), ui_lines), scan
+    # 単一ファイルは crawler を使わず直接読む（設計書 §6.4）。消えている・読めないときは、CSV や段階を出す前に
+    # 止める（stat だけ先に。ハッシュは時間がかかるのでループの中で取り、その前に段階と処理中のファイルを出す）
+    st = os.stat(source)
+    _print_stage("ingest")
+    return _scan_single_file_lazily(source, st, ui_lines), None
+
+
+def _announce_each(files, ui_lines: bool):
+    """1 件取り出すごとに、処理中のファイルを UI に知らせます（処理する前に）。閉じたら元の一覧も閉じる。"""
+    try:
+        for scanned in files:
+            if ui_lines:
+                _print_path_line("Current file", path=scanned.path_abs)
+            yield scanned
+    finally:
+        files.close()
+
+
+def _scan_single_file_lazily(source, st, ui_lines: bool):
+    """単一ファイルを、判定のループの中で（最初の 1 件を取り出すときに）読みます。
+
+    ハッシュはここで取る。ディレクトリと同じく、ハッシュ中の中断も中断として扱われ、判定の終わり（Ingest finished）が出る。
+    時間のかかるハッシュの前に、処理中のファイルを知らせる。
+    """
+    if ui_lines:
+        _print_path_line("Current file", path=source)
+    # 事前の stat の結果を渡す（stat し直さない。この後に読めなくなっても、ハッシュなしの 1 件として扱われる）
+    yield crawler_client.scan_single_file(source, st)
 
 
 def resolve_dest_subdir(config) -> str | None:
@@ -220,71 +306,104 @@ def resolve_dest_subdir(config) -> str | None:
 
 def run_add(session, config, ingest) -> tuple[str, dict]:
     """投入元を取り込みます。戻り値は (実行ステータス, result 別件数)。"""
-    files, scan = _collect_files(config)
-    if scan is not None:
-        ingest.crawler_db_path = scan.db_path
-        ingest.crawler_scan_id = scan.scan_id
-        session.commit()
-
-    planner = mover.DestPlanner(session, config, resolve_dest_subdir(config))
-    counters: dict[str, int] = {}
-    reserved: set[str] = set()       # dry-run 用: 予約済みの保存先（casefold）
-    virtual_hashes: set = set()      # dry-run 用: 取り込み予定の内容
-    status = "completed"
-
-    ts_start = f"{datetime.now():%Y%m%d_%H%M%S}"
-    csv_file = create_csv(config.log_dir, "add_result", ts_start)
-    processed = 0
-    is_own = own_data_matcher(config)
-    lookup = archives.ArchiveLookup()
-    in_archive = archive_matcher(config, lookup)
-
+    ui_lines = _ui_progress()
+    files, scan = _collect_files(config, ui_lines)
+    # 判定の段階に入った後は、ループの前の準備（件数の数え上げなど）で止まっても、判定の終わり（Ingest finished）を出す。
+    # UI は処理中のファイルと残り時間を止める（#18。UI 向けの区切り）
     try:
-        for scanned in files:
-            processed += 1
-            if is_own(scanned.path_abs):
-                # 取り込まないが、CSV とサマリには残す（黙って減らすと件数が合わず取りこぼしに見える）
-                result, stored_rel = RESULT_SKIPPED_OWN_DATA, None
-                message = "The detector's own data (master DB / work DB / logs / UI data); not ingested"
-                logger.warning(f"Skipped the detector's own data inside the source: {scanned.path_abs}")
-                _record_item(session, config, ingest, scanned, result, None, None, message)
-            elif (message := in_archive(scanned.path_abs)) is not None:
-                # 保存フォルダの管理用フォルダ・保存フォルダの中のファイルは動かさない（#6）
-                result, stored_rel = RESULT_SKIPPED_IN_ARCHIVE, None
-                logger.warning(f"Skipped: {message}: {scanned.path_abs}")
-                _record_item(session, config, ingest, scanned, result, None, None, message)
-            else:
-                result, stored_rel, message = _process_one(
-                    session, config, ingest, scanned, planner, reserved, virtual_hashes, lookup
-                )
-            counters[result] = counters.get(result, 0) + 1
-            csv_update(
-                csv_file,
-                [
-                    scanned.name,
-                    scanned.path_abs,
-                    result,
-                    scanned.size,
-                    stored_rel or "",
-                    message or "",
-                ],
-            )
-            print(f"Progress: {processed} files ({result})")
-            if not config.dry_run and processed % COMMIT_INTERVAL == 0:
-                session.commit()
-    except KeyboardInterrupt:
-        status = "interrupted"
-        logger.warning("Interrupted by user")
-    finally:
-        if not config.dry_run:
+        if scan is not None:
+            ingest.crawler_db_path = scan.db_path
+            ingest.crawler_scan_id = scan.scan_id
             session.commit()
 
+        planner = mover.DestPlanner(session, config, resolve_dest_subdir(config))
+        counters: dict[str, int] = {}
+        reserved: set[str] = set()       # dry-run 用: 予約済みの保存先（casefold）
+        virtual_hashes: set = set()      # dry-run 用: 取り込み予定の内容
+        status = "completed"
+
+        ts_start = f"{datetime.now():%Y%m%d_%H%M%S}"
+        csv_file = create_csv(config.log_dir, "add_result", ts_start)
+        processed = 0
+        is_own = own_data_matcher(config)
+        lookup = archives.ArchiveLookup()
+        in_archive = archive_matcher(config, lookup)
+
+        try:
+            # 件数の数え上げは大きい DB では時間がかかるので、中断をループと同じく受け止める try の中で行う
+            total = _count_total(scan)
+            if total is not None:
+                print(f"Total: {total} files", flush=True)
+            of_total = f"/{total}" if total is not None else ""
+
+            for scanned in files:
+                processed += 1
+                if is_own(scanned.path_abs):
+                    # 取り込まないが、CSV とサマリには残す（黙って減らすと件数が合わず取りこぼしに見える）
+                    result, stored_rel = RESULT_SKIPPED_OWN_DATA, None
+                    message = "The detector's own data (master DB / work DB / logs / UI data); not ingested"
+                    logger.warning(f"Skipped the detector's own data inside the source: {scanned.path_abs}")
+                    _record_item(session, config, ingest, scanned, result, None, None, message)
+                elif (message := in_archive(scanned.path_abs)) is not None:
+                    # 保存フォルダの管理用フォルダ・保存フォルダの中のファイルは動かさない（#6）
+                    result, stored_rel = RESULT_SKIPPED_IN_ARCHIVE, None
+                    logger.warning(f"Skipped: {message}: {scanned.path_abs}")
+                    _record_item(session, config, ingest, scanned, result, None, None, message)
+                else:
+                    result, stored_rel, message = _process_one(
+                        session, config, ingest, scanned, planner, reserved, virtual_hashes, lookup
+                    )
+                counters[result] = counters.get(result, 0) + 1
+                csv_update(
+                    csv_file,
+                    [
+                        scanned.name,
+                        scanned.path_abs,
+                        result,
+                        scanned.size,
+                        stored_rel or "",
+                        message or "",
+                    ],
+                )
+                if result == RESULT_FAILED:
+                    # どの経路で failed になっても、パス入りの WARNING でログファイルに残す（1 件 1 行）。UI から起動したときは
+                    # JSON の行（失敗の一覧）で知らせ、WARNING は詳細ログ（コンソール）には流さない（失敗が多いと詳細ログを
+                    # 埋めて、ほかの警告を押し出すため。全件は CSV とログファイル）
+                    logger.warning(
+                        f"Failed: {scanned.path_abs}: {message or ''}", extra={"file_only": ui_lines}
+                    )
+                    if ui_lines:
+                        _print_path_line("Failed", path=scanned.path_abs, message=message or "")
+                # UI から起動したときは 1 件ずつ flush する（PYTHONUNBUFFERED が効かない起動でも遅れて届かないように）。
+                # CLI でリダイレクトしたときに 1 件ごとの書き込みにはしない
+                print(f"Progress: {processed}{of_total} files ({result})", flush=ui_lines)
+                if not config.dry_run and processed % COMMIT_INTERVAL == 0:
+                    session.commit()
+        except KeyboardInterrupt:
+            status = "interrupted"
+            logger.warning("Interrupted by user")
+        finally:
+            if not config.dry_run:
+                session.commit()
+    finally:
+        # 一覧（crawler DB の接続）はここで閉じる。中断・例外で抜けても、後片付けの間まで開いたままにしない
+        files.close()
+        if ui_lines:
+            print("Ingest finished", flush=True)
+
+    # 段階は、前の段階が最後まで済んだときだけ進める（UI は「次の段階が出たら前の段階は完了」とだけ読む。#18）。
+    # 中断したときも後片付けは走るが、判定が済んだとは出さない
+    completed = status == "completed"
+    if completed:
+        _print_stage("cleanup")
     _report_unavailable_owners(session, lookup)
 
     if config.prune_empty_dirs and not config.dry_run and os.path.isdir(config.source_path):
         removed = mover.prune_empty_dirs(config.source_path, keep=is_own)
         if removed:
             logger.info(f"Removed {removed} empty source directories")
+    if completed:
+        _print_stage("done")
 
     logger.info(f"CSV report: {csv_file}")
     return status, counters

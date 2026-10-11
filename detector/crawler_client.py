@@ -3,6 +3,7 @@
 # crawler は `package = false` のフラット構成（import collector）でライブラリ import に
 # 向かないため、CLI としてサブプロセス起動し、出力された file_inventory.db を
 # 読み取り専用で参照する。detector の判定ロジックは ScannedFile にしか依存させない。
+import contextlib
 import logging
 import mimetypes
 import os
@@ -15,7 +16,7 @@ from typing import Iterator
 
 from errors import PreflightError
 from utl import hashing
-from utl.helpers import to_posix
+from utl.helpers import connect_readonly, to_posix
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +105,7 @@ def _max_scan_id(db_path: str) -> int:
     if not os.path.exists(db_path):
         return 0
     try:
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        with contextlib.closing(connect_readonly(db_path)) as conn:
             row = conn.execute("SELECT MAX(id) FROM fs_scans").fetchone()
     except sqlite3.DatabaseError:
         return 0
@@ -113,7 +114,7 @@ def _max_scan_id(db_path: str) -> int:
 
 def _read_scan(db_path: str, after_id: int) -> tuple[int | None, str]:
     """after_id より後に作られた最新の fs_scans 行の (id, status) を返します。"""
-    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+    with contextlib.closing(connect_readonly(db_path)) as conn:
         row = conn.execute(
             "SELECT id, status FROM fs_scans WHERE id > ? ORDER BY id DESC LIMIT 1",
             (after_id,),
@@ -188,14 +189,26 @@ def _parse_dt(value) -> datetime | None:
         return None
 
 
+# 今回のスキャンで存在確認された active な行。read_files と count_files で同じ条件を使う
+# （条件がずれると、UI の割合が 100% を超えたり届かないまま終わったりする。#18）
+_SCANNED_ROWS = "FROM fs_files WHERE last_seen_scan_id = ? AND status = 'active'"
+
+
+def count_files(db_path: str, scan_id: int) -> int:
+    """read_files が返す件数を数えます（読み取り専用。読めなければ sqlite3.Error）。"""
+    # sqlite3 の with は commit / rollback だけで接続を閉じないので、closing で閉じる
+    with contextlib.closing(connect_readonly(db_path)) as conn:
+        return int(conn.execute(f"SELECT COUNT(*) {_SCANNED_ROWS}", (scan_id,)).fetchone()[0])
+
+
 def read_files(db_path: str, scan_id: int) -> Iterator[ScannedFile]:
     """今回のスキャンで存在確認された active な行を読み出します（読み取り専用）。"""
     sql = (
         "SELECT name, path_abs, path_rel, size, filehash, hash_algo, mime_type,"
-        " modified_at, created_at FROM fs_files"
-        " WHERE last_seen_scan_id = ? AND status = 'active' ORDER BY path_abs"
+        f" modified_at, created_at {_SCANNED_ROWS} ORDER BY path_abs"
     )
-    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+    # 途中で止まっても（ジェネレータを閉じたとき）接続を閉じる。sqlite3 の with だけでは閉じない
+    with contextlib.closing(connect_readonly(db_path)) as conn:
         for row in conn.execute(sql, (scan_id,)):
             yield ScannedFile(
                 name=row[0],
@@ -210,18 +223,26 @@ def read_files(db_path: str, scan_id: int) -> Iterator[ScannedFile]:
             )
 
 
-def scan_single_file(path: str) -> ScannedFile:
+def scan_single_file(path: str, st: os.stat_result | None = None) -> ScannedFile:
     """単一ファイルを crawler を使わずに直接読み取ります（設計書 §6.4）。
 
     1ファイルのためにサブプロセスを起こす意味がなく、除外指定の取りこぼしも避けられる。
     """
-    st = os.stat(path)
+    # 呼び出し側が先に stat していればそれを使う（stat し直す間に消えて、実行全体が落ちないように。#18）
+    if st is None:
+        st = os.stat(path)
     name = os.path.basename(path)
     try:
         filehash = hashing.file_hash(path)
         algo = hashing.HASH_ALGO
+        # ハッシュを取った後に stat し直し、前と同じ版かを確かめる。stat の後・ハッシュの間に書き換わる・差し替わると、
+        # 大きさ・日時（前の版）とハッシュ・中身（後の版）が食い違った記録になるので、ハッシュ無しとして移動しない（#18）
+        after = os.stat(path)
+        if _file_version(after) != _file_version(st):
+            logger.warning(f"The file changed while reading; not ingested this time: {path}")
+            filehash, algo = None, None
     except OSError as e:
-        # 読み取れなければハッシュ無しとして返す（判定側が skipped_nohash にする）
+        # 読み取れなければ（ハッシュの間に消えた場合も）ハッシュ無しとして返す（判定側が skipped_nohash にする）
         logger.warning(f"Failed to compute hash: {path}: {e}")
         filehash, algo = None, None
     return ScannedFile(
@@ -235,6 +256,15 @@ def scan_single_file(path: str) -> ScannedFile:
         modified_at=datetime.fromtimestamp(st.st_mtime, tz=timezone.utc),
         created_at=birthtime_utc(st),
     )
+
+
+def _file_version(st: os.stat_result) -> tuple:
+    """同じ版のファイルかを見分ける組（大きさ・更新日時）。
+
+    inode とデバイスは使わない。FUSE・クラウド同期・一部のネットワークのマウントでは、変わっていないファイルでも
+    stat のたびに inode が変わることがあり、「読んでいる間に変わった」と取り違えて取り込めなくなるため。
+    """
+    return (st.st_size, st.st_mtime_ns)
 
 
 def birthtime_utc(st: os.stat_result) -> datetime | None:

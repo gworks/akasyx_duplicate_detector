@@ -246,7 +246,10 @@ Python 側の前提は CLI と同じです（`detector/` で `uv sync` 済み、
 - **前回の入力を復元** — 次回起動時に同じ値が入っています
   （ただし `--yes`（実削除）は毎回オフに戻ります）
 - **実行されるコマンドを常時表示** — 「コピー」でターミナルにそのまま貼れる形で取れます
-- **進捗の集計表示** — `add` の1ファイル1行の出力はログに流さず、件数と判定内訳に集計します
+- **進み具合の表示**（#18） — `add` は段階（ファイル一覧の作成 → 判定と移動 → 後片付け）・`処理済み / 全体` の件数と割合・
+  直近 10 分の速さから出す残り時間・処理中のファイル・判定内訳・失敗したファイルの一覧（パスとエラー、500 件まで）を出します。
+  1ファイルごとの行はログに流さず、詳細ログは既定でたたみます（正常に終わらなかったとき・中断したとき・警告やエラーの行があったときは開きます）。全体の件数を数えられないときは
+  割合も残り時間も出さず「全体の件数は不明」と出します
 - **CSV / ログへの導線** — 実行後に出力された CSV を Finder で開けます
 
 ### 多言語対応
@@ -257,10 +260,14 @@ Python 側の前提は CLI と同じです（`detector/` で `uv sync` 済み、
   辞書に無いキーは英語の値で埋める。HTML を含む値はキー名を `*_html` にする（`data-i18n-html` で innerHTML に入る）
 - 文言を足したら 6 言語すべてに同じキーを入れる。`cd electron-ui && npm test` が、JSON として読めること・キーと
   `{差し込み名}` の一致・`index.html` と入力エラーが参照するキーの存在を検査する
-- detector 本体のログ・コンソール出力は**英語のみ**。UI は `Progress: <n> files (<result>)`・`CSV report: <path>`・
+- detector 本体のログ・コンソール出力は**英語のみ**。UI は `Progress: <n>[/<全体>] files (<result>)`・`Stage: scan|ingest|cleanup|done`（次の段階は前の段階が最後まで済んだときだけ出る）・
+  `Total: <n> files`・`Current file: {"path": …}`・`Failed: {"path": …, "message": …}`（パスを含む行は ASCII の JSON で、
+  UI が環境変数 `AKASYX_UI_PROGRESS=1` を付けて起動したときだけ出る。CLI では失敗はパス入りの WARNING と CSV で分かる）・
+  crawler の `Processing files: <n>/<全体>`・crawler の出力の終わりを示す `Crawler finished`・判定のループの終わり（中断を含む）を
+  示す `Ingest finished`（この 2 つも UI から起動したときだけ出る）・`CSV report: <path>`・
   `Note: … archives --forget <ID>`・adopt の案内（`…: adopt <フォルダ>`）の行と、`archives --json` の出力を読む
-  （変えるときは `electron-ui/detector-output.js` の正規表現も直す。Note と adopt の案内は
-  `detector/tests/test_archives_ui.py` が同じ正規表現で実際の出力を確かめる）
+  （変えるときは `electron-ui/detector-output.js` の正規表現も直す。進み具合の行は `detector/tests/test_progress_output.py`、
+  Note と adopt の案内は `detector/tests/test_archives_ui.py` が同じ正規表現で実際の出力を確かめる）
 
 ### 安全側の作り
 

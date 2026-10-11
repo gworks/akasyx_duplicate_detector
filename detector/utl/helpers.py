@@ -1,7 +1,9 @@
 # helpers.py - 共通ヘルパー
 import json
 import os
+import sqlite3
 import sys
+import urllib.parse
 from datetime import datetime
 
 
@@ -64,3 +66,37 @@ def format_size(num: int) -> str:
             return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
         value /= 1024.0
     return f"{value:.1f} TiB"  # pragma: no cover - 上のループで必ず返る
+
+
+def sqlite_uri_for(path: str, windows: bool) -> str:
+    """絶対パスから、SQLite が読み取り専用で開く URI を作ります。
+
+    パスの `#` `?` `%` などはエスケープする（そのまま書くと別のパスになる）。`\\` を区切りとみなすのは Windows だけ
+    （macOS・Linux ではファイル名の文字）。`file://` の後ろは必ず `/` で始まるパスにする: ドライブは `file:///C:/...`、
+    ネットワーク共有（UNC）は `file:////nas/share/...`（`file://nas/...` だと SQLite がホスト名として断る）。
+    pathlib の as_uri は UNC を `file://nas/...` にするので使わない。
+    """
+    if windows:
+        # 拡張長パスの接頭辞（\\?\C:\... と \\?\UNC\server\...）は外す（? がエスケープされて別のパスになる）
+        if path.startswith("\\\\?\\UNC\\"):
+            path = "\\\\" + path[len("\\\\?\\UNC\\"):]
+        elif path.startswith("\\\\?\\"):
+            path = path[len("\\\\?\\"):]
+        path = path.replace("\\", "/")
+    if not path.startswith("/"):
+        path = "/" + path
+    # UTF-8 でない名前（surrogateescape で来る）は元のバイトのままエスケープする
+    return f"file://{urllib.parse.quote(path, safe='/:', errors='surrogateescape')}?mode=ro"
+
+
+def sqlite_readonly_uri(path: str) -> str:
+    """SQLite の DB を読み取り専用で開く URI（このマシンのパスの規則で。sqlite_uri_for）。"""
+    return sqlite_uri_for(os.path.abspath(path), windows=os.name == "nt")
+
+
+def connect_readonly(path: str) -> sqlite3.Connection:
+    """SQLite の DB を読み取り専用で開きます（パスは sqlite_readonly_uri でエスケープする）。
+
+    sqlite3 の with は commit / rollback だけで接続を閉じないので、呼び出し側は contextlib.closing か finally で閉じる。
+    """
+    return sqlite3.connect(sqlite_readonly_uri(path), uri=True)

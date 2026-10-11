@@ -15,7 +15,7 @@ from models import Archive
 
 # electron-ui/detector-output.js の NOTE_FORGET_LINE / ADOPT_HINT_LINE と同じ
 NOTE_FORGET_LINE = re.compile(r"^Note: .*archive folder #(\d+) .*`archives --forget (\d+)`")
-ADOPT_HINT_LINE = re.compile(r"(?:Register the files in it first|Run adopt again): adopt (.+)$")
+ADOPT_HINT_LINE = re.compile(r"^\s+(?:Register the files in it first|Run adopt again): adopt (.+)$")
 
 
 def _add(make_config, root, source, tmp_path, fake_crawler):

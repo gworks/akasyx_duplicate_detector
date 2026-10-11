@@ -6,7 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { buildArgs, formatCommand, quoteArg, FormError, normalizePath, toFieldValue } = require('./commands');
-const { scanLine, parseArchivesJson } = require('./detector-output');
+const { scanLine, parseArchivesJson, createRunState, countsAsWarning } = require('./detector-output');
 const i18n = require('./i18n');
 
 // electron-ui/ はリポジトリルート直下に置く（設計書 §16）
@@ -34,6 +34,7 @@ const UV_CANDIDATES = [
 const EXTRA_PATH_DIRS = UV_CANDIDATES.map((p) => path.dirname(p));
 
 const FLUSH_INTERVAL_MS = 80;
+const ETA_TICK_MS = 1000; // 残り時間を計算し直して送る間隔（#18）
 const LIST_TIMEOUT_MS = 120000; // 保存フォルダの一覧（archives --json）を待つ上限
 
 // 終了コードの意味。文言は辞書のキーで renderer に渡し、renderer が今の言語で出す
@@ -155,6 +156,8 @@ function childEnv() {
     // 逐次出力させる。無いとログが終了までまとめて届く
     PYTHONUNBUFFERED: '1',
     PYTHONIOENCODING: 'utf-8',
+    // 処理中のファイル・失敗の行（JSON）を出させる。CLI では出ない（detector/ingest.py の UI_PROGRESS_ENV。#18）
+    AKASYX_UI_PROGRESS: '1',
     PATH: `${process.env.PATH || ''}${path.delimiter}${extra}`,
     // 実行形式では detector が同梱の crawler を起動する（uv と crawler のソースが要らない）
     ...(BIN_DIR ? { AKASYX_SIBLINGS_BIN: BIN_DIR } : {}),
@@ -248,12 +251,15 @@ function interrupt() {
 
 /** stdout/stderr を行単位に切り、ログは束ねて、進捗は集計だけ送る。 */
 function createStreamPump(send) {
+  const run = createRunState();
   let pending = [];              // 未送信のログ行
-  let progress = null;           // { processed, tally }
+  let progressChanged = false;   // 前回送ってから進み具合が変わったか
+  let sentFailures = 0;          // 前回送った失敗の一覧の件数（一覧は変わったときだけ送る）
   let timer = null;
   let csvPath = null;
   const forgetIds = new Set(); // Note: 行が示す、つながっていない保存フォルダ（登録を外す候補。#11）
   let adoptPath = null;        // 断りの案内が示す、adopt が要るフォルダ
+  let warnings = 0;            // 警告・エラーの行の数（開き直す前に出たものも、終わったときに詳細ログを開く判断に使う）
 
   const flush = () => {
     timer = null;
@@ -261,34 +267,56 @@ function createStreamPump(send) {
       send('run:log', pending);
       pending = [];
     }
-    if (progress) {
-      send('run:progress', progress);
-      progress = null;
-    }
+    if (progressChanged) sendProgress();
+  };
+
+  // 失敗の一覧（最大 500 件）は、変わったときだけ、まるごと入れる。進み具合は 80 ミリ秒ごとに送るので毎回は写さない。
+  // 増えた分だけ送る形にすると、受け手と食い違ったときに直らない（上限があるので、まるごとでも量は限られる）。
+  // 上限を超えた後の失敗は一覧を変えない（超えた件数は一覧なしの写しにも入る）。sentFailures が -1（開き直した）なら次は必ず入れる
+  const sendProgress = () => {
+    const size = run.failureListSize();
+    send('run:progress', run.snapshot({ failures: size !== sentFailures }));
+    sentFailures = size;
+    progressChanged = false;
+  };
+
+  // 残り時間は時間がたつだけで変わる。1 件に時間がかかって行が来ない間も、1 秒ごとに計算し直して送る。
+  // タイマーは判定と移動の段階に入ってから作る（取り込み以外のコマンドでは作らない）
+  let ticker = null;
+  const startTicker = () => {
+    if (ticker || !run.ticking()) return;
+    ticker = setInterval(() => {
+      // 判定と移動が終わったら（後片付け・全件処理済み）止める。後片付けの間に空回りさせない
+      if (!run.ticking()) {
+        clearInterval(ticker);
+        ticker = null;
+        return;
+      }
+      if (!timer) sendProgress();
+    }, ETA_TICK_MS);
   };
 
   const schedule = () => {
     if (!timer) timer = setTimeout(flush, FLUSH_INTERVAL_MS);
   };
 
-  const tally = {};
-  let processed = 0;
-
   const handleLine = (stream, text) => {
     const found = scanLine(text);
-    if (found.progress) {
-      // 1ファイル1行。件数が多いとログ窓が実用にならないので集計に落とす
-      processed = found.progress.processed;
-      const { result } = found.progress;
-      tally[result] = (tally[result] || 0) + 1;
-      progress = { processed, tally: { ...tally } };
+    // 進み具合の行（1 ファイルに 2〜3 行・crawler の進捗）は、件数が多いとログ窓が実用にならないので集計に落とす。
+    // 読むのは stdout だけ（stderr のログに改行入りのファイル名が出ても、進み具合の行に化けないように）
+    if (stream === 'out' && run.apply(found)) {
+      startTicker();
+      progressChanged = true;
       schedule();
       return;
     }
     if (found.csvPath) csvPath = found.csvPath;
     if (found.forgetId) forgetIds.add(found.forgetId);
     if (found.adoptPath) adoptPath = found.adoptPath;
-    pending.push({ stream, text });
+    if (countsAsWarning(text)) warnings += 1;
+    // 取り込みの一覧作成の段階に stdout に出た行は crawler のもの（その [Summary] は取り込みの完了ではない。#18）。
+    // 段階の行も stdout なので順番が保たれる。stderr はパイプが別で前後が保証されないので印を付けない
+    pending.push(stream === 'out' && run.inScan() ? { stream, text, crawler: true } : { stream, text });
     if (pending.length > 400) flush();
     else schedule();
   };
@@ -303,14 +331,22 @@ function createStreamPump(send) {
     };
   };
 
-  const state = () => ({ processed, tally: { ...tally }, csvPath, forgetIds: [...forgetIds], adoptPath });
+  const state = () => ({ ...run.snapshot(), csvPath, forgetIds: [...forgetIds], adoptPath, warnings });
 
   return {
     onStdout: makeReader('out'),
     onStderr: makeReader('err'),
     /** 現時点の集計（ウィンドウを開き直したときの初期表示用）。 */
     snapshot: state,
+    /**
+     * 次に送る進み具合に、失敗の一覧をまるごと入れる。開き直した画面は一覧を持っていないので、写しと次の送信の
+     * 行き違いで一覧が足りないまま残らないように、開き直したとき（app:context）に呼ぶ。
+     */
+    resendFailures() {
+      sentFailures = -1;
+    },
     finish() {
+      clearInterval(ticker);
       if (timer) clearTimeout(timer);
       flush();
       return state();
@@ -320,21 +356,31 @@ function createStreamPump(send) {
 
 // --- IPC --------------------------------------------------------------------
 
-ipcMain.handle('app:context', () => ({
-  repoRoot: REPO_ROOT,
-  detectorDir: RUN_DIR,
-  // 「コピー」で `cd` に貼る用。スペース等を含むチェックアウト先でもそのまま貼れるようにする
-  detectorDirQuoted: quoteArg(RUN_DIR),
-  version: appVersion(),
-  dataDir: dataDir(),
-  uvPath: resolveUv(),
-  detectorFound: fs.existsSync(DETECTOR_EXE || path.join(DETECTOR_DIR, 'main.py')),
-  bundled: !!DETECTOR_EXE,
-  // macOS でウィンドウを閉じても子プロセスは走り続けるので、開き直した画面に状態を返す
-  run: activeRun
-    ? { command: activeRun.command, startedAt: activeRun.startedAt, ...activeRun.pump.snapshot() }
-    : null,
-}));
+ipcMain.handle('app:context', () => {
+  // 開き直した画面は失敗の一覧を持っていないので、次の送信で一覧をまるごと送る
+  if (activeRun) activeRun.pump.resendFailures();
+  return appContext();
+});
+
+function appContext() {
+  return {
+    repoRoot: REPO_ROOT,
+    detectorDir: RUN_DIR,
+    // 「コピー」で `cd` に貼る用。スペース等を含むチェックアウト先でもそのまま貼れるようにする
+    detectorDirQuoted: quoteArg(RUN_DIR),
+    version: appVersion(),
+    dataDir: dataDir(),
+    uvPath: resolveUv(),
+    detectorFound: fs.existsSync(DETECTOR_EXE || path.join(DETECTOR_DIR, 'main.py')),
+    bundled: !!DETECTOR_EXE,
+    // renderer がパスの区切りを決めるのに使う（\ を区切りとみなすのは Windows だけ）
+    platform: process.platform,
+    // macOS でウィンドウを閉じても子プロセスは走り続けるので、開き直した画面に状態を返す
+    run: activeRun
+      ? { command: activeRun.command, mode: activeRun.mode, startedAt: activeRun.startedAt, ...activeRun.pump.snapshot() }
+      : null,
+  };
+}
 
 ipcMain.handle('i18n:get', () => ({ lang: currentLang(), dict: i18n.dictionary(currentLang()) }));
 ipcMain.handle('i18n:set', (_event, next) => {
@@ -546,7 +592,6 @@ async function startRun(form) {
 
   // 起動時のウィンドウではなく「今のウィンドウ」へ送る。閉じて開き直しても制御を失わないようにする
   const send = sendToWindow;
-  const pump = createStreamPump(send);
   const command = formatCommand(args, commandBase());
   stoppedByUser = false;
 
@@ -554,7 +599,10 @@ async function startRun(form) {
   const spawned = spawnDetector(args, { detached: true });
   const { program } = spawned;
   child = spawned.proc;
-  activeRun = { command, startedAt: Date.now(), pump };
+  // spawn の後に作る（集計は 1 秒ごとのタイマーを持ち、finish で止める。spawn が例外で抜けると止める人がいない）
+  const pump = createStreamPump(send);
+  // mode は開き直した画面が詳細ログを開くかたたむかを決めるのに使う（#18）
+  activeRun = { command, mode: form.mode, startedAt: Date.now(), pump };
   let finished = false;
   const finish = (payload) => {
     if (finished) return;
