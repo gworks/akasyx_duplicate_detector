@@ -18,13 +18,25 @@
       <span data-i18n="app_title">akasyx Duplicate Detector</span>
       <span class="version" id="version"></span>
     </div>
+    <!-- 目的でまとめる（#20。並びは renderer/modes.js の GROUPS と同じ。modes.test.js が確かめる）。
+         タブの印（ファイル／DB）は app.js が modes.js から付ける。見出しの入れ物に data-group は使わない
+         （data-group はフォームのチェックボックスを集める印） -->
     <nav class="tabs" id="tabs">
-      <button type="button" class="tab" data-mode="add" data-i18n="tab_add">Add</button>
-      <button type="button" class="tab" data-mode="verify" data-i18n="tab_verify">Verify</button>
-      <button type="button" class="tab" data-mode="adopt" data-i18n="tab_adopt">Register existing files</button>
-      <button type="button" class="tab" data-mode="delete-duplicates" data-i18n="tab_delete">Clean up duplicates</button>
-      <button type="button" class="tab" data-mode="report" data-i18n="tab_report">Status &amp; history</button>
-      <button type="button" class="tab" data-mode="archives" data-i18n="tab_archives">Archive folders</button>
+      <div class="tab-group" data-tab-group="ingest">
+        <span class="tab-group-label" data-i18n="group_ingest">Ingest</span>
+        <button type="button" class="tab" data-mode="add"><span data-i18n="tab_add">Add</span></button>
+        <button type="button" class="tab" data-mode="delete-duplicates"><span data-i18n="tab_delete">Clean up duplicates</span></button>
+      </div>
+      <div class="tab-group" data-tab-group="check">
+        <span class="tab-group-label" data-i18n="group_check">Check</span>
+        <button type="button" class="tab" data-mode="report"><span data-i18n="tab_report">Status &amp; history</span></button>
+        <button type="button" class="tab" data-mode="verify"><span data-i18n="tab_verify">Verify</span></button>
+        <button type="button" class="tab" data-mode="archives"><span data-i18n="tab_archives">Archive folders</span></button>
+      </div>
+      <div class="tab-group" data-tab-group="setup">
+        <span class="tab-group-label" data-i18n="group_setup">Setup &amp; recovery</span>
+        <button type="button" class="tab" data-mode="adopt"><span data-i18n="tab_adopt">Register existing files</span></button>
+      </div>
     </nav>
     <!-- 言語名はそれぞれの言語で書く（どの言語を表示中でも自分の言語を探せるように） -->
     <select class="lang-select" id="lang-select" data-i18n-aria-label="language" aria-label="Language">
@@ -231,20 +243,26 @@
 
     <!-- ============================ 実行 ============================ -->
     <section class="pane pane-run">
-      <div class="command">
-        <div class="command-head">
-          <span class="label small"><span data-i18n="command_label">Command to run</span><span class="cwd" id="run-cwd"></span></span>
-          <button type="button" class="btn ghost" id="copy-command" data-i18n="copy">Copy</button>
-        </div>
-        <code class="command-text" id="command-text">—</code>
-      </div>
-
       <div class="actions">
-        <button type="button" class="btn primary" id="run"><span data-i18n="run">Run</span> <span class="kbd">⌘↵</span></button>
+        <!-- 色と文言は、今のフォームで実際に起きること（ファイルを動かす・DB を変える・見るだけ。#20） -->
+        <button type="button" class="btn primary" id="run"><span id="run-label">Run</span> <span class="kbd">⌘↵</span></button>
         <button type="button" class="btn stop" id="stop" disabled data-i18n="stop">Stop</button>
         <span class="spinner" id="spinner" hidden></span>
         <span class="elapsed" id="elapsed"></span>
       </div>
+      <!-- 実行できない理由（コマンドの表示はたたんでいるので、ここにも出す。#20） -->
+      <p class="run-invalid" id="run-invalid" hidden></p>
+
+      <!-- 実行されるコマンド。利用者向けの進み具合・結果より目立たないよう、既定はたたむ（#20） -->
+      <details class="command" id="command">
+        <summary class="command-head">
+          <span class="label small"><span data-i18n="command_label">Command to run</span><span class="cwd" id="run-cwd"></span></span>
+        </summary>
+        <div class="command-body">
+          <code class="command-text" id="command-text">—</code>
+          <button type="button" class="btn ghost" id="copy-command" data-i18n="copy">Copy</button>
+        </div>
+      </details>
 
       <!-- 実行中・前回の実行の出力を、実行したのとは別のタブで見ているとき（#19） -->
       <div class="banner banner-info next-step" id="run-elsewhere" hidden>
@@ -302,6 +320,7 @@
     </section>
   </main>
 
+  <script src="modes.js"></script>
   <script src="run-view.js"></script>
   <script src="app.js"></script>
 </body>

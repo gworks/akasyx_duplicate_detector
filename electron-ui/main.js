@@ -8,6 +8,8 @@ const path = require('node:path');
 const { buildArgs, formatCommand, quoteArg, FormError, normalizePath, toFieldValue } = require('./commands');
 const { scanLine, parseArchivesJson, createRunState, countsAsWarning } = require('./detector-output');
 const i18n = require('./i18n');
+// 実行ボタンの印（#20）。画面と同じファイルを使い、組んだ引数から決める
+const { argsEffect, sameEffect } = require('./renderer/modes');
 
 // electron-ui/ はリポジトリルート直下に置く（設計書 §16）
 const REPO_ROOT = path.dirname(__dirname);
@@ -426,7 +428,8 @@ ipcMain.handle('dialog:pick', async (_event, options = {}) => {
 
 ipcMain.handle('command:preview', (_event, form) => {
   try {
-    return { command: formatCommand(buildArgs(form), commandBase()), error: null };
+    const args = buildArgs(form);
+    return { command: formatCommand(args, commandBase()), error: null, effect: argsEffect(args) };
   } catch (e) {
     if (e instanceof FormError) return { command: null, error: tr(e.key, e.vars) };
     throw e;
@@ -579,6 +582,12 @@ async function startRun(form) {
   } catch (e) {
     if (e instanceof FormError) return { started: false, error: tr(e.key, e.vars) };
     throw e;
+  }
+
+  // 実行ボタンから始めるときは、押したときに画面に見えていた印（色と文言）を受け取り、組んだ引数の印と同じときだけ
+  // 始める（#20。画面の予約の仕組みに頼らず、ここで保証する）。一覧の行から登録を外すときなどは印を渡さない
+  if (form.expectEffect && !sameEffect(form.expectEffect, argsEffect(args))) {
+    return { started: false, error: tr('run_effect_changed') };
   }
 
   // ファイルを消すコマンドだけは、renderer 任せにせずここで必ず確認を取る

@@ -37,6 +37,7 @@ const dom = {
   runbarGo: el('runbar-go'), runbarStop: el('runbar-stop'), runbarDismiss: el('runbar-dismiss'),
   runOutput: el('run-output'), runElsewhere: el('run-elsewhere'), runElsewhereText: el('run-elsewhere-text'),
   runElsewhereGo: el('run-elsewhere-go'),
+  runLabel: el('run-label'), runInvalid: el('run-invalid'),
 };
 
 let context = { repoRoot: '', dataDir: '', version: '', detectorFound: true };
@@ -113,11 +114,13 @@ function applyLanguage(next) {
   renderArchives();
   renderNextAdopt();
   renderRunView();
+  renderTabEffects();
+  renderRunLabel();
 }
 
 async function changeLanguage(next) {
   applyLanguage(await api.setLanguage(next));
-  refreshPreview(); // 入力エラーの文言も訳し直す
+  refreshPreview({ keepQueue: true }); // 入力エラーの文言も訳し直す（フォームは変わらないので予約は残す）
   persist();
 }
 
@@ -226,15 +229,111 @@ function rememberRecent(path) {
 // ------------------------------------------------------------ プレビュー
 
 let previewTimer = null;
-function refreshPreview() {
+// 実行は、押したときに見えていた印（色と文言）と、そのフォームに対する最新の応答の印が同じときだけ始める（#20）。
+// 応答を待つ間もボタンの見た目は変えない（入力のたびに薄くしたり色を消したりしない）。待つ間に押されたら予約し
+// （runWhenReady に押したときの印を控える）、応答の印が同じなら実行する。違えば始めずに新しい印を見せる
+// （タブを替えた直後に押しても、見ていない操作は走らない）。古い応答は通し番号で捨てる
+let previewSerial = 0;
+let previewPending = false;
+let runQueued = false;    // 応答待ちの間に押された
+let queuedShown = null;   // そのときに見えていた印（押せない状態だったなら null）
+let runNoteKey = null;    // 「印が変わったので実行していません」の知らせ（キーで持ち、言語を替えても訳し直す）
+
+/** 実行ボタン・⌘↵。応答待ちなら予約する（上の決まり）。見えていた印は main にも渡して照合させる。 */
+function requestRun() {
+  if (running || starting) return;
+  if (previewPending) {
+    runQueued = true;
+    // 押したときに押せない状態（組めない・一覧の読み込み中など）なら印を持たせない（応答の後でも始めない）
+    queuedShown = dom.run.disabled ? null : lastRunEffect;
+    return;
+  }
+  if (!dom.run.disabled) start({ expectEffect: lastRunEffect });
+}
+
+/** keepQueue: フォームは変わらない描き直し（言語の切り替え）。押した実行の予約を取り消さない。 */
+function refreshPreview({ keepQueue = false } = {}) {
   clearTimeout(previewTimer);
+  const serial = ++previewSerial;
+  previewPending = true;
+  if (!keepQueue) {
+    runQueued = false; // 押した後でフォームが変わったら、その予約は取り消す
+    queuedShown = null;
+    runNoteKey = null; // 知らせも役目を終える（新しい印を見ている）
+  }
+  dom.copyCommand.disabled = true; // 写すのは最新の応答のコマンドだけ
   previewTimer = setTimeout(async () => {
-    const { command, error } = await api.preview(collectForm());
+    let result;
+    try {
+      result = await api.preview(collectForm());
+    } catch (e) {
+      console.error('preview failed', e);
+      result = { command: null, error: t('preview_failed', { detail: e.message || String(e) }) };
+    }
+    if (serial !== previewSerial) return; // 後からフォームが変わった（新しい応答を待つ）
+    previewPending = false;
+    const { command, error, effect } = result;
+    dom.copyCommand.disabled = !command;
+    lastRunEffect = command ? effect : null;
+    renderRunLabel();
     dom.commandText.textContent = command || (error ? `— ${error}` : '—');
     dom.commandText.classList.toggle('invalid', !command);
+    // コマンドの表示はたたんでいるので、実行できない理由は実行ボタンの下にも出す（#20）
+    showRunNote(command ? (runNoteKey ? t(runNoteKey) : '') : (error || ''));
     commandValid = !!command;
     updateRunButton();
+    if (runQueued) {
+      const shown = queuedShown;
+      runQueued = false;
+      queuedShown = null;
+      if (Modes.sameEffect(shown, lastRunEffect) && !dom.run.disabled) start({ expectEffect: lastRunEffect });
+      // 押したときと印が変わった。黙って捨てず、確かめて押し直すよう知らせる（押したときに押せない状態だった
+      // ＝印が無かったなら、#20 以前と同じく何もしない。「変わった」は事実と違う）
+      else if (command && shown) {
+        runNoteKey = 'run_effect_changed';
+        showRunNote(t(runNoteKey));
+      }
+    }
   }, 120);
+}
+
+/** 実行ボタンの下の知らせ（実行できない理由・印が変わって始めなかったこと）。空なら隠す。 */
+function showRunNote(text) {
+  dom.runInvalid.hidden = !text;
+  dom.runInvalid.textContent = text;
+}
+
+/** タブの印（ファイルを動かす・DB を変える。#20）。見るだけの機能には付けない。言語を切り替えたら描き直す。 */
+function renderTabEffects() {
+  for (const tab of dom.tabs.querySelectorAll('.tab')) {
+    const effect = Modes.tabEffect(tab.dataset.mode);
+    let mark = tab.querySelector('.tab-effect');
+    if (effect !== 'files' && effect !== 'db') {
+      if (mark) mark.remove();
+      tab.removeAttribute('title');
+      continue;
+    }
+    if (!mark) {
+      mark = document.createElement('span');
+      tab.append(mark);
+    }
+    mark.className = `tab-effect ${effect}`;
+    mark.setAttribute('aria-hidden', 'true'); // タブの名前に混ぜない（説明は title で渡す）
+    mark.textContent = t(`effect_${effect}_short`);
+    tab.title = t(`effect_${effect}`);
+  }
+}
+
+// 実行ボタンの印（#20）。main がプレビューで組んだ引数から決めたもの（コマンドを組めないときは null）
+let lastRunEffect = null;
+
+/** 実行ボタンの色と文言。組んだ引数で実際に起きること（dry-run・--yes・退避先の有無などで変わる。#20）。 */
+function renderRunLabel() {
+  const { effect, action } = lastRunEffect || { effect: 'unknown', action: 'unknown' };
+  dom.run.classList.toggle('effect-files', effect === 'files');
+  dom.run.classList.toggle('effect-db', effect === 'db');
+  const key = `run_${action}`;
+  dom.runLabel.textContent = key in dict ? t(key) : t('run');
 }
 
 // ------------------------------------------------------------------ ログ
@@ -714,7 +813,8 @@ function setRunning(next, since = Date.now()) {
 /** タブの表示名（実行中の帯・案内に出す）。 */
 const modeLabel = (m) => {
   const tab = dom.tabs.querySelector(`.tab[data-mode="${m}"]`);
-  return tab ? t(tab.dataset.i18n) : m;
+  const label = tab && tab.querySelector('[data-i18n]');
+  return label ? t(label.dataset.i18n) : m;
 };
 
 /**
@@ -848,6 +948,8 @@ function resumeRun(run) {
 async function start(extra = {}) {
   if (running || starting) return;
   clearLog(); // 前の出力と、その出力が付けた案内の印を消す（印は出力と運命をともにする）
+  runNoteKey = null;
+  showRunNote(''); // 「印が変わったので実行していません」などの前の知らせを残さない（始められるのは組めたときだけ）
   const form = { ...collectForm(), ...extra };
   adoptRun(form);
   // コマンドは main の応答で決まる（プレビューには一覧の行から外す指定などが入っていない）
@@ -996,7 +1098,7 @@ function wireForm() {
 
 
 function wireRunControls() {
-  dom.run.addEventListener('click', () => start());
+  dom.run.addEventListener('click', requestRun);
   dom.archivesRefresh.addEventListener('click', loadArchives);
   // 導線をたどったら帯は消す（行き先のタブで続きを行う）
   dom.nextForgetGo.addEventListener('click', () => {
@@ -1027,7 +1129,7 @@ function wireRunControls() {
   dom.log.addEventListener('scroll', noteLogPosition, { passive: true });
   dom.copyCommand.addEventListener('click', () => {
     const text = dom.commandText.textContent;
-    if (text && !dom.commandText.classList.contains('invalid')) {
+    if (!dom.copyCommand.disabled && text) {
       // cd 先はメインプロセスで引数と同じ規則でクォート済み（スペース入りパス対策）
       api.copy(`cd ${context.detectorDirQuoted} && ${text}`);
       dom.copyCommand.textContent = t('copied');
@@ -1040,7 +1142,7 @@ function wireRunControls() {
   document.addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
       e.preventDefault();
-      if (!dom.run.disabled) start();
+      requestRun();
     }
   });
 }
