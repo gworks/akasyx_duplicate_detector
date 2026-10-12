@@ -11,7 +11,7 @@ import archives
 import crawler_client
 import mover
 from config import OS_JUNK_FILES, OWN_DATA_DB, own_data_dirs, own_data_locations
-from database import META_DIRNAME
+from database import META_DIRNAME, commit_after_interrupt
 from models import (
     OWNING_STATUSES,
     RESULT_DUPLICATE,
@@ -383,8 +383,15 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
             status = "interrupted"
             logger.warning("Interrupted by user")
         finally:
-            if not config.dry_run:
-                session.commit()
+            # dry-run でも通す（判定のクエリの途中の中断で壊れたセッションを、この後の DB の読み取りの前に立て直す。#32）
+            if commit_after_interrupt(session) and not config.dry_run:
+                # 移動の無い判定（重複・除外・失敗）は COMMIT_INTERVAL 件ごとにしか保存しないので、最後の保存の後の分は
+                # DB に残らない（移動したファイルは 1 件ごとに保存済み）。CSV には全件ある。黙って欠けさせない（#32）
+                logger.warning(
+                    "A DB write was cut off (interrupted or failed): the records of up to "
+                    f"{COMMIT_INTERVAL} files judged since the last save "
+                    "were not saved to the DB (moved files are saved; the CSV has every file)"
+                )
     finally:
         # 一覧（crawler DB の接続）はここで閉じる。中断・例外で抜けても、後片付けの間まで開いたままにしない
         files.close()

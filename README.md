@@ -317,7 +317,10 @@ Python 側の前提は CLI と同じです（`detector/` で `uv sync` 済み、
   読めなかったときは空の一覧ではなくエラーを出します
 - 「中断」は子プロセスのプロセスグループへ `SIGINT` を送ります。detector は
   `KeyboardInterrupt` を受けて `status='interrupted'` で後片付けするので、
-  途中で止めても DB と実体の整合は保たれます
+  途中で止めても DB と実体の整合は保たれます。Windows はプロセスグループへのシグナルが無く、uv を止めても
+  その下の detector に届かないため、停止ファイルを使います（#32）。UI は起動時に環境変数 `AKASYX_STOP_FILE` で
+  場所（OS の一時フォルダ）を渡し、中断でそのファイルを作ります。detector は見張りのスレッドでそれを見つけると、
+  自分に `KeyboardInterrupt` を起こします（同じ後片付けになる）。crawler の実行中は crawler をプロセスの木ごと止めます
 - レンダラは `contextIsolation` / `sandbox` 有効、Node 統合なし、CSP で外部読み込み禁止
 
 ### 配布について

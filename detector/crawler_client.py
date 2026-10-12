@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterator
 
+import stop_watch
 from errors import PreflightError
 from utl import hashing
 from utl.helpers import connect_readonly, to_posix
@@ -26,6 +27,10 @@ CRAWLER_PKG_DIRNAME = "crawler"
 CRAWLER_BIN_NAME = "akasyx-crawler"
 # 走査が中途半端な状態で移動を始めると、投入元の一部だけが移った状態になる（設計書 §3）
 COMPLETED_STATUS = "completed"
+# crawler の終わりを待ち直す間隔（秒）。この間隔で中断（KeyboardInterrupt）を受け取れる（#32）
+WAIT_INTERVAL = 0.5
+# 中断のとき、crawler が自分で止まるのを待つ時間（秒。macOS・Linux）
+CRAWLER_STOP_GRACE = 2.0
 
 
 @dataclass
@@ -151,10 +156,12 @@ def run_crawler(target: str, config, extra_excludes: tuple[str, ...] = ()) -> Cr
     logger.info(f"Running crawler: {' '.join(cmd)} (cwd={cwd})")
     # detector 側の VIRTUAL_ENV を持ち込むと uv が「プロジェクトの環境と違う」と警告する。
     # crawler は crawler 自身の .venv で動かすべきなので落としておく
-    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
-    proc = subprocess.run(cmd, cwd=cwd, check=False, env=env)
-    if proc.returncode != 0:
-        logger.warning(f"Crawler exited with non-zero status (code {proc.returncode})")
+    # 停止ファイルの場所も渡さない（detector の中断のためのもの。crawler は detector が止める。#32）
+    env = {k: v for k, v in os.environ.items() if k not in ("VIRTUAL_ENV", stop_watch.STOP_FILE_ENV)}
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env)
+    returncode = wait_crawler(proc)
+    if returncode != 0:
+        logger.warning(f"Crawler exited with non-zero status (code {returncode})")
 
     if not os.path.exists(db_path):
         raise PreflightError(f"Crawler did not produce a DB: {db_path}")
@@ -163,6 +170,56 @@ def run_crawler(target: str, config, extra_excludes: tuple[str, ...] = ()) -> Cr
     return CrawlerScan(
         db_path=db_path, scan_id=scan_id, status=status, root_dir=target
     )
+
+
+def wait_crawler(proc, interval: float = WAIT_INTERVAL) -> int:
+    """crawler の終わりを待ちます。中断（KeyboardInterrupt）が来たら crawler を止めてから伝えます（#32）。
+
+    Windows では子プロセスを長く待つ wait は KeyboardInterrupt で抜けない（停止ファイルの見張りが起こす中断が、crawler が
+    終わるまで届かない）ので、短い間隔で待ち直す。中断のときは、uv の下の python まで止める（stop_process_tree）。
+    """
+    try:
+        while True:
+            try:
+                return proc.wait(timeout=interval)
+            except subprocess.TimeoutExpired:
+                continue
+    except BaseException:
+        # 中断（KeyboardInterrupt）でも、ほかの例外でも、crawler を残さない。
+        # crawler も中断を受けていれば（macOS・Linux のプロセスグループへの SIGINT、Windows のコンソールの Ctrl+C）、
+        # 自分で止まる。少し待ってから止める（すぐ kill すると crawler の後片付けを途中で切る）。待つ間に 2 度目の
+        # 中断が来ても、crawler は必ず止める
+        try:
+            proc.wait(timeout=CRAWLER_STOP_GRACE)
+        except subprocess.TimeoutExpired:
+            pass
+        finally:
+            stop_process_tree(proc)
+        raise
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def stop_process_tree(proc) -> None:
+    """子プロセスを、その下のプロセスまで止めます。Windows は taskkill で木ごと（uv を止めても python が残るため）。"""
+    # Windows は uv が先に終わっていても、その下の python が残りうるので、木ごと止める指示は必ず出す
+    if proc.poll() is not None and not _is_windows():
+        return  # もう終わっている
+    if _is_windows():
+        subprocess.run(
+            ["taskkill", "/pid", str(proc.pid), "/T", "/F"],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    try:
+        proc.kill()
+    except OSError:
+        pass  # もう終わっている
+    try:
+        proc.wait(timeout=10)
+    except (subprocess.TimeoutExpired, OSError):
+        logger.warning(f"The crawler process did not stop in time (pid {proc.pid})")
 
 
 def ensure_completed(scan: CrawlerScan) -> None:

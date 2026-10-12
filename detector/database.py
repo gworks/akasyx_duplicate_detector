@@ -5,6 +5,7 @@ import logging
 import os
 
 from sqlalchemy import create_engine, event
+from sqlalchemy.exc import PendingRollbackError
 from sqlalchemy.orm import Session, sessionmaker
 
 from errors import PreflightError
@@ -73,6 +74,25 @@ def get_session(path: str) -> tuple[Session, object]:
     session = sessionmaker(bind=engine)()
     logger.info(f"DB {'created' if is_new else 'connected'}: {path}")
     return session, engine
+
+
+def commit_after_interrupt(session: Session) -> bool:
+    """中断（KeyboardInterrupt）の後片付けで、それまでの記録を commit します。
+
+    中断が flush や接続の実行の途中に割り込むと、セッションは rollback するまで使えない（commit が PendingRollbackError に
+    なる）。その場合は未確定の分を捨ててから commit し直す（#32。確定済みの記録は残り、この後で中断の状態も書ける）。
+    接続だけが無効になったときは session.is_active が True のままなので、commit の失敗で見分ける。
+    それ以外の失敗（ディスクの不足など）は捨てずにそのまま投げる。
+    戻り値: 未確定の分を捨てたら True（呼び出し元が、何が保存されなかったかを知らせる）。
+    """
+    try:
+        session.commit()
+    except PendingRollbackError:
+        logger.warning("Interrupted during a DB write; rolling back the unfinished part")
+        session.rollback()
+        session.commit()
+        return True
+    return False
 
 
 def _pid_alive(pid: int) -> bool:

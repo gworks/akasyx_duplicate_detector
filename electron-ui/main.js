@@ -3,6 +3,7 @@ const { app, BrowserWindow, dialog, ipcMain, shell, clipboard } = require('elect
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
+const crypto = require('node:crypto');
 const path = require('node:path');
 
 const { buildArgs, formatCommand, quoteArg, FormError, normalizePath, toFieldValue } = require('./commands');
@@ -72,6 +73,7 @@ let stoppedByUser = false;
 // アプリを終えるときは待ちの列を捨て、次回に持ち越さない（quitting の後は始めない）
 const quickQueue = createQueue();
 let quitting = false;
+let stopKillTimer = null;  // Windows で停止ファイルを作った後、応えなければ木ごと止める予約（#32）
 let runSeq = 0;            // 実行の通し番号（activeRun.id。中断がどの実行へのものかを見分ける）
 // 実行ボタンから始めた実行の、最後の結果（#22）。列の項目が始まると画面の出力が置き換わるので、そのときに列の完了の
 // 行として残す。実行ボタンで次の実行を始めたら（自分の操作で置き換えた）捨てる
@@ -278,6 +280,41 @@ function interrupt() {
 }
 
 function sendInterrupt() {
+  // Windows にはプロセスグループへのシグナルが無く、child.kill は uv を強制終了するだけで、その下の python（detector）には
+  // 中断が届かない（#32）。停止ファイルを作って detector 自身に中断させる（SIGINT と同じ後片付けになる）。
+  // 作れなければ木ごと強制終了する
+  // 停止ファイルの場所は実行の記録が持つ（実行ごとに違う。起動の途中で失敗した実行には無い）
+  const stopFile = activeRun && activeRun.stopFile;
+  if (process.platform === 'win32' && stopFile) {
+    const target = child;
+    const run = activeRun;
+    // もう終わっている（close を待つところ）なら頼まない（終わった実行を「中断」と記録しない）
+    if (target.exitCode !== null || target.signalCode !== null) return null;
+    try {
+      fs.writeFileSync(stopFile, '');
+      // detector が応えない（起動前の uv sync の最中・長い C の呼び出しの中など）まま残らないよう、待っても終わらなければ
+      // 木ごと強制終了する（後片付けは次の起動の復旧に任せる）
+      clearTimeout(stopKillTimer);
+      stopKillTimer = setTimeout(() => {
+        stopKillTimer = null;
+        if (child === target && target.exitCode === null && target.signalCode === null) {
+          run.forceKilled = true; // 停止ファイルが残っていても中断として扱う（close の判定）
+          killGroup(target, 'SIGKILL');
+        }
+      }, STOP_FILE_GRACE_MS);
+      return true;
+    } catch {
+      // 下へ
+    }
+  }
+  if (process.platform === 'win32') {
+    // 停止ファイルを作れない（一時フォルダを拒まれた等）。下の止め方は uv しか止めず python が残るので、すぐ木ごと
+    // 強制終了する（後片付けは次の起動の復旧に任せる。#32）
+    if (child.exitCode !== null || child.signalCode !== null) return null;
+    if (activeRun) activeRun.forceKilled = true;
+    killGroup(child, 'SIGKILL');
+    return true;
+  }
   try {
     // detached:true で自前のプロセスグループにしてあるので、グループごと送る
     process.kill(-child.pid, 'SIGINT');
@@ -567,10 +604,31 @@ ipcMain.handle('clipboard:write', (_event, text) => {
   return true;
 });
 
+// detector が見張る停止ファイルの場所を渡す環境変数（detector/stop_watch.py の STOP_FILE_ENV と同じ）
+const STOP_FILE_ENV = 'AKASYX_STOP_FILE';
+// 停止ファイルを作ってから、detector が自分で止まるのを待つ時間（過ぎたら木ごと強制終了する）
+// 後片付け（DB への書き込み・CSV・移動の途中の後始末）には時間がかかりうるので、長めにとる
+const STOP_FILE_GRACE_MS = 60000;
+
+/** 実行ごとの停止ファイルの場所（OS の一時フォルダ。投入元・保存フォルダの中には作らない。名前は実行ごとに違う）。 */
+function newStopFile() {
+  return path.join(os.tmpdir(), `akasyx-detector-stop-${process.pid}-${crypto.randomUUID()}`);
+}
+
+/** 停止ファイルを消す（無ければ何もしない。detector が中断を起こすときにも消す）。 */
+function dropStopFile(file) {
+  try {
+    fs.rmSync(file, { force: true });
+  } catch {
+    // 消せなくても実行には関わらない（一時フォルダの中）
+  }
+}
+
 /** detector を起動します。uv は PATH が最小限でも見つかるよう絶対パスで起動する（表示は `uv` のまま）。 */
-function spawnDetector(args, options = {}) {
+function spawnDetector(args, { extraEnv = {}, ...options } = {}) {
   const [program, ...baseArgs] = DETECTOR_EXE ? commandBase() : [resolveUv(), 'run', 'main.py'];
-  const proc = spawn(program, [...baseArgs, ...args], { cwd: RUN_DIR, env: childEnv(), ...options });
+  // extraEnv: この実行だけに渡す環境変数（停止ファイルの場所。#32）
+  const proc = spawn(program, [...baseArgs, ...args], { cwd: RUN_DIR, env: { ...childEnv(), ...extraEnv }, ...options });
   return { proc, program };
 }
 
@@ -767,7 +825,9 @@ function launch(args, identity, onFinish = null) {
   stoppedByUser = false;
 
   // detached: 中断をプロセスグループごと送るため（uv の下の python にも届く）
-  const spawned = spawnDetector(args, { detached: true });
+  // 停止ファイルの場所（実行ごと。Windows の中断で使う。#32）
+  const thisStopFile = newStopFile();
+  const spawned = spawnDetector(args, { detached: true, extraEnv: { [STOP_FILE_ENV]: thisStopFile } });
   const { program } = spawned;
   child = spawned.proc;
   let finished = false;
@@ -783,6 +843,7 @@ function launch(args, identity, onFinish = null) {
     // movesFiles: 組んだ引数で実際にファイルを動かすか（dry-run は動かさない）。中断で列を止めるかに使う
     activeRun = {
       id: runSeq, command, ...identity, startedAt: Date.now(), pump, movesFiles: argsEffect(args).effect === 'files',
+      stopFile: thisStopFile,
     };
     const run = activeRun;
     const finish = (payload) => {
@@ -790,6 +851,9 @@ function launch(args, identity, onFinish = null) {
       finished = true;
       child = null;
       activeRun = null;
+      dropStopFile(thisStopFile);
+      clearTimeout(stopKillTimer); // 終わった実行の強制終了の予約は要らない
+      stopKillTimer = null;
       const summary = { ...payload, ...pump.finish(), ...identity };
       // 実行で登録が変わりうる（登録を外す・初めての保存フォルダの登録）。main が持つ一覧は捨て、次に読んだものを使う
       lastListed = { archiveDb: null, roots: [] };
@@ -841,10 +905,15 @@ function launch(args, identity, onFinish = null) {
     });
 
     child.on('close', (code, signal) => {
+      // 中断を受け止めた detector も終了コード 0 で終わるので、終了コードでは見分けない。Windows の停止ファイルが
+      // 残っていれば、detector は受け取らずに（受け取るときに消す。見張りの外で作られた）自分で終わったので中断ではない
+      // （終わった・断った実行を「中断」と記録しない・列を止めない。#32）。応えずに強制終了したときは中断のまま
+      let stopFileLeft = false;
+      try { stopFileLeft = fs.existsSync(thisStopFile); } catch { /* 分からなければ頼んだとおりに扱う */ }
       finish({
         code,
         signal,
-        stoppedByUser,
+        stoppedByUser: stoppedByUser && !(stopFileLeft && !run.forceKilled),
         meaning: EXIT_MEANINGS[code] || (signal
           ? { level: 'error', key: 'exit_signal', vars: { signal } }
           : { level: 'error', key: 'exit_code', vars: { code } }),
@@ -857,6 +926,9 @@ function launch(args, identity, onFinish = null) {
     spawned.proc.on('error', () => {});
     if (pump) pump.discard();
     activeRun = null;
+    dropStopFile(thisStopFile);
+    clearTimeout(stopKillTimer); // 下で止めるので、停止ファイルの後の強制終了の予約は要らない（#32）
+    stopKillTimer = null;
     // 起動していたら、止め終わる（close）まで実行中のままにする（その間に列の次の項目や別の実行を始めない。
     // Windows では uv の下の python が残りうる。#22）。起動できていなければ（pid が無い）すぐ下ろす
     const proc = spawned.proc;
