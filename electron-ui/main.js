@@ -304,6 +304,9 @@ function createStreamPump(send, { keepOutput = true } = {}) {
   let progressChanged = false;   // 前回送ってから進み具合が変わったか
   let sentFailures = 0;          // 前回送った失敗の一覧の件数（一覧は変わったときだけ送る）
   let timer = null;
+  // 終わった（finish / discard した）ポンプは、行を扱わず、送る予約・残り時間のタイマーも作らない（終わった後に届いた行を、
+  // 次の実行の画面へ送らない）
+  let closed = false;
   let csvPath = null;
   const forgetIds = new Set(); // Note: 行が示す、つながっていない保存フォルダ（登録を外す候補。#11）
   let adoptPath = null;        // 断りの案内が示す、adopt が要るフォルダ
@@ -335,13 +338,16 @@ function createStreamPump(send, { keepOutput = true } = {}) {
   // 残り時間は時間がたつだけで変わる。1 件に時間がかかって行が来ない間も、1 秒ごとに計算し直して送る。
   // タイマーは判定と移動の段階に入ってから作る（取り込み以外のコマンドでは作らない）
   let ticker = null;
+  const stopTicker = () => {
+    clearInterval(ticker);
+    ticker = null;
+  };
   const startTicker = () => {
     if (ticker || !run.ticking()) return;
     ticker = setInterval(() => {
       // 判定と移動が終わったら（後片付け・全件処理済み）止める。後片付けの間に空回りさせない
       if (!run.ticking()) {
-        clearInterval(ticker);
-        ticker = null;
+        stopTicker();
         return;
       }
       if (!timer) sendProgress();
@@ -352,7 +358,16 @@ function createStreamPump(send, { keepOutput = true } = {}) {
     if (!timer) timer = setTimeout(flush, FLUSH_INTERVAL_MS);
   };
 
+  const stopTimers = () => {
+    stopTicker();
+    if (timer) clearTimeout(timer);
+    timer = null;
+  };
+
   const handleLine = (stream, text) => {
+    // 終わった後に届いた行は扱わない（送る予約も、たまった行の直接の送信もしない）。閉じた後の出力を捨てるのはここ
+    // 1 か所（起動の途中で失敗したときは、launch がリスナーも外す。close の後には出力は届かない）
+    if (closed) return;
     const found = scanLine(text);
     // 進み具合の行（1 ファイルに 2〜3 行・crawler の進捗）は、件数が多いとログ窓が実用にならないので集計に落とす。
     // 読むのは stdout だけ（stderr のログに改行入りのファイル名が出ても、進み具合の行に化けないように）
@@ -412,17 +427,17 @@ function createStreamPump(send, { keepOutput = true } = {}) {
     },
     /** 送らずに止める（タイマーを止め、ためた行を捨てる）。始まったことを画面に伝えていない実行で使う。 */
     discard() {
-      clearInterval(ticker);
-      if (timer) clearTimeout(timer);
-      timer = null;
+      closed = true;
+      stopTimers();
       pending = [];
       progressChanged = false;
     },
     finish() {
-      clearInterval(ticker);
-      if (timer) clearTimeout(timer);
+      // 読みかけの最後の行を先に流してから止める（流した行が送る予約・残り時間のタイマーを作っても、ここで止める）
       readOut.flush();
       readErr.flush();
+      closed = true;
+      stopTimers();
       flush();
       return { ...state(), notices: notices.snapshot(), output: tail ? tail.snapshot() : null };
     },
