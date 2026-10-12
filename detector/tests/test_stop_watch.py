@@ -231,7 +231,8 @@ def test_watch_retries_removing_a_locked_stop_file(monkeypatch, tmp_path):
     calls = []
     watch = stop_watch.start(str(stop), interval=0.01, interrupt=lambda: calls.append(1))
     assert _wait_until(lambda: calls == [1])
-    assert len(fails) == 2 and not stop.exists()
+    assert _wait_until(lambda: not stop.exists())  # 中断を起こした後に消し直す
+    assert len(fails) == 2
     watch.stop()
 
 
@@ -258,3 +259,45 @@ def test_commit_after_interrupt_reports_nothing_discarded_on_a_healthy_session(s
     import database
 
     assert database.commit_after_interrupt(session) is False
+
+
+def test_no_interrupt_after_stop_returns_even_while_removing(monkeypatch, tmp_path):
+    # 停止ファイルを消し直している間に見張りが止められても、stop() から戻った後に中断を起こさない
+    # （正常に終わった実行に中断が届く。PR #33 の bot の指摘）
+    stop = tmp_path / "stop"
+    stop.write_text("")
+    removing = threading.Event()
+
+    def locked_remove(path):
+        removing.set()
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(stop_watch.os, "remove", locked_remove)
+    calls = []
+    watch = stop_watch.start(str(stop), interval=0.01, interrupt=lambda: calls.append(1))
+    assert removing.wait(2)
+    before = list(calls)
+    watch.stop()
+    time.sleep(0.6)  # 消し直しの待ち（最大 REMOVE_TRIES × REMOVE_RETRY_WAIT）より長く
+    assert calls == before
+
+
+def test_stop_waits_for_the_stop_file_to_be_removed(monkeypatch, tmp_path):
+    # 中断を起こした後に detector が先に終わると、残った停止ファイルを UI が「受け取っていない」と読む
+    stop = tmp_path / "stop"
+    stop.write_text("")
+    real_remove = stop_watch.os.remove
+    fails = []
+
+    def flaky_remove(path):
+        if len(fails) < 3:
+            fails.append(path)
+            raise PermissionError("locked")
+        real_remove(path)
+
+    monkeypatch.setattr(stop_watch.os, "remove", flaky_remove)
+    calls = []
+    watch = stop_watch.start(str(stop), interval=0.01, interrupt=lambda: calls.append(1))
+    assert _wait_until(lambda: calls == [1])
+    watch.stop()
+    assert not stop.exists()

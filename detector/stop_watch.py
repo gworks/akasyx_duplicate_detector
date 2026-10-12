@@ -26,6 +26,9 @@ class StopWatch:
         self._interval = interval
         self._interrupt = interrupt
         self._stopped = threading.Event()
+        # 「止められていないかの確認 → 中断」と stop() を排他にする（stop() から戻った後に中断を起こさない）
+        self._lock = threading.Lock()
+        self._fired = False
         self.thread = threading.Thread(target=self._watch, name="stop-watch", daemon=True)
 
     def _watch(self):
@@ -33,16 +36,23 @@ class StopWatch:
             if os.path.exists(self._path):
                 # 見張りをやめた後（実行が終わった）なら、中断は起こさずファイルも残す。UI は残ったファイルで
                 # detector が受け取らなかった（中断ではなく自分で終わった）と分かる
-                if self._stopped.is_set():
-                    return
-                # 中断は 1 度だけ（2 度目は後片付けを途中で止めうる）。受け取った印として停止ファイルを消す
-                # （UI が先に終わっても残さない）
+                with self._lock:
+                    if self._stopped.is_set():
+                        return
+                    # 中断は 1 度だけ（2 度目は後片付けを途中で止めうる）
+                    self._fired = True
+                    self._interrupt()
+                # 受け取った印として停止ファイルを消す（UI が先に終わっても残さない）。消し直しで待つことがあるので、
+                # 中断を起こした後に行う（待つ間に止められても、止めた後に中断が届かない）
                 _remove(self._path)
-                self._interrupt()
                 return
 
     def stop(self):
-        self._stopped.set()
+        with self._lock:
+            self._stopped.set()
+        # 中断を起こした後なら、停止ファイルを消し終えるまで少し待つ（先に終わると UI が「受け取っていない」と読む）
+        if self._fired and self.thread.is_alive() and threading.current_thread() is not self.thread:
+            self.thread.join(timeout=REMOVE_TRIES * REMOVE_RETRY_WAIT + 1)
 
 
 def _remove(path: str) -> None:
