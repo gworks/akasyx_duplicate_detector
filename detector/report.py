@@ -2,6 +2,7 @@
 import json
 
 from models import (
+    COUNTS_UNAVAILABLE,
     RESULT_DUPLICATE,
     ArchiveFile,
     Ingest,
@@ -81,11 +82,24 @@ def _recent_ingests(
         lines.append("  (no history)")
     for r in rows:
         dry = "[dry-run] " if r.dry_run else ""
-        lines.append(
-            f"  #{r.id:<4} {r.mode:<18} {dry}{r.status:<12} "
-            f"moved {r.moved} / duplicates {r.duplicated} / skipped {r.skipped} / failed {r.failed}"
+        counts = (
+            "counts not available"
+            if _counts_unavailable(r)
+            else f"moved {r.moved} / duplicates {r.duplicated} / skipped {r.skipped} / failed {r.failed}"
         )
+        lines.append(f"  #{r.id:<4} {r.mode:<18} {dry}{r.status:<12} {counts}")
     return lines
+
+
+def _counts_unavailable(row: Ingest) -> bool:
+    """件数が分からない実行か（ループの外で中断した。#34）。"""
+    if not row.stats_json:
+        return False
+    try:
+        stats = json.loads(row.stats_json)
+    except ValueError:
+        return False
+    return isinstance(stats, dict) and stats.get(COUNTS_UNAVAILABLE) is True
 
 
 def _ingest_detail(session, archive_id: int, ingest_id: int) -> list[str]:
@@ -99,7 +113,9 @@ def _ingest_detail(session, archive_id: int, ingest_id: int) -> list[str]:
     lines.append(f"  Start / end : {row.started_at} / {row.finished_at}")
     lines.append(f"  Status      : {row.status}{' [dry-run]' if row.dry_run else ''}")
     lines.append(f"  Version     : {row.app_version or '-'}")
-    if row.stats_json:
+    if _counts_unavailable(row):
+        lines.append("  Breakdown   : not available (interrupted)")
+    elif row.stats_json:
         lines.append("  Breakdown   :")
         for key, value in json.loads(row.stats_json).items():
             lines.append(f"    {key:<18} {value}")

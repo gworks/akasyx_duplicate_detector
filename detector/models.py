@@ -30,6 +30,9 @@ MODE_ADOPT = "adopt"  # 中身のある保存フォルダを実体から登録�
 MODE_ARCHIVES = "archives"  # 登録済みの保存フォルダ一覧（DB 全体を見る。保存フォルダ指定なし）
 
 # --- ar_archive_files.status -------------------------------------------------
+# ar_ingests.stats_json の目印: この実行の件数が分からない（ループの外で中断し、DB から数え直せなかった。#34）
+COUNTS_UNAVAILABLE = "counts_unavailable"
+
 STATUS_PENDING = "pending"            # 移動を予約したが未完了（§7.3 Phase 1〜2）
 STATUS_STORED = "stored"              # 実体があり DB と一致（正常）
 STATUS_MISSING = "missing"            # DB にはあるが実体が無い（削除はしない）

@@ -8,8 +8,11 @@ import logging
 import mimetypes
 import os
 import shutil
+import signal
 import sqlite3
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterator
@@ -31,6 +34,10 @@ COMPLETED_STATUS = "completed"
 WAIT_INTERVAL = 0.5
 # 中断のとき、crawler が自分で止まるのを待つ時間（秒。macOS・Linux）
 CRAWLER_STOP_GRACE = 2.0
+# uv が先に終わった後、その下の python（crawler）が終わったかを見直す間隔（秒。macOS・Linux。#35）
+GROUP_POLL_INTERVAL = 0.05
+# Windows の signal には SIGKILL が無い（macOS・Linux の値。グループごと止めるときに使う。#35）
+SIGKILL = getattr(signal, "SIGKILL", 9)
 
 
 @dataclass
@@ -158,8 +165,23 @@ def run_crawler(target: str, config, extra_excludes: tuple[str, ...] = ()) -> Cr
     # crawler は crawler 自身の .venv で動かすべきなので落としておく
     # 停止ファイルの場所も渡さない（detector の中断のためのもの。crawler は detector が止める。#32）
     env = {k: v for k, v in os.environ.items() if k not in ("VIRTUAL_ENV", stop_watch.STOP_FILE_ENV)}
-    proc = subprocess.Popen(cmd, cwd=cwd, env=env)
-    returncode = wait_crawler(proc)
+    # macOS・Linux では自前のプロセスグループ（新しいセッション）で起動する。中断のとき、uv だけでなくその下の python
+    # （crawler）までグループごと止められるように（#35）。その代わり UI・端末からの SIGINT は crawler に届かないので、
+    # detector が受けた中断を wait_crawler が crawler のグループに送り直す
+    popen_kwargs = {} if _is_windows() else {"start_new_session": True}
+    proc = None
+    started = []  # 起動した crawler（SIGHUP・SIGTERM の送り直し先。起動の前から送り直しの用意をしておく）
+    try:
+        with _forward_termination(started):
+            proc = subprocess.Popen(cmd, cwd=cwd, env=env, **popen_kwargs)
+            started.append(proc)
+            returncode = wait_crawler(proc)
+    except BaseException:
+        # 起動してから wait_crawler が後片付けを引き受けるまでの間の中断でも、crawler を残さない（別のグループなので
+        # 中断が届いていない）。wait_crawler が止めた後なら何もしない
+        if proc is not None and not getattr(proc, "stopped_by_detector", False):
+            stop_process_tree(proc)
+        raise
     if returncode != 0:
         logger.warning(f"Crawler exited with non-zero status (code {returncode})")
 
@@ -178,40 +200,134 @@ def wait_crawler(proc, interval: float = WAIT_INTERVAL) -> int:
     Windows では子プロセスを長く待つ wait は KeyboardInterrupt で抜けない（停止ファイルの見張りが起こす中断が、crawler が
     終わるまで届かない）ので、短い間隔で待ち直す。中断のときは、uv の下の python まで止める（stop_process_tree）。
     """
-    try:
-        while True:
-            try:
-                return proc.wait(timeout=interval)
-            except subprocess.TimeoutExpired:
-                continue
-    except BaseException:
-        # 中断（KeyboardInterrupt）でも、ほかの例外でも、crawler を残さない。
-        # crawler も中断を受けていれば（macOS・Linux のプロセスグループへの SIGINT、Windows のコンソールの Ctrl+C）、
-        # 自分で止まる。少し待ってから止める（すぐ kill すると crawler の後片付けを途中で切る）。待つ間に 2 度目の
-        # 中断が来ても、crawler は必ず止める
+    # 猶予の間・止める間も SIGHUP・SIGTERM を crawler に送り直す（その間に detector だけが終わらないように）
+    with _forward_termination([proc]):
         try:
-            proc.wait(timeout=CRAWLER_STOP_GRACE)
-        except subprocess.TimeoutExpired:
-            pass
-        finally:
-            stop_process_tree(proc)
-        raise
+            while True:
+                try:
+                    return proc.wait(timeout=interval)
+                except subprocess.TimeoutExpired:
+                    continue
+        except BaseException:
+            # 中断（KeyboardInterrupt）でも、ほかの例外でも、crawler を残さない。
+            # crawler も中断を受けていれば（Windows のコンソールの Ctrl+C。macOS・Linux では下で送る SIGINT）、
+            # 自分で止まる。少し待ってから止める（すぐ kill すると crawler の後片付けを途中で切る）。待つ間に 2 度目の
+            # 中断が来ても、crawler は必ず止める
+            try:
+                _forward_interrupt(proc)
+                _wait_for_exit(proc, CRAWLER_STOP_GRACE)
+            finally:
+                stop_process_tree(proc)
+                proc.stopped_by_detector = True  # run_crawler が止め直さない
+            raise
+
+
+def _wait_for_exit(proc, grace: float) -> None:
+    """crawler が自分で止まるのを grace 秒まで待ちます。
+
+    macOS・Linux では uv だけが先に終わっても、その下の python（crawler）が後片付けをしている間は待つ（グループに
+    誰も居なくなるまで。#35）。
+    """
+    deadline = time.monotonic() + grace
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        return
+    if _is_windows():
+        return
+    while time.monotonic() < deadline and _group_alive(proc):
+        time.sleep(GROUP_POLL_INTERVAL)
+
+
+def _group_alive(proc) -> bool:
+    """crawler のプロセスグループに、まだ誰か居るか。"""
+    try:
+        os.killpg(proc.pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # 居る（macOS はゾンビだけのグループにも EPERM を返す。そのときは猶予の終わりまで待つだけ）
+    except OSError:
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def _forward_termination(procs: list):
+    """macOS・Linux: crawler を待つ間に detector が SIGHUP・SIGTERM で終わるときは、crawler のグループにも送ります。
+
+    crawler は自前のグループなので、端末を閉じたとき（SIGHUP）などに detector だけが終わり、crawler が残って
+    crawler の DB に書き続けうる（#35）。送った後は元の扱いに任せる（今までどおりに終わる）。procs は送り先の crawler
+    （起動の前から用意できるよう、起動したら足す）。外側で用意済みなら何もしない（二重に送らない）。
+    起動（fork）の最中に届いたものは、送り先がまだ分からないので送れない。
+    """
+    if _is_windows() or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = {}
+
+    def forward(signum, frame):
+        for proc in procs:
+            _signal_group(proc, signum)
+        handler = previous[signum]
+        if callable(handler):
+            # 元の扱いが Python の関数（終わらずに戻ることもある）なら、そのまま呼び、この後も送り直しを続ける
+            handler(signum, frame)
+            return
+        signal.signal(signum, handler)  # 既定の扱いに戻して自分にも送り直す（今までどおりに終わる）
+        os.kill(os.getpid(), signum)
+
+    forward.forwards_to_crawler = True
+
+    for name in ("SIGHUP", "SIGTERM"):
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        current = signal.getsignal(signum)
+        if current == signal.SIG_IGN:
+            continue  # 無視する設定（nohup など）。detector も終わらないので crawler にも送らない
+        if getattr(current, "forwards_to_crawler", False):
+            continue  # 外側（run_crawler）で用意済み
+        previous[signum] = current if current is not None else signal.SIG_DFL
+        signal.signal(signum, forward)
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 def _is_windows() -> bool:
     return os.name == "nt"
 
 
+def _signal_group(proc, sig) -> None:
+    """crawler のプロセスグループ（run_crawler が自前のグループで起動したもの。pgid は uv の pid）へ送ります。"""
+    try:
+        os.killpg(proc.pid, sig)
+    except OSError:
+        pass  # グループにもう誰も居ない（macOS はゾンビだけのグループに EPERM を返すことがある）
+
+
+def _forward_interrupt(proc) -> None:
+    """macOS・Linux: detector が受けた中断を crawler のグループにも送ります（別のグループなので届いていない。#35）。"""
+    if not _is_windows():
+        _signal_group(proc, signal.SIGINT)
+
+
 def stop_process_tree(proc) -> None:
-    """子プロセスを、その下のプロセスまで止めます。Windows は taskkill で木ごと（uv を止めても python が残るため）。"""
-    # Windows は uv が先に終わっていても、その下の python が残りうるので、木ごと止める指示は必ず出す
-    if proc.poll() is not None and not _is_windows():
-        return  # もう終わっている
+    """子プロセスを、その下のプロセスまで止めます。
+
+    Windows は taskkill で木ごと、macOS・Linux はプロセスグループごと（uv を止めても python が残るため。#35）。
+    uv が先に終わっていても、その下の python が残りうるので、木・グループごと止める指示は必ず出す。
+    """
     if _is_windows():
         subprocess.run(
             ["taskkill", "/pid", str(proc.pid), "/T", "/F"],
             check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+    else:
+        _signal_group(proc, SIGKILL)
     try:
         proc.kill()
     except OSError:
