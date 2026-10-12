@@ -27,6 +27,7 @@
       "preload.js",
       "commands.js",
       "defaults-summary.js",
+      "quick-queue.js",
       "detector-output.js",
       "i18n.js",
       "locales/**/*",

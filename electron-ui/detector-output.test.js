@@ -394,3 +394,103 @@ test('警告・エラーの行の数を数える（開き直す前に出た警�
   assert.strictEqual(countsAsWarning('2026-10-11 10:00:00,123 INFO ingest: CSV report: /x.csv'), false);
   assert.strictEqual(countsAsWarning('[Summary] moved: 3'), false);
 });
+
+// ---- 警告・エラーの行を残す（かんたん取り込みの列の行に、終わった理由を残す。#22）
+
+test('警告・エラーの行と、断りの続きの字下げした行を、上限まで（先頭と末尾を）残す', () => {
+  const { createNoticeCollector } = require('./detector-output');
+  const c = createNoticeCollector(3);
+  for (const line of [
+    '2026-10-12 10:00:00,000 INFO ingest: started',
+    'Error: The source is inside an archive folder (a folder with .akasyx/archive.id):',
+    '  archive folder: /a',
+    '  source        : /a/b',
+    '2026-10-12 10:00:01,000 INFO x: next',
+    '  indented but not after an error',
+    'Note: archive folder #3 is not connected',
+  ]) c.add(line);
+  const { lines, omitted } = c.snapshot();
+  // 上限 3 行は先頭 2 行と末尾 1 行（字下げしたログ以外の行・断りの後でない字下げした行は残さない）
+  assert.deepStrictEqual(lines, [
+    'Error: The source is inside an archive folder (a folder with .akasyx/archive.id):',
+    '  archive folder: /a',
+    'Note: archive folder #3 is not connected',
+  ]);
+  assert.strictEqual(omitted, 1); // 間の '  source        : /a/b'
+});
+
+test('出力の末尾を残す（上限を超えたら古い行から捨て、捨てた行数を数える）', () => {
+  const { createTailCollector } = require('./detector-output');
+  const c = createTailCollector(2);
+  for (const line of ['a', 'b', 'c']) c.add(line);
+  assert.deepStrictEqual(c.snapshot(), { lines: ['b', 'c'], omitted: 1 });
+});
+
+test('出力の末尾: まとめて切り詰めても、見える行と捨てた行数は 1 行ずつ切り詰めたときと同じ', () => {
+  const { createTailCollector } = require('./detector-output');
+  const c = createTailCollector(3);
+  for (let i = 1; i <= 10; i += 1) {
+    c.add(String(i));
+    const { lines, omitted } = c.snapshot();
+    assert.deepStrictEqual(lines, Array.from({ length: Math.min(i, 3) }, (_, k) => String(Math.max(i - 3, 0) + k + 1)));
+    assert.strictEqual(omitted, Math.max(0, i - 3));
+  }
+});
+
+test('detector が落ちたときの Traceback も、警告・エラーの行として残す', () => {
+  const { createNoticeCollector } = require('./detector-output');
+  const c = createNoticeCollector(10);
+  for (const line of [
+    '2026-10-12 10:00:00,000 INFO ingest: started',
+    'Traceback (most recent call last):',
+    '  File "main.py", line 1, in <module>',
+    '    main()',
+    'sqlite3.OperationalError: database is locked',
+    '2026-10-12 10:00:01,000 INFO x: after',
+  ]) c.add(line);
+  assert.deepStrictEqual(c.snapshot().lines, [
+    'Traceback (most recent call last):',
+    '  File "main.py", line 1, in <module>',
+    '    main()',
+    'sqlite3.OperationalError: database is locked',
+  ]);
+});
+
+test('Traceback は stderr の行だけで追う（途中に stdout の行が混ざっても、最後の例外の行を残す）', () => {
+  const { createNoticeCollector } = require('./detector-output');
+  const c = createNoticeCollector(10);
+  c.add('Traceback (most recent call last):', false, 'err');
+  c.add('  File "main.py", line 1, in <module>', false, 'err');
+  c.add('[Summary] moved: 1', false, 'out');
+  c.add('ValueError: boom', false, 'err');
+  assert.deepStrictEqual(c.snapshot().lines, [
+    'Traceback (most recent call last):', '  File "main.py", line 1, in <module>', 'ValueError: boom',
+  ]);
+});
+
+test('警告・エラーの行は、先頭と末尾を残す（最後に出た終わった理由を落とさない）', () => {
+  const { createNoticeCollector } = require('./detector-output');
+  const c = createNoticeCollector(4);
+  for (let i = 1; i <= 6; i += 1) c.add(`Note: n${i}`);
+  c.add('Error: the reason');
+  const { lines, omitted } = c.snapshot();
+  assert.deepStrictEqual(lines, ['Note: n1', 'Note: n2', 'Note: n6', 'Error: the reason']);
+  assert.strictEqual(omitted, 3);
+});
+
+test('Traceback は、次のログの行が来るまで続けて残す（複数行の例外メッセージを途中で切らない）', () => {
+  const { createNoticeCollector } = require('./detector-output');
+  const c = createNoticeCollector(10);
+  for (const line of [
+    'Traceback (most recent call last):',
+    '  File "main.py", line 1, in <module>',
+    'RuntimeError: preflight failed',
+    'second line of the message',
+    '',
+    '2026-10-12 10:00:01,000 INFO x: after',
+  ]) c.add(line, false, 'err');
+  assert.deepStrictEqual(c.snapshot().lines, [
+    'Traceback (most recent call last):', '  File "main.py", line 1, in <module>',
+    'RuntimeError: preflight failed', 'second line of the message',
+  ]);
+});

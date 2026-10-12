@@ -65,3 +65,12 @@ test('detector が出した実パスは正規化で変わらない（一覧の�
     assert.strictEqual(normalizePath(toFieldValue(p, platform), platform), p, `${platform}: ${p}`);
   }
 });
+
+test('buildArgs の verbatimPaths: 保存フォルダと投入元を正規化せずにそのまま使う（空はやはり断る）', () => {
+  const { buildArgs, FormError } = require('./commands');
+  const args = buildArgs({ mode: 'add', archiveRoot: ' /a ', sourcePath: "'/s'" }, { verbatimPaths: true });
+  assert.deepStrictEqual(args.slice(0, 3), ['add', ' /a ', "'/s'"]);
+  assert.throws(() => buildArgs({ mode: 'add', archiveRoot: '', sourcePath: '/s' }, { verbatimPaths: true }), FormError);
+  // フォームの欄では外せない（画面から来たフォームは必ず正規化する）
+  assert.deepStrictEqual(buildArgs({ mode: 'add', archiveRoot: ' /a ', sourcePath: '/s', verbatimPaths: true }).slice(0, 2), ['add', '/a']);
+});

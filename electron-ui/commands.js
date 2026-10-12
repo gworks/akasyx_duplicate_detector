@@ -72,8 +72,12 @@ function isWindowsPath(p) {
   return /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('\\\\');
 }
 
-/** フォーム1件から CLI 引数配列を作ります。不備は FormError で返します。 */
-function buildArgs(form) {
+/**
+ * フォーム1件から CLI 引数配列を作ります。不備は FormError で返します。
+ * options.verbatimPaths: 保存フォルダ・投入元を正規化せずそのまま使う（main が確かめた実パスのとき。フォームの欄では
+ * 渡せない＝画面から来たフォームで正規化を外せない）。
+ */
+function buildArgs(form, { verbatimPaths = false } = {}) {
   const mode = trimmed(form && form.mode);
   if (!MODES.includes(mode)) {
     throw new FormError('err_unknown_command', { mode: mode || '-' });
@@ -86,7 +90,9 @@ function buildArgs(form) {
     return pushCommonArgs(buildArchivesArgs(form), common);
   }
 
-  const archiveRoot = normalizePath(form.archiveRoot);
+  // 正規化は前後の空白や囲み引用符を落とすので、そういう名前の実パスは別のパスになる（かんたん取り込み #22）
+  const pathOf = (value) => (verbatimPaths ? String(value ?? '') : normalizePath(value));
+  const archiveRoot = pathOf(form.archiveRoot);
   if (!archiveRoot) {
     throw new FormError('err_archive_root_required');
   }
@@ -94,7 +100,7 @@ function buildArgs(form) {
   const args = [mode, archiveRoot];
 
   if (mode === 'add') {
-    const sourcePath = normalizePath(form.sourcePath);
+    const sourcePath = pathOf(form.sourcePath);
     if (!sourcePath) {
       throw new FormError('err_source_required');
     }

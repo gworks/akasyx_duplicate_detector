@@ -40,6 +40,10 @@ const dom = {
   runLabel: el('run-label'), runInvalid: el('run-invalid'),
   settings: el('settings'), openSettings: el('open-settings'), closeSettings: el('close-settings'),
   defaultArchiveRoot: el('defaultArchiveRoot'),
+  quickArchive: el('quick-archive'), quickNoArchive: el('quick-no-archive'), quickChooseArchive: el('quick-choose-archive'),
+  quickDrop: el('quick-drop'), quickPickFiles: el('quick-pick-files'), quickPickFolders: el('quick-pick-folders'),
+  quickMessage: el('quick-message'), quickQueue: el('quick-queue'),
+  quickPaused: el('quick-paused'), quickPausedText: el('quick-paused-text'), quickResume: el('quick-resume'),
 };
 
 let context = { repoRoot: '', dataDir: '', version: '', detectorFound: true };
@@ -79,6 +83,15 @@ let forgetHint = null;
 let stopRequested = false; // 中断を頼んだ（終わるまで中断は押せない）
 let starting = false;      // 実行を頼み、始まったという応答を待っている（中断は main が無視するので押させない）
 let finishedUnseen = false; // 他のタブにいる間に終わり、まだ見に行っていない
+// かんたん取り込みの列（#22。main が持つものの写し）と、画面が始めていない実行（列の項目）が始まった回数
+let quickItems = [];
+let quickPaused = false;     // 列が一時停止している（中断した後。再開で続ける）
+let externalStarts = 0;
+let quickNotice = null;    // ドロップの断り: { level, key（見出しのキー）, lines（訳した文言か { key, vars }） }
+let quickSubmitting = false; // 確認のダイアログを待っている
+let quickQueueEvents = 0;    // 列の写しが届いた回数（起動時の問い合わせより新しい写しを上書きしない）
+let currentRunId = null;     // 見ている実行の id（main の activeRun.id。中断がどの実行へのものかを main が見分ける。#22）
+let stopSentRunId = null;    // 中断を送った実行の id（古い行の中断が「もう走っていない」と返っても、今の実行の印を下ろさない）
 
 /** 実行ボタン。一覧の問い合わせ中も main は実行を断るので、押せないようにしておく。 */
 function updateRunButton() {
@@ -122,6 +135,7 @@ function applyLanguage(next) {
   renderRunLabel();
   renderDefaultsLine(lastDefaults);
   renderDefaultArchiveOptions();
+  renderQuick();
 }
 
 async function changeLanguage(next) {
@@ -139,9 +153,15 @@ async function changeLanguage(next) {
 function activeControls() {
   return [...document.querySelectorAll('[data-field], [data-group]')].filter((c) => {
     const scope = c.closest('.mode-panel, [data-for-mode]');
-    return !scope || (scope.dataset.panel || scope.dataset.forMode) === mode;
+    if (!scope) return true;
+    // かんたん取り込み（#22）は取り込みの既定を使う（取り込みタブの欄は使わない）
+    if (scope.dataset.forMode) return scope.dataset.forMode === settingsModeFor(mode);
+    return scope.dataset.panel === mode;
   });
 }
+
+/** 設定画面の、その機能の既定の区画（かんたん取り込みは取り込みの既定。#22）。 */
+const settingsModeFor = (m) => (m === 'quick' ? 'add' : m);
 
 function collectForm() {
   const form = { mode };
@@ -165,7 +185,10 @@ function setMode(next) {
   for (const panel of document.querySelectorAll('.mode-panel')) {
     panel.classList.toggle('active', panel.dataset.panel === next);
   }
-  dom.archiveRootField.hidden = next === 'archives';
+  // 保存フォルダ一覧は登録済みの全体を、かんたん取り込みは既定の保存フォルダを扱う（#22）
+  dom.archiveRootField.hidden = next === 'archives' || next === 'quick';
+  document.body.dataset.view = next; // かんたん取り込みでは実行ボタン・コマンドの表示を隠す（style.css）
+  renderQuick();
   // 実行したタブを開いたら、終わった印の帯は役目を終える
   if (next === runMode) finishedUnseen = false;
   renderRunView();
@@ -174,6 +197,11 @@ function setMode(next) {
   if (next === 'archives') {
     if (running) renderArchives(); // 実行中は読まない。読めないことを出す
     else loadArchives();
+  } else if (next === 'quick') {
+    // 登録済みの保存フォルダ（その中のもの・それを含むフォルダをダイアログの前に断る）を、タブを開いたときに設定画面と
+    // 同じ条件で読む。実行が終わるたびには読み直さない（読む間は列の次の項目を待たせる。つながっていない保存フォルダが
+    // あると長く待たせる。#7）。実行中は読まない。読めなかった分は detector が実行の前に断る
+    loadArchivesIfStale();
   }
 }
 
@@ -306,6 +334,7 @@ function renderDefaultArchiveOptions() {
     // 変わったときだけ書き直す（開いているドロップダウンを閉じない）
     if (option.textContent !== text) option.textContent = text;
   }
+  renderQuick(); // かんたん取り込みの保存先の表示も、今の選択に合わせる（#22）
 }
 
 // ------------------------------------------------------------ 設定画面（#21）
@@ -316,13 +345,20 @@ function openSettings(forMode) {
   runQueued = false;
   queuedShown = null;
   if (!dom.settings.open) dom.settings.showModal();
-  // 既定の保存フォルダの選択肢のため、一覧を読む。読むのは、まだ読んでいない・前に読めなかった・その後に実行が
-  // 終わった（登録が変わりうる）ときだけ（読む間は実行を止めるので、開くたびには読まない。実行中は読まない）
-  // 読み込み中なら頼まない（読み込み中の結果を捨てて読み直すと、実行を止める時間が延びる）
+  // 既定の保存フォルダの選択肢のため、一覧を読む
+  loadArchivesIfStale();
+  const section = forMode && dom.settings.querySelector(`[data-for-mode="${settingsModeFor(forMode)}"]`);
+  if (section) section.scrollIntoView({ block: 'start' });
+}
+
+/**
+ * 一覧を、まだ読んでいない・前に読めなかった・その後に実行が終わった（登録が変わりうる）ときだけ読む（読む間は実行を
+ * 止めるので、画面を開くたびには読まない。実行中は読まない）。読み込み中なら頼まない（読み込み中の結果を捨てて
+ * 読み直すと、実行を止める時間が延びる）。
+ */
+function loadArchivesIfStale() {
   const failed = !!(archivesState && archivesState.error); // 前に読めなかった（控えの一覧は古い）
   if (!running && !listInFlight && (!listedArchives() || failed || archivesStale)) loadArchives();
-  const section = forMode && dom.settings.querySelector(`[data-for-mode="${forMode}"]`);
-  if (section) section.scrollIntoView({ block: 'start' });
 }
 
 function closeSettings() {
@@ -791,7 +827,7 @@ function setStatus(level, key, vars = {}) {
  * 詳細ログを開く・たたむ（#18）。実行するコマンドの種類だけで決める: 取り込みは進み具合のカードで足りるのでたたみ、
  * ほかのコマンドは出力そのものが結果なので開く（logOpenFor）。実行が始まらなかったとき・エラーで終わったときは開く。
  */
-const logOpenFor = (mode) => mode !== 'add';
+const logOpenFor = (mode) => mode !== 'add' && mode !== 'quick';
 
 function setLogOpen(open) {
   const wasOpen = !dom.log.hidden;
@@ -913,8 +949,14 @@ function renderFailures(count) {
   dom.failuresSummary.textContent = t('failures_summary', { count: count.toLocaleString(lang) });
   // 新しい一覧が届いたときだけ描き直す（届くのは一覧が変わったときだけ・上限 500 件。言語の切り替えでは中身は変わらない）
   if (failures === renderedFailures) return finishFailures(omitted);
-  dom.failureList.replaceChildren();
-  for (const f of failures) {
+  dom.failureList.replaceChildren(...failureItems(failures));
+  renderedFailures = failures;
+  return finishFailures(omitted);
+}
+
+/** 失敗の一覧の行（パスとエラー）。進み具合のカードと、かんたん取り込みの終わった項目（#22）で同じ形にする。 */
+function failureItems(failures) {
+  return failures.map((f) => {
     const item = document.createElement('li');
     const name = document.createElement('span');
     name.className = 'failure-path';
@@ -923,10 +965,8 @@ function renderFailures(count) {
     message.className = 'failure-message';
     message.textContent = f.message;
     item.append(name, message);
-    dom.failureList.append(item);
-  }
-  renderedFailures = failures;
-  return finishFailures(omitted);
+    return item;
+  });
 }
 
 function finishFailures(omitted) {
@@ -991,6 +1031,7 @@ const modeLabel = (m) => {
 function renderRunView() {
   const v = RunView.runView({ mode, runMode, running, stopRequested, finishedUnseen, starting });
   const name = runMode ? modeLabel(runMode) : '';
+  renderQuickProgress(); // 列の実行中の項目にも、同じ進み具合を出す（#22）
 
   const outputShown = dom.runOutput.hidden && v.showOutput;
   dom.runOutput.hidden = !v.showOutput;
@@ -1053,16 +1094,32 @@ function setRunbarTitle(text, shown) {
  * 押せるように戻すのは、main が「送れなかった」（false）と確かに答えたときだけ。null（子プロセスがもう無い・
  * 終わるところ）や、応答そのものが失敗した（送れたかどうか分からない）ときは押せないまま、終わり方の表示に任せる。
  */
-async function requestStop() {
+async function requestStop(runId = currentRunId) {
+  // runId: 中断を頼む実行（列の行の中断はその項目の実行。main はその実行がもう走っていなければ何も送らない。#22）
   const run = runSerial; // 頼んだときの実行（応答が届くまでに終わって次の実行が始まっていたら、その応答は使わない）
   stopRequested = true;
   setStatus('warn', 'status_stop_requested');
   let sent;
   try {
-    sent = await api.stop();
+    sent = await api.stop(runId);
   } catch {
     return; // 送れたかどうか分からない
   }
+  if (sent === 'stale') {
+    // 頼んだ実行はもう走っていなかった（何も送っていない。その間に列の次の項目が始まった等。#22）。
+    // 今の実行に前から中断を頼んでいれば、その印はそのまま。頼んだ後に別の実行に替わっていたら、その実行の印には触らない
+    // （そちらへの中断の応答を待っているかもしれない）。どちらでもなければ印を下ろし、今の実行を中断できるようにする
+    if (runSerial !== run) return;
+    if (running && stopSentRunId !== null && stopSentRunId === currentRunId) {
+      setStatus('warn', 'status_stop_requested');
+      return;
+    }
+    stopRequested = false;
+    if (running) setStatus('info', 'status_running');
+    else renderRunView();
+    return;
+  }
+  if (sent === true) stopSentRunId = runId;
   if (sent !== false || !running || runSerial !== run) return;
   stopRequested = false;
   setStatus('warn', 'status_stop_failed'); // 実行は続いている
@@ -1090,9 +1147,11 @@ function resumeRun(run) {
   setStatus('info', 'status_running');
   adoptRun(run);
   runCommand = run.command || '';
+  currentRunId = run.id ?? null;
   // 実行中にしてから描く（残り時間と処理中のファイルは実行中だけ出す）
   setRunning(true, run.startedAt);
   if (run.stopRequested) {
+    stopSentRunId = run.id ?? null;
     // 閉じる前に中断を頼んでいた。もう一度押させない（2 度目の中断は detector の後片付けを途中で止めうる）
     stopRequested = true;
     setStatus('warn', 'status_stop_requested');
@@ -1127,6 +1186,7 @@ async function start(extra = {}) {
   starting = true;
   setRunning(true);
   setStatus('info', 'status_starting');
+  const externalBefore = externalStarts;
   let result;
   try {
     result = await api.start(form);
@@ -1137,6 +1197,13 @@ async function start(extra = {}) {
     starting = false;
     updateRunButton();
   }
+  if (!result.started && externalStarts !== externalBefore) {
+    // 応答を待つ間に、かんたん取り込みの列の項目が始まった（main はこちらを断った。#22）。その実行の表示を
+    // 消したり実行中でないことにしたりせず、断りだけを実行ボタンの下に出す
+    showRunNote(result.error || '');
+    renderRunView(); // 応答を待つ間（starting）に描いた中断ボタンを、押せる状態に描き直す
+    return;
+  }
   if (!result.started) {
     // 始まらなかった実行は出力の持ち主にしない（断りの帯はどのタブでも見える）
     releaseOutput();
@@ -1146,11 +1213,15 @@ async function start(extra = {}) {
     setStatus(result.error ? 'error' : 'info', result.error || 'status_canceled');
     return;
   }
-  appendLog([{ stream: 'meta', text: `$ ${result.command}` }]);
-  runCommand = result.command; // main が実際に組んだもの
-  renderRunView();
   if (form.mode !== 'archives') rememberRecent((form.archiveRoot || '').trim());
   persist();
+  // 応答より先に、この実行が終わって列の項目が始まっていた（#22）。画面はもう列の実行のものなので、
+  // そのコマンドと実行の id をこの実行のもので上書きしない
+  if (externalStarts !== externalBefore) return;
+  appendLog([{ stream: 'meta', text: `$ ${result.command}` }]);
+  runCommand = result.command; // main が実際に組んだもの
+  currentRunId = result.runId ?? null;
+  renderRunView();
   // 応答より先に終了通知を受けて片付いていたら（onExit が running を落としている）、状態を上書きしない
   if (!running) return;
   setStatus('info', 'status_running');
@@ -1160,6 +1231,320 @@ async function start(extra = {}) {
 function logDir(value = el('logDir').value) {
   const custom = String(value || '').trim();
   return custom || `${context.dataDir}/log`;
+}
+
+// ------------------------------------------------------- かんたん取り込み（#22）
+// 保存先は設定画面の既定の保存フォルダ、設定は取り込みの既定。ドロップしたものは main が確かめて確認のダイアログを出し、
+// 許可されたものだけを列に入れる（コマンドはそのときの設定で固定）。列は main が持ち、変わるたびに写しが届く
+
+/** main から届いた列の写し: { items, paused }。 */
+function applyQuickView(view) {
+  quickItems = view && Array.isArray(view.items) ? view.items : [];
+  quickPaused = !!(view && view.paused);
+}
+
+/** 既定の保存フォルダ（設定画面で選んだ実パス。決まっていなければ空）。 */
+const quickArchiveRoot = () => dom.defaultArchiveRoot.value;
+
+function renderQuick() {
+  const root = quickArchiveRoot();
+  dom.quickArchive.textContent = root || '—';
+  // 決まっていないときはドロップ欄を使えなくし、先に保存先を選ぶよう案内する
+  dom.quickNoArchive.hidden = !!root;
+  const enabled = !!root && !quickSubmitting;
+  dom.quickDrop.classList.toggle('disabled', !enabled);
+  dom.quickDrop.setAttribute('aria-disabled', String(!enabled));
+  dom.quickPickFiles.disabled = !enabled;
+  dom.quickPickFolders.disabled = !enabled;
+  dom.quickMessage.hidden = !quickNotice;
+  if (quickNotice) {
+    dom.quickMessage.className = `banner banner-${quickNotice.level}`;
+    // 行は訳した文言か、辞書のキー（断った理由。言語を切り替えたら訳し直す）
+    const line = (l) => (typeof l === 'string' ? l : t(l.key, l.vars));
+    dom.quickMessage.textContent = [quickNotice.key ? t(quickNotice.key) : '', ...quickNotice.lines.map(line)]
+      .filter(Boolean).join('\n');
+  }
+  renderQuickQueue();
+}
+
+function renderQuickQueue() {
+  const waiting = quickItems.filter((i) => i.status === 'waiting').length;
+  dom.quickPaused.hidden = !quickPaused;
+  if (quickPaused) dom.quickPausedText.textContent = t('quick_paused', { count: waiting.toLocaleString(lang) });
+  // 終わった行は中身が変わらないので使い回す（開いた失敗の一覧を閉じない・大きな一覧を作り直さない）。
+  // 言語を切り替えたら作り直す
+  const old = new Map([...dom.quickQueue.children].map((li) => [li.dataset.id, li]));
+  dom.quickQueue.replaceChildren(...quickItems.map((item) => {
+    const prev = old.get(String(item.id));
+    const reuse = prev && item.status === 'done' && prev.dataset.status === 'done' && prev.dataset.lang === lang;
+    return reuse ? prev : renderQuickItem(item);
+  }));
+  renderQuickProgress();
+}
+
+/** 終わった項目の終わり方: [見出しのキー, 色]。 */
+function quickOutcome(result) {
+  if (result.stoppedByUser) return ['quick_status_stopped', 'warn'];
+  const level = (result.meaning && result.meaning.level) || 'error';
+  // 正常に終わっても、行に残した警告の行があれば「警告あり」（crawler だけの警告では付けない。行に中身が出ないため）
+  const notices = result.notices || { lines: [], omitted: 0 };
+  if (level === 'ok') {
+    return notices.lines.length + notices.omitted > 0 ? ['quick_status_done_warn', 'warn'] : ['quick_status_done', 'ok'];
+  }
+  return [level === 'warn' ? 'quick_status_done_warn' : 'quick_status_failed', level === 'warn' ? 'warn' : 'error'];
+}
+
+function quickButton(action, key, cls = '') {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = `btn ${cls}`.trim();
+  button.dataset.action = action;
+  button.textContent = t(key);
+  return button;
+}
+
+function renderQuickItem(item) {
+  const li = document.createElement('li');
+  li.className = `quick-item ${item.status}`;
+  li.dataset.id = String(item.id);
+  li.dataset.status = item.status;
+  li.dataset.lang = lang;
+  const status = document.createElement('span');
+  status.className = 'quick-status';
+  const body = document.createElement('div');
+  body.className = 'quick-body';
+  const name = document.createElement('div');
+  name.className = 'quick-name';
+  // 他のタブの実行の結果の行（列の項目に押し出された実行。mode を持つ）は、その機能の名前とコマンドを出す
+  name.textContent = item.mode ? t('quick_other_run', { name: modeLabel(item.mode) }) : fileLabel(item.source);
+  name.title = item.mode ? item.command || '' : item.source;
+  const detail = document.createElement('div');
+  detail.className = 'quick-detail';
+  body.append(name, detail);
+  const actions = document.createElement('div');
+  actions.className = 'quick-actions';
+
+  if (item.status === 'waiting') {
+    status.textContent = t('quick_status_waiting');
+    actions.append(quickButton('cancel', 'quick_cancel'));
+  } else if (item.status === 'running') {
+    status.textContent = t('quick_status_running');
+    detail.classList.add('quick-progress'); // 進み具合は renderQuickProgress が入れる
+    actions.append(quickButton('stop', 'stop', 'stop'));
+  } else {
+    const r = item.result || {};
+    const [key, level] = quickOutcome(r);
+    status.textContent = t(key);
+    status.classList.add(level);
+    // 移動・重複・失敗の件数（失敗は 0 件でも出す）
+    const tally = r.tally || {};
+    const chips = document.createElement('div');
+    chips.className = 'chips';
+    // 他のタブの実行は、その実行の判定の内訳をそのまま出す
+    const kinds = item.mode ? RESULT_ORDER.filter((k) => tally[k]) : ['moved', 'duplicate', 'failed'];
+    for (const k of kinds) {
+      const n = k === 'failed' ? Math.max(tally.failed || 0, r.failureCount || 0) : tally[k] || 0;
+      chips.append(chip(`${t(`result_${k}`)} ${Number(n).toLocaleString(lang)}`, k));
+    }
+    detail.append(chips);
+    // 正常でなかった理由（一部失敗・エラー。中断は見出しで分かる。詳細ログは次の項目が始まると消える）
+    if (r.meaning && r.meaning.level !== 'ok' && !r.stoppedByUser) {
+      const why = document.createElement('div');
+      why.textContent = t(r.meaning.key, r.meaning.vars || {});
+      detail.append(why);
+    }
+    if (r.failures && r.failures.length) detail.append(quickFailures(r));
+    if (r.notices && r.notices.lines.length) detail.append(quickLines(r.notices, 'quick_notices', 'quick-notices'));
+    if (r.output && r.output.lines.length) detail.append(quickLines(r.output, 'quick_output', 'quick-output', 'quick_output_omitted'));
+    if (r.csvPath) actions.append(quickButton('csv', 'open_csv', 'ghost'));
+    // 出力が示した次の操作（詳細ログと一緒に消えるので、行から辿れるようにする）
+    if (r.adoptPath) actions.append(quickButton('adopt', 'next_adopt_button'));
+    if (r.forgetIds && r.forgetIds.length) actions.append(quickButton('forget', 'next_forget_button'));
+  }
+  li.append(status, body, actions);
+  return li;
+}
+
+/**
+ * 行に残した出力の行を、たたんだ一覧で出す: 警告・エラーの行（次の項目が始まると詳細ログが消えるので、終わった理由を
+ * 残す）と、他のタブの実行の出力の末尾。key は見出しの辞書のキー（{count} は全体の行数）。捨てた行があれば、
+ * ログのファイルにあることを添える。
+ */
+function quickLines({ lines, omitted }, key, cls, omittedKey = 'quick_notices_omitted') {
+  const pre = document.createElement('pre');
+  pre.className = 'quick-notice-lines';
+  pre.textContent = lines.join('\n');
+  return detailsBox(cls, t(key, { count: (lines.length + omitted).toLocaleString(lang) }), pre,
+    omitted ? t(omittedKey, { count: omitted.toLocaleString(lang) }) : '');
+}
+
+/** 終わった項目の失敗の一覧（CSV を開かなくても分かるように。#18 と同じ形）。 */
+function quickFailures(r) {
+  const list = document.createElement('ul');
+  list.className = 'failure-list';
+  list.append(...failureItems(r.failures));
+  return detailsBox('', t('failures_summary', { count: Number(r.failureCount || r.failures.length).toLocaleString(lang) }),
+    list, r.failuresOmitted ? t('failures_omitted', { count: Number(r.failuresOmitted).toLocaleString(lang) }) : '');
+}
+
+/** 列の行のたたんだ一覧（見出し・中身・載せきれなかった分の一文）。失敗の一覧と同じ見た目（failures）にする。 */
+function detailsBox(cls, summaryText, body, omittedText) {
+  const box = document.createElement('details');
+  box.className = `failures ${cls}`.trim();
+  const summary = document.createElement('summary');
+  summary.textContent = summaryText;
+  box.append(summary, body);
+  if (omittedText) {
+    const more = document.createElement('p');
+    more.className = 'failure-omitted';
+    more.textContent = omittedText;
+    box.append(more);
+  }
+  return box;
+}
+
+/** 実行中の項目の進み具合（実行したタブの進み具合と同じ文言）と、中断ボタンの押せる・押せない。 */
+function renderQuickProgress() {
+  const row = dom.quickQueue.querySelector('.quick-item.running');
+  if (!row) return;
+  const own = running && runMode === 'quick';
+  const text = own && lastProgress
+    ? [dom.count.textContent, dom.eta.textContent].filter(Boolean).join(' · ')
+    : t('status_running');
+  const detail = row.querySelector('.quick-progress');
+  if (detail && detail.textContent !== text) detail.textContent = text;
+  const stop = row.querySelector('[data-action="stop"]');
+  if (stop) stop.disabled = !own || stopRequested || starting;
+}
+
+/**
+ * ドロップ・選んだものを main に渡す（確かめて、確認のダイアログで許可されたら列に入る）。
+ * skipped は、落とされたもののうちパスにできなかった項目の数（知らせに添える）。
+ */
+async function submitQuick(paths, skipped = 0) {
+  // パスにできないもの（相対パス・Web のリンクなど）だけが落とされた。黙って捨てず、そのことを知らせる
+  if (!paths.length) {
+    quickNotice = { level: 'warn', key: 'quick_no_paths', lines: [] };
+    renderQuick();
+    return;
+  }
+  // 前に落としたものの確認を待っている間は受け付けない（黙って捨てず、そのことを知らせる）
+  if (quickSubmitting) {
+    quickNotice = { level: 'warn', key: 'quick_busy', lines: [] };
+    renderQuick();
+    return;
+  }
+  // 保存先が決まっていなければ何もしない（ドロップ欄を使えなくし、案内を出している。main も断る）
+  if (!quickArchiveRoot()) return;
+  quickSubmitting = true;
+  quickNotice = null;
+  renderQuick();
+  let result;
+  try {
+    // 登録済みの保存フォルダ（分かっている分）も渡し、その中のもの・それを含むフォルダを断らせる
+    result = await api.quickSubmit({ sources: paths, form: collectForm(), registeredRoots: registeredRoots() });
+  } catch (e) {
+    result = { queued: 0, rejected: [], error: t('quick_submit_failed', { detail: e.message || String(e) }) };
+  } finally {
+    quickSubmitting = false;
+  }
+  const rejected = result.rejected || [];
+  quickNotice = null; // 待つ間に出した知らせは、この結果で置き換える
+  // 断ったもの（理由つき）・組めなかった理由。キャンセルしたときは何も出さない（そのドロップは無かったことにする）
+  if (result.canceled) {
+    renderQuick();
+    return;
+  }
+  const reasons = rejected.map((r) => ({ key: r.key, vars: r.vars }));
+  if (skipped) reasons.push({ key: 'quick_skipped_paths', vars: { count: skipped.toLocaleString(lang) } });
+  if (result.error) quickNotice = { level: 'error', key: null, lines: [result.error, ...reasons] };
+  else if (reasons.length) quickNotice = { level: 'warn', key: 'quick_rejected', lines: reasons };
+  renderQuick();
+}
+
+function onQuickQueueClick(e) {
+  const button = e.target.closest('button[data-action]');
+  const row = button && button.closest('.quick-item');
+  if (!row) return;
+  const id = Number(row.dataset.id);
+  const item = quickItems.find((i) => i.id === id);
+  if (!item) return;
+  // 取り消せなかった（その間に始まった）ときは、届く列の写しが実行中の行に描き直す
+  if (button.dataset.action === 'cancel') api.quickCancel(id).catch((err) => console.error('quick cancel', err));
+  // 行の項目の実行に頼む（その間に終わって次の項目が始まっていたら、main は次を止めない）
+  else if (button.dataset.action === 'stop') requestStop(item.runId);
+  else if (button.dataset.action === 'csv' && item.result && item.result.csvPath) api.reveal(item.result.csvPath);
+  else if (button.dataset.action === 'adopt' && item.result && item.result.adoptPath) {
+    // 出力の案内と同じ: 実パスをパス欄の正規化で書き換わらない形にして入れ、既存ファイルの登録のタブへ
+    setPathField(el('archiveRoot'), item.result.adoptPath).then(() => setMode('adopt'));
+  } else if (button.dataset.action === 'forget' && item.result) {
+    // 出力の案内と同じく、保存フォルダ一覧のその実行の正本 DB の一覧に印を付ける（ID は正本 DB ごと）。
+    // 実行中は付けない（印と正本 DB は、走っている実行の出力のもの。上書きすると、その実行の案内と取り違える）
+    if (!running) {
+      forgetHint = new Set((item.result.forgetIds || []).map(Number));
+      runArchiveDb = String(item.result.archiveDb || '').trim();
+    }
+    setMode('archives');
+  }
+}
+
+function wireQuick() {
+  const zone = dom.quickDrop;
+  const highlight = (on) => zone.classList.toggle('dragover', on && !zone.classList.contains('disabled'));
+  for (const type of ['dragover', 'dragenter']) {
+    zone.addEventListener(type, (e) => {
+      e.preventDefault();
+      // 使えないとき（保存先が決まっていない・確認のダイアログを待っている）は、落とせない印のカーソルにする
+      if (zone.classList.contains('disabled')) e.dataTransfer.dropEffect = 'none';
+      highlight(true);
+    });
+  }
+  // 中の要素へ移ったときは消さない
+  zone.addEventListener('dragleave', (e) => {
+    if (!zone.contains(e.relatedTarget)) highlight(false);
+  });
+  zone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    highlight(false);
+    const { paths, skipped } = droppedPaths(e.dataTransfer);
+    submitQuick(paths, skipped);
+  });
+  // ファイルとフォルダで入口を分ける（Windows・Linux の選択ダイアログは両方を同時に選べない）
+  for (const [button, filesOnly] of [[dom.quickPickFiles, true], [dom.quickPickFolders, false]]) {
+    button.addEventListener('click', async () => {
+      const picked = await api.pick({ title: t('pick_quick'), filesOnly, multiple: true });
+      if (Array.isArray(picked) && picked.length) submitQuick(picked);
+    });
+  }
+  dom.quickChooseArchive.addEventListener('click', () => {
+    openSettings();
+    dom.defaultArchiveRoot.focus();
+  });
+  dom.quickQueue.addEventListener('click', onQuickQueueClick);
+  dom.quickResume.addEventListener('click', () => api.quickResume().catch((e) => console.error('quick resume', e)));
+  dom.defaultArchiveRoot.addEventListener('change', renderQuick);
+}
+
+/** 画面が始めていない実行（かんたん取り込みの列の項目）が始まった。実行ボタンで始めたときと同じ表示にする。 */
+function onRunStarted(run) {
+  externalStarts += 1;
+  context.run = null; // 開き直した直後に、古い写しで取り戻さない
+  // 前の出力を消す。結果は列の行に残っている（列の項目の結果・警告の行。他のタブの実行なら、main が終わり方・件数・
+  // CSV と出力の本文の末尾を列の完了の行に入れている）
+  clearLog();
+  // 前の実行に頼んだ中断の印は、この実行のものではない
+  stopRequested = false;
+  stopSentRunId = null;
+  adoptRun(run);
+  runCommand = run.command || '';
+  currentRunId = run.runId ?? null;
+  setLogOpen(logOpenFor(run.mode));
+  setRunning(true, run.startedAt);
+  setStatus('info', 'status_running');
+  appendLog([{ stream: 'meta', text: `$ ${run.command}` }]);
+  finishedUnseen = false;
+  renderRunView();
 }
 
 // ------------------------------------------------------------ 初期化・配線
@@ -1227,23 +1612,53 @@ function wireDropTargets() {
  * その場合は file:// URL をデコードしてパスにする。
  */
 function droppedPath(dt) {
-  const file = dt.files && dt.files[0];
-  if (file) {
-    const p = api.pathForFile(file);
-    if (p) return p;
+  // パス欄へのドロップ。テキストの前後の空白は落とす（選んだ文字列に紛れた空白で、欄が空や別のパスにならないように）
+  return droppedPaths(dt, { keepSpaces: false }).paths[0] || '';
+}
+
+/** ドロップされたものすべての実パス（かんたん取り込みは、一度に落とした項目を全部列に入れる。#22）。 */
+function droppedPaths(dt, { keepSpaces = true } = {}) {
+  // skipped: パスにできなかった項目の数（黙って捨てず、数を知らせる）
+  const files = [...(dt.files || [])];
+  if (files.length) {
+    const paths = files.map((f) => api.pathForFile(f)).filter(Boolean);
+    if (paths.length) return { paths, skipped: files.length - paths.length };
   }
   const raw = dt.getData('text/uri-list') || dt.getData('text/plain') || '';
-  const line = raw.split(/\r?\n/).find((l) => l && !l.startsWith('#')) || '';
+  const lines = raw.split(/\r?\n/).filter((l) => l.trim() && !l.startsWith('#'));
+  const paths = lines.map((l) => uriLinePath(keepSpaces ? l : l.trim())).filter(Boolean);
+  return { paths, skipped: Math.max(files.length, lines.length) - paths.length };
+}
+
+/** uri-list の 1 行をパスにする（file:// はデコードする）。 */
+function uriLinePath(line) {
+  const windows = context.platform === 'win32';
   if (line.startsWith('file://')) {
     try {
-      let p = decodeURIComponent(new URL(line).pathname);
+      const url = new URL(line);
+      let p = decodeURIComponent(url.pathname);
       if (p.length > 1 && p.endsWith('/')) p = p.slice(0, -1);
-      return p;
+      // macOS・Linux で別のマシンを指す file://server/... は受け付けない（ホスト名を捨てると、同じ名前のローカルの
+      // 場所を指してしまう）
+      const remote = url.host && url.host.toLowerCase() !== 'localhost';
+      if (!windows) return remote ? '' : p;
+      // Windows: file:///C:/x → C:\x、file://server/share/x → \\server\share\x（#22。いくつも落とせるようにしたので）
+      // file://localhost/C:/x はこのマシンのパス（UNC にしない）
+      if (remote) return `\\\\${url.host}${p.replace(/\//g, '\\')}`;
+      const local = p.replace(/^\/([A-Za-z]:)/, '$1').replace(/\//g, '\\');
+      // ドライブのルートは `C:\` のまま（`C:` だとそのドライブの作業フォルダを指してしまう）
+      return /^[A-Za-z]:$/.test(local) ? `${local}\\` : local;
     } catch {
       return '';
     }
   }
-  return line.startsWith('/') ? line.trim() : '';
+  // 前後の空白は落とさない（名前の前後に空白があるファイルを、別のパスにしない。落とすかは呼び出し側が決める）
+  // Windows のエクスプローラーの「パスのコピー」は全体を "…" で囲む（その形も受け付ける）
+  const quoted = windows && /^\s*".*"\s*$/.test(line);
+  const text = quoted ? line.trim().slice(1, -1) : line;
+  // commands.js の isWindowsPath と同じ形（ドライブ・UNC）
+  if (windows && (/^[A-Za-z]:[\\/]/.test(text) || text.startsWith('\\\\'))) return text;
+  return text.startsWith('/') ? text : '';
 }
 
 function wireForm() {
@@ -1279,8 +1694,8 @@ function wireRunControls() {
     renderNextAdopt();
     setMode('adopt');
   });
-  dom.stop.addEventListener('click', requestStop);
-  dom.runbarStop.addEventListener('click', requestStop);
+  dom.stop.addEventListener('click', () => requestStop());
+  dom.runbarStop.addEventListener('click', () => requestStop());
   // 実行したタブへ（帯・他のタブの案内から）
   const showRun = () => runMode && setMode(runMode);
   dom.runbarGo.addEventListener('click', showRun);
@@ -1291,7 +1706,12 @@ function wireRunControls() {
   });
   // 実行中のクリアはログの行だけ消す。進み具合と失敗の一覧はその実行のもので、main は失敗の一覧を
   // 増えたときにしか送らないので、ここで消すと二度と戻らない
-  dom.clearLog.addEventListener('click', () => (running ? clearLogLines() : clearLog()));
+  // 終わった後のクリアは、前の実行の結果を画面から消す。main にも伝え、列の次の項目が始まるときに列へ残させない（#22）
+  dom.clearLog.addEventListener('click', () => {
+    if (running) return clearLogLines();
+    clearLog();
+    return api.outputCleared().catch((e) => console.error('output cleared', e));
+  });
   dom.logToggle.addEventListener('click', () => setLogOpen(dom.log.hidden));
   dom.log.addEventListener('scroll', noteLogPosition, { passive: true });
   dom.copyCommand.addEventListener('click', () => {
@@ -1344,6 +1764,13 @@ function wireRunControls() {
 }
 
 function wireRunEvents() {
+  // かんたん取り込み（#22）: 列の写しと、列の項目が始まったこと
+  api.onQuickQueue((view) => {
+    quickQueueEvents += 1;
+    applyQuickView(view);
+    renderQuickQueue();
+  });
+  api.onStarted(onRunStarted);
   api.onLog(appendLog);
   api.onProgress(renderProgress);
   api.onExit((result) => {
@@ -1392,6 +1819,16 @@ async function init() {
   wireDropTargets();
   wireForm();
   wireRunControls();
+  wireQuick();
+  // かんたん取り込みの列（ウィンドウを閉じて開き直したときも、main が持っている列を出す。#22）。
+  // 問い合わせを待つ間に写しが届いたら、そちらが新しい
+  try {
+    const before = quickQueueEvents;
+    const view = await api.quickList();
+    if (quickQueueEvents === before) applyQuickView(view);
+  } catch (e) {
+    console.error('quick queue', e);
+  }
   // 走り続けている実行を先に取り戻す（setMode が archives の一覧を読みに行き、main に断られないように）
   if (context.run) resumeRun(context.run);
   setMode(mode);

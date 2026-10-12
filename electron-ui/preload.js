@@ -17,7 +17,8 @@ contextBridge.exposeInMainWorld('detector', {
   pick: (options) => ipcRenderer.invoke('dialog:pick', options),
   preview: (form) => ipcRenderer.invoke('command:preview', form),
   start: (form) => ipcRenderer.invoke('run:start', form),
-  stop: () => ipcRenderer.invoke('run:stop'),
+  // runId: 画面が見ている実行（もう走っていなければ main は何も送らない。#22）
+  stop: (runId) => ipcRenderer.invoke('run:stop', runId),
   // 登録済みの保存フォルダの一覧: { masterDb, archives, error }（#11）
   listArchives: (form) => ipcRenderer.invoke('archives:list', form),
   reveal: (target) => ipcRenderer.invoke('shell:reveal', target),
@@ -34,6 +35,17 @@ contextBridge.exposeInMainWorld('detector', {
       return '';
     }
   },
+  // かんたん取り込み（#22）: ドロップしたもの（実パス）を確認して列に入れる・列の中身・待ちの取り消し
+  // （実行中の項目の中断は stop に項目の実行の id を渡す）
+  quickSubmit: (request) => ipcRenderer.invoke('quick:submit', request),
+  quickList: () => ipcRenderer.invoke('quick:list'),
+  quickCancel: (id) => ipcRenderer.invoke('quick:cancel', id),
+  quickResume: () => ipcRenderer.invoke('quick:resume'),
+  // 出力を消した（前の実行の結果を列に残さなくてよい）
+  outputCleared: () => ipcRenderer.invoke('run:output-cleared'),
+  onQuickQueue: listen('quick:queue'),
+  // 画面が始めていない実行（列の項目）が始まった
+  onStarted: listen('run:started'),
   onLog: listen('run:log'),
   onProgress: listen('run:progress'),
   onExit: listen('run:exit'),
