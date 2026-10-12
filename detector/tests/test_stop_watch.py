@@ -10,6 +10,24 @@ import pytest
 import stop_watch
 
 
+# 本物のプロセスグループにシグナルを送るテスト（ほかのテストは、偽の pid 4242 のグループに本当に送らない）
+_REAL_SIGNAL_TESTS = {
+    "test_a_crawler_ignoring_sigint_does_not_survive_the_interrupt",
+    "test_detector_terminated_while_waiting_takes_the_crawler_down",
+}
+
+
+@pytest.fixture(autouse=True)
+def _no_real_killpg(request, monkeypatch):
+    if request.node.name in _REAL_SIGNAL_TESTS:
+        return
+
+    def gone(pgid, sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(crawler_client.os, "killpg", gone, raising=False)
+
+
 def _wait_until(cond, timeout=3.0):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -139,7 +157,7 @@ def test_stop_process_tree_uses_taskkill_on_windows(monkeypatch):
 
 
 def test_stop_process_tree_kills_the_child_elsewhere(monkeypatch):
-    monkeypatch.setattr(crawler_client, "_is_windows", lambda: False)
+    _record_killpg(monkeypatch)
     proc = _FakeProc()
     crawler_client.stop_process_tree(proc)
     assert proc.killed
@@ -301,3 +319,422 @@ def test_stop_waits_for_the_stop_file_to_be_removed(monkeypatch, tmp_path):
     assert _wait_until(lambda: calls == [1])
     watch.stop()
     assert not stop.exists()
+
+
+# --- macOS・Linux: crawler をプロセスグループごと止める（#35） ---------------------------------------------
+
+
+def _record_killpg(monkeypatch):
+    sent = []
+    monkeypatch.setattr(crawler_client, "_is_windows", lambda: False)
+    monkeypatch.setattr(crawler_client.os, "killpg", lambda pgid, sig: sent.append((pgid, sig)), raising=False)
+    return sent
+
+
+def test_crawler_runs_in_its_own_process_group_outside_windows(make_config, tmp_path, monkeypatch):
+    # 自前のグループで起動する（uv が止まっても、その下の python をグループごと止められるように）
+    seen = {}
+
+    class _Done:
+        pid = 4242
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(cmd, **kwargs):
+        seen.update(kwargs)
+        return _Done()
+
+    monkeypatch.setattr(crawler_client, "_is_windows", lambda: False)
+    monkeypatch.setattr(crawler_client, "crawler_command", lambda config: (["crawler"], str(tmp_path)))
+    monkeypatch.setattr(crawler_client.subprocess, "Popen", fake_popen)
+    with pytest.raises(Exception):
+        crawler_client.run_crawler(str(tmp_path), make_config())  # DB が無いので止まる（起動の仕方だけ見る）
+    assert seen.get("start_new_session") is True
+
+
+def test_crawler_is_not_given_a_new_session_on_windows(make_config, tmp_path, monkeypatch):
+    seen = {}
+
+    class _Done:
+        pid = 4242
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(cmd, **kwargs):
+        seen.update(kwargs)
+        return _Done()
+
+    monkeypatch.setattr(crawler_client, "_is_windows", lambda: True)
+    monkeypatch.setattr(crawler_client, "crawler_command", lambda config: (["crawler"], str(tmp_path)))
+    monkeypatch.setattr(crawler_client.subprocess, "Popen", fake_popen)
+    with pytest.raises(Exception):
+        crawler_client.run_crawler(str(tmp_path), make_config())
+    assert not seen.get("start_new_session")
+
+
+def test_interrupt_is_forwarded_to_the_crawler_group(monkeypatch):
+    # crawler は別のグループなので、UI・端末からの SIGINT は届かない。detector が受けた中断を crawler のグループに送る
+    import signal
+
+    sent = _record_killpg(monkeypatch)
+    stopped = []
+    monkeypatch.setattr(crawler_client, "stop_process_tree", lambda p: stopped.append(p.pid))
+    proc = _FakeProc()
+    with pytest.raises(KeyboardInterrupt):
+        crawler_client.wait_crawler(proc)
+    assert sent == [(4242, signal.SIGINT)]  # 猶予の前に 1 度だけ
+    assert proc.timeouts[-1] == crawler_client.CRAWLER_STOP_GRACE
+    assert stopped == [4242]
+
+
+def test_interrupt_is_not_forwarded_by_signal_on_windows(monkeypatch):
+    sent = []
+    monkeypatch.setattr(crawler_client, "_is_windows", lambda: True)
+    monkeypatch.setattr(crawler_client.os, "killpg", lambda pgid, sig: sent.append((pgid, sig)), raising=False)
+    monkeypatch.setattr(crawler_client, "stop_process_tree", lambda p: None)
+    with pytest.raises(KeyboardInterrupt):
+        crawler_client.wait_crawler(_FakeProc())
+    assert sent == []
+
+
+def test_stop_process_tree_kills_the_whole_group_even_after_uv_exited(monkeypatch):
+    # uv が先に終わっていても、その下の python（crawler）が残りうる。グループごと止める指示は必ず出す
+    sent = _record_killpg(monkeypatch)
+    proc = _FakeProc()
+    proc.killed = True  # uv はもう終わっている
+    crawler_client.stop_process_tree(proc)
+    assert (4242, crawler_client.SIGKILL) in sent
+
+
+def test_stop_process_tree_tolerates_a_group_that_is_already_gone(monkeypatch):
+    monkeypatch.setattr(crawler_client, "_is_windows", lambda: False)
+
+    def gone(pgid, sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(crawler_client.os, "killpg", gone, raising=False)
+    proc = _FakeProc()
+    crawler_client.stop_process_tree(proc)  # 投げない
+    assert proc.killed
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="macOS・Linux のプロセスグループの実物の確かめ")
+def test_a_crawler_ignoring_sigint_does_not_survive_the_interrupt(tmp_path):
+    # uv の代わりの親と、SIGINT を無視する子（crawler の代わり）。中断の後、子も残らない
+    import os
+    import signal
+
+    pid_file = tmp_path / "child.pid"
+    child = (
+        "import os, signal, sys, time; signal.signal(signal.SIGINT, signal.SIG_IGN); "
+        f"open({str(pid_file)!r}, 'w').write(str(os.getpid())); time.sleep(60)"
+    )
+    # 親は uv と同じく SIGINT では子を止めない（subprocess.call は中断で子を kill するので、無視させる）。
+    # 子が残らないのは、グループごとの SIGKILL だけによる
+    parent = (
+        "import signal, subprocess, sys; signal.signal(signal.SIGINT, signal.SIG_IGN); "
+        f"subprocess.call([sys.executable, '-c', {child!r}])"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", parent], start_new_session=True)
+    try:
+        assert _wait_until(lambda: pid_file.exists() and pid_file.read_text(), timeout=10)
+        child_pid = int(pid_file.read_text())
+
+        class _Interrupting:
+            pid = proc.pid
+            first = True
+
+            def wait(self, timeout=None):
+                if self.first:
+                    self.first = False
+                    raise KeyboardInterrupt
+                return proc.wait(timeout=timeout)
+
+            def poll(self):
+                return proc.poll()
+
+            def kill(self):
+                proc.kill()
+
+        with pytest.raises(KeyboardInterrupt):
+            crawler_client.wait_crawler(_Interrupting())
+
+        def gone():
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                return True
+            return False
+
+        assert _wait_until(gone, timeout=5)
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        proc.wait(timeout=5)
+
+
+def test_grace_continues_while_the_crawler_outlives_uv(monkeypatch):
+    # uv が先に終わっても、その下の python が後片付けをしている間は猶予の終わりまで待つ（すぐ SIGKILL しない）
+    import signal
+
+    probes = []
+    events = []
+
+    def killpg(pgid, sig):
+        if sig == 0:
+            probes.append(1)
+            if len(probes) >= 3:
+                raise ProcessLookupError  # 3 度目の確認で居なくなった
+            return
+        events.append(("signal", sig))
+
+    monkeypatch.setattr(crawler_client, "_is_windows", lambda: False)
+    monkeypatch.setattr(crawler_client.os, "killpg", killpg, raising=False)
+    monkeypatch.setattr(crawler_client, "GROUP_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(crawler_client, "stop_process_tree", lambda p: events.append(("stop", None)))
+
+    class _UvExitsAtOnce(_FakeProc):
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.waits == 1:
+                raise KeyboardInterrupt
+            return 0  # uv は SIGINT ですぐ終わる
+
+    with pytest.raises(KeyboardInterrupt):
+        crawler_client.wait_crawler(_UvExitsAtOnce())
+    assert len(probes) == 3  # グループが空になるまで待った
+    assert events == [("signal", signal.SIGINT), ("stop", None)]
+
+
+def test_grace_ends_even_if_the_group_never_empties(monkeypatch):
+    monkeypatch.setattr(crawler_client, "_is_windows", lambda: False)
+    monkeypatch.setattr(crawler_client.os, "killpg", lambda pgid, sig: None, raising=False)  # いつまでも居る
+    monkeypatch.setattr(crawler_client, "GROUP_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(crawler_client, "CRAWLER_STOP_GRACE", 0.2)
+    stopped = []
+    monkeypatch.setattr(crawler_client, "stop_process_tree", lambda p: stopped.append(p.pid))
+
+    class _UvExitsAtOnce(_FakeProc):
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.waits == 1:
+                raise KeyboardInterrupt
+            return 0
+
+    started = time.monotonic()
+    with pytest.raises(KeyboardInterrupt):
+        crawler_client.wait_crawler(_UvExitsAtOnce())
+    assert time.monotonic() - started < 2
+    assert stopped == [4242]
+
+
+def test_termination_while_waiting_is_forwarded_to_the_crawler_group(monkeypatch):
+    # crawler は別のグループ。端末を閉じた（SIGHUP）・kill された（SIGTERM）detector だけが終わり crawler が残らないよう、
+    # 同じシグナルを crawler のグループにも送り、元の扱いに戻して detector 自身にも送り直す
+    import signal
+
+    sent = []
+    resent = []
+    monkeypatch.setattr(crawler_client, "_is_windows", lambda: False)
+    monkeypatch.setattr(crawler_client.os, "killpg", lambda pgid, sig: sent.append((pgid, sig)), raising=False)
+    monkeypatch.setattr(crawler_client.os, "kill", lambda pid, sig: resent.append((pid, sig)))
+    before = signal.getsignal(signal.SIGTERM)
+    with crawler_client._forward_termination([_FakeProc()]):
+        handler = signal.getsignal(signal.SIGTERM)
+        assert handler is not before
+        handler(signal.SIGTERM, None)
+        assert signal.getsignal(signal.SIGTERM) is before  # 送り直す前に元の扱いに戻した
+    assert sent == [(4242, signal.SIGTERM)]
+    assert resent == [(crawler_client.os.getpid(), signal.SIGTERM)]
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+def test_termination_handlers_are_restored_after_the_wait(monkeypatch):
+    import signal
+
+    monkeypatch.setattr(crawler_client, "_is_windows", lambda: False)
+    before = signal.getsignal(signal.SIGTERM)
+
+    class _Done(_FakeProc):
+        def wait(self, timeout=None):
+            return 0
+
+    assert crawler_client.wait_crawler(_Done()) == 0
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGHUP は macOS・Linux だけ")
+def test_ignored_hangup_is_left_alone(monkeypatch):
+    import signal
+
+    monkeypatch.setattr(crawler_client, "_is_windows", lambda: False)
+    previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)  # nohup で起動されたとき
+    try:
+        with crawler_client._forward_termination([_FakeProc()]):
+            assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="macOS・Linux のプロセスグループの実物の確かめ")
+def test_detector_terminated_while_waiting_takes_the_crawler_down(tmp_path):
+    # detector（crawler を待っている）が SIGTERM で終わっても、crawler（別のグループ・SIGINT を無視）が残らない
+    import os
+    import signal
+
+    pid_file = tmp_path / "child.pid"
+    child = (
+        "import os, signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); "
+        f"open({str(pid_file)!r}, 'w').write(str(os.getpid())); time.sleep(60)"
+    )
+    detector_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    detector = (
+        f"import subprocess, sys; sys.path.insert(0, {detector_dir!r}); import crawler_client; "
+        f"p = subprocess.Popen([sys.executable, '-c', {child!r}], start_new_session=True); "
+        "crawler_client.wait_crawler(p)"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", detector])
+    child_pid = None
+    try:
+        assert _wait_until(lambda: pid_file.exists() and pid_file.read_text(), timeout=10)
+        child_pid = int(pid_file.read_text())
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=10)
+        assert proc.returncode == -signal.SIGTERM  # detector は今までどおり SIGTERM で終わる
+
+        def gone():
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                return True
+            return False
+
+        assert _wait_until(gone, timeout=5)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_termination_is_still_forwarded_during_the_grace(monkeypatch):
+    # 中断の後の猶予の間に SIGTERM が来ても（止めるのを急かされた）、detector だけが終わって crawler が残らない
+    import signal
+
+    monkeypatch.setattr(crawler_client, "_is_windows", lambda: False)
+    monkeypatch.setattr(crawler_client, "stop_process_tree", lambda p: None)
+    before = signal.getsignal(signal.SIGTERM)
+    during_grace = []
+
+    class _Proc(_FakeProc):
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.waits == 1:
+                raise KeyboardInterrupt
+            during_grace.append(signal.getsignal(signal.SIGTERM))
+            return 0
+
+    with pytest.raises(KeyboardInterrupt):
+        crawler_client.wait_crawler(_Proc())
+    assert during_grace and during_grace[0] is not before
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+def _spawned(monkeypatch, tmp_path, wait_crawler):
+    stopped = []
+
+    class _Started(_FakeProc):
+        pass
+
+    monkeypatch.setattr(crawler_client, "crawler_command", lambda config: (["crawler"], str(tmp_path)))
+    monkeypatch.setattr(crawler_client.subprocess, "Popen", lambda cmd, **kw: _Started())
+    monkeypatch.setattr(crawler_client, "wait_crawler", wait_crawler)
+    monkeypatch.setattr(crawler_client, "stop_process_tree", lambda p: stopped.append(p.pid))
+    return stopped
+
+
+def test_interrupt_right_after_the_crawler_started_still_stops_it(make_config, tmp_path, monkeypatch):
+    # 起動した直後・wait_crawler が後片付けを引き受ける前の中断（#35）
+    def interrupted_before_waiting(proc):
+        raise KeyboardInterrupt
+
+    stopped = _spawned(monkeypatch, tmp_path, interrupted_before_waiting)
+    with pytest.raises(KeyboardInterrupt):
+        crawler_client.run_crawler(str(tmp_path), make_config())
+    assert stopped == [4242]
+
+
+def test_crawler_stopped_by_wait_is_not_stopped_twice(make_config, tmp_path, monkeypatch):
+    def stopped_while_waiting(proc):
+        proc.stopped_by_detector = True
+        raise KeyboardInterrupt
+
+    stopped = _spawned(monkeypatch, tmp_path, stopped_while_waiting)
+    with pytest.raises(KeyboardInterrupt):
+        crawler_client.run_crawler(str(tmp_path), make_config())
+    assert stopped == []
+
+
+def test_termination_is_forwarded_from_before_the_crawler_starts(make_config, tmp_path, monkeypatch):
+    # 起動した直後（wait_crawler が始まる前）に届いた SIGTERM も crawler に送る
+    import signal
+
+    monkeypatch.setattr(crawler_client, "_is_windows", lambda: False)
+    monkeypatch.setattr(crawler_client, "crawler_command", lambda config: (["crawler"], str(tmp_path)))
+    monkeypatch.setattr(crawler_client, "stop_process_tree", lambda p: None)
+    monkeypatch.setattr(crawler_client.subprocess, "Popen", lambda cmd, **kw: _FakeProc())
+    seen = []
+
+    def wait_after_a_signal(proc):
+        seen.append(signal.getsignal(signal.SIGTERM))
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(crawler_client, "wait_crawler", wait_after_a_signal)
+    before = signal.getsignal(signal.SIGTERM)
+    with pytest.raises(KeyboardInterrupt):
+        crawler_client.run_crawler(str(tmp_path), make_config())
+    assert seen and getattr(seen[0], "forwards_to_crawler", False)  # wait_crawler の前から送り直しの用意がある
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+def test_forwarding_continues_after_a_python_handler_that_returns(monkeypatch):
+    import signal
+
+    sent = []
+    calls = []
+    monkeypatch.setattr(crawler_client, "_is_windows", lambda: False)
+    monkeypatch.setattr(crawler_client.os, "killpg", lambda pgid, sig: sent.append((pgid, sig)), raising=False)
+    previous = signal.signal(signal.SIGTERM, lambda signum, frame: calls.append(signum))
+    try:
+        with crawler_client._forward_termination([_FakeProc()]):
+            handler = signal.getsignal(signal.SIGTERM)
+            handler(signal.SIGTERM, None)
+            assert signal.getsignal(signal.SIGTERM) is handler  # 送り直しを続ける
+            handler(signal.SIGTERM, None)
+        assert calls == [signal.SIGTERM, signal.SIGTERM]
+        assert sent == [(4242, signal.SIGTERM), (4242, signal.SIGTERM)]
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def test_nested_forwarding_does_not_send_twice(monkeypatch):
+    import signal
+
+    sent = []
+    monkeypatch.setattr(crawler_client, "_is_windows", lambda: False)
+    monkeypatch.setattr(crawler_client.os, "killpg", lambda pgid, sig: sent.append((pgid, sig)), raising=False)
+    monkeypatch.setattr(crawler_client.os, "kill", lambda pid, sig: None)
+    proc = _FakeProc()
+    with crawler_client._forward_termination([proc]):
+        outer = signal.getsignal(signal.SIGTERM)
+        with crawler_client._forward_termination([proc]):
+            assert signal.getsignal(signal.SIGTERM) is outer
+            outer(signal.SIGTERM, None)
+    assert sent == [(4242, signal.SIGTERM)]

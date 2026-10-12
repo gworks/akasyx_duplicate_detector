@@ -4,6 +4,8 @@ import os
 import sys
 from datetime import datetime, timezone
 
+from sqlalchemy import func
+
 import adopt
 import archives
 import config as config_module
@@ -38,7 +40,11 @@ from models import (
     RESULT_SKIPPED_NOHASH,
     RESULT_SKIPPED_IN_ARCHIVE,
     RESULT_SKIPPED_OWN_DATA,
+    COUNTS_UNAVAILABLE,
+    STATUS_STORED,
+    ArchiveFile,
     Ingest,
+    IngestItem,
 )
 from utl.helpers import is_nested, json_dumps, path_key
 
@@ -210,6 +216,47 @@ def _apply_counters(record: Ingest, counters: dict) -> None:
     record.stats_json = json_dumps(counters)
 
 
+def _counts_are_saved(config: DetectorConfig) -> bool:
+    """この実行の判定が 1 件ずつ ar_ingest_items に保存されるか（add だけ。dry-run は書かない）。
+
+    delete-duplicates は前の取り込みの行を書き換え、verify は ok の件数を保存しないので、DB からは数え直せない。
+    """
+    return config.mode == MODE_ADD and not config.dry_run
+
+
+def _saved_counters(session, record: Ingest) -> dict:
+    """この実行の、DB に保存された判定（ar_ingest_items）を result 別に数えます。
+
+    移動したファイルは、保存の記録（ar_archive_files）が 1 件ごとに確定している。判定の記録はその後の commit で確定するので、
+    最後の commit の最中の中断では欠けうる。移動の件数は保存の記録の方からも数え、多い方を使う。
+    """
+    rows = (
+        session.query(IngestItem.result, func.count())
+        .filter(IngestItem.ingest_id == record.id)
+        .group_by(IngestItem.result)
+        .all()
+    )
+    counters = {result: count for result, count in rows}
+    stored = (
+        session.query(func.count(ArchiveFile.id))
+        .filter(ArchiveFile.ingest_id == record.id, ArchiveFile.status == STATUS_STORED)
+        .scalar()
+    )
+    if stored > counters.get(RESULT_MOVED, 0):
+        counters[RESULT_MOVED] = stored
+    return counters
+
+
+def _interrupted_before_listing(config: DetectorConfig, record: Ingest, interrupted_outside: bool) -> bool:
+    """取り込みが一覧作成の段階で中断されたか（crawler のスキャンが記録される前。移動はまだ始まっていない）。"""
+    return (
+        interrupted_outside
+        and config.mode == MODE_ADD
+        and record.crawler_scan_id is None
+        and os.path.isdir(config.source_path)
+    )
+
+
 def run_archives(config: DetectorConfig) -> int:
     """登録済みの保存フォルダ一覧（保存フォルダの指定もロックも要らない）。--forget は登録を外す。
 
@@ -319,33 +366,66 @@ def run(config: DetectorConfig) -> int:
 
             status = "failed"
             counters: dict = {}
+            # 各処理のループの外（一覧作成の段階・ループの後の後片付けの commit など）で中断を受けたか（#34）
+            interrupted_outside = False
             try:
                 status, counters = RUNNERS[config.mode](session, config, record)
             except PreflightError:
                 session.delete(record)
                 session.commit()
                 raise
+            except KeyboardInterrupt:
+                # 致命的エラーにせず中断として記録する（UI は中断として扱う。記録と食い違わせない。#34）
+                status = "interrupted"
+                interrupted_outside = True
+                logger.warning("Interrupted by user")
             except Exception:
                 logger.exception("A fatal error occurred during processing")
             finally:
-                if status == "failed":
-                    # 例外で抜けた場合、未コミットの変更を捨ててから実行行を書き戻す
+                if status == "failed" or interrupted_outside:
+                    # 例外で抜けた場合、未コミットの変更を捨ててから実行行を書き戻す。ループの外の中断も同じ
+                    # （どこまで済んだか分からない途中の状態を確定させない。確定済みの記録は残る）
                     session.rollback()
                 elif status == "interrupted":
                     # 中断が DB の読み書きの途中に入ると、セッションは rollback するまで使えない（dry-run の判定の
                     # クエリなど、各処理の後片付けが立て直さない経路もある。#32）
                     commit_after_interrupt(session)
+                if interrupted_outside and _counts_are_saved(config):
+                    # 各処理が数えた件数は失われたので、DB に保存された記録から数え直す（0 件と記録しない）
+                    counters = _saved_counters(session, record)
+                    if not _interrupted_before_listing(config, record, interrupted_outside):
+                        # 確定していなかった判定の記録は上の rollback で捨てた（最後の commit の最中の中断など）。黙って
+                        # 欠けさせない（一覧作成の段階なら判定はまだ無い）
+                        logger.warning(
+                            "Interrupted outside the processing loop: judgments not yet saved to the DB at that "
+                            "point (if any) were discarded (moved files are saved; see the CSV for the judged files)"
+                        )
                 record.status = status
                 record.finished_at = datetime.now(timezone.utc)
                 _apply_counters(record, counters)
+                if interrupted_outside and not _counts_are_saved(config) and not _interrupted_before_listing(
+                    config, record, interrupted_outside
+                ):
+                    # 0 件と読める記録を残さない（report の履歴も「分からない」と出す）
+                    record.stats_json = json_dumps({COUNTS_UNAVAILABLE: True})
                 session.commit()
 
             if config.mode == MODE_REPORT:
-                # report は読み取り専用。集計はレポート本文に出ているのでサマリは要らない
+                # report は読み取り専用。集計はレポート本文に出ているのでサマリは要らない。中断したときは、本文が途中までで
+                # あることだけ出す（#34）
+                if status == "interrupted":
+                    print("* report was interrupted (the output may be incomplete)")
                 return EXIT_OK
 
             summary = _summarize(config, counters)
-            if status == "interrupted":
+            if status == "interrupted" and _interrupted_before_listing(config, record, interrupted_outside):
+                summary += " * run was interrupted while listing the source (no files were moved)"
+            elif interrupted_outside and _counts_are_saved(config):
+                summary += " * run was interrupted (summary covers the results saved to the DB)"
+            elif interrupted_outside:
+                # 件数を DB から数え直せない（delete-duplicates・verify・dry-run）。0 件と読める形で出さない
+                summary = "[Summary] counts are not available * run was interrupted (see the CSV and the log)"
+            elif status == "interrupted":
                 summary += " * run was interrupted (summary covers processed files only)"
             elif status == "failed":
                 summary += " * stopped due to a fatal error"
