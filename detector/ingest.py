@@ -83,6 +83,11 @@ def judge(
 
     戻り値の RESULT_MOVED は「移動対象」の意味で、実際の移動は呼び出し側が行う。
     """
+    if scanned.nohash_reason is not None:
+        # ハッシュが無い理由が分かっている（単一ファイルを直接読んだ）。大きさは読む前の stat の値なので、それで「空」と
+        # 判定すると理由（読んでいる間に変わった・読めなかった）が消える（#25）
+        return RESULT_SKIPPED_NOHASH, None, scanned.nohash_reason
+
     if scanned.size < config.min_size:
         return (
             RESULT_SKIPPED_EMPTY,
@@ -92,7 +97,8 @@ def judge(
 
     if not scanned.filehash or not scanned.hash_algo:
         # crawler は読み取りエラー時に filehash=NULL で登録を続行する。
-        # これを新規と誤判定すると重複が保存フォルダに紛れ込む（設計書 §7.1 #2）
+        # これを新規と誤判定すると重複が保存フォルダに紛れ込む（設計書 §7.1 #2）。理由は分からない（理由が分かる単一
+        # ファイルは上で返している）
         return RESULT_SKIPPED_NOHASH, None, "Cannot classify: hash unavailable"
 
     key = (scanned.filehash, scanned.hash_algo)

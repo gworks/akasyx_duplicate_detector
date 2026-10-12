@@ -530,7 +530,7 @@ def test_single_file_changed_while_hashing_is_not_moved(make_config, archive, tm
     with caplog.at_level(logging.WARNING):
         main.run(make_config(archive_root=archive, source_path=path))
     assert os.path.exists(path)  # 移動していない
-    assert "changed while reading" in caplog.text
+    assert "changed while it was being read" in caplog.text
 
 
 def test_total_unknown_when_uri_cannot_be_encoded(

@@ -18,7 +18,8 @@ const INGEST_FINISHED_LINE = /^Ingest finished$/;
 // crawler（一覧作成）の進捗。全体が分からないときは unknown
 const SCAN_PROGRESS_LINE = /^Processing files: (\d+)\/(\d+|unknown)\b/;
 // CSV の場所はログの INFO 行（%(asctime)s %(levelname)s %(name)s: …）の形のときだけ拾う。ほかの行（失敗の WARNING など）は
-// 任意のファイル名やエラー文を含むので、同じ語が入っていても拾わない
+// 任意のファイル名やエラー文を含むので、同じ語が入っていても拾わない。detector の config.setup_logging の書式に依るので、
+// detector/tests/test_csv_line_ui.py がこの行から正規表現を読み、各コマンドの実際の行が合うことを確かめている（#26）
 const CSV_LINE = /^\d{4}-\d\d-\d\d \S+ INFO \S+: CSV report: (.+)$/;
 // つながっていない保存フォルダにしか無い重複（ingest._report_unavailable_owners が stdout に出す行）。
 // 同じ文がログ（stderr の WARNING 行）にも出るので、行頭の Note: だけを拾う
