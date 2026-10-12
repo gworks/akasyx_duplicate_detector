@@ -353,7 +353,10 @@ packaging/build_mac.sh
 packaging/build_python.sh    # → build/pyi/dist/akasyx-{detector,crawler}/（PyInstaller onedir）
 ```
 
-- 兄弟リポジトリ `../akasyx_crawler` が要る。crawler の GPL 系依存（mutagen・pillow-heif）は同梱しない
+- 兄弟リポジトリ `../akasyx_crawler` が要る。進み具合を英語の行（`Processing files: n/全体`）で出す版
+  （76ed58a「#3 english output」を含む版。版番号ではなくこのコミットを含むかで決まる。v0.1.1 までのリリースは
+  「ファイル処理中:」と日本語で出すので使えない）でないと、UI に一覧作成の進み具合が出ないので、スクリプトが
+  固める前に止める。crawler の GPL 系依存（mutagen・pillow-heif）は同梱しない
   （音声・HEIC のメタデータが取れないだけで走査は続く）。混入していればスクリプトが失敗する
 - 実行形式は起動しただけで配布版の扱いになり、データフォルダは Application Support 側を使う
 - 開発中の UI から実行形式を試す: `AKASYX_BIN_DIR=../build/pyi/dist npm run dev`（`electron-ui/` で）。
