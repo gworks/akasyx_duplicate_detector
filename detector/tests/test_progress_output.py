@@ -570,3 +570,53 @@ def test_unstable_inode_is_not_taken_as_change(make_config, archive, tmp_path, m
     monkeypatch.setattr(crawler_client.os, "stat", shifting_stat)
     assert main.run(make_config(archive_root=archive, source_path=path)) == main.EXIT_OK
     assert not os.path.exists(path)  # 取り込まれて移動した
+
+
+def test_interrupt_during_a_db_write_is_cleaned_up_not_fatal(
+    make_config, archive, source, tmp_path, fake_crawler, capsys, caplog, monkeypatch
+):
+    """中断が DB への書き込みの途中に入っても（接続のトランザクションが無効になる）、致命的エラーにせず中断として終わる。
+
+    2026-10-12、Windows の停止ファイルでの中断で PendingRollbackError になり、CSV も出なかった（#32）。
+    """
+    import ingest
+
+    write_file(os.path.join(source, "a.txt"), b"AAA")
+
+    def stop_mid_write(session, *args, **kwargs):
+        session.connection().invalidate()  # 実行の途中で割り込まれた接続
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ingest, "_process_one", stop_mid_write)
+    capsys.readouterr()
+    assert _add(make_config, archive, source, tmp_path, fake_crawler) != main.EXIT_FATAL
+    lines = _lines(capsys)
+    assert any("run was interrupted" in line for line in lines)
+    assert "were not saved to the DB" in caplog.text  # 保存されなかった分を黙らない
+
+
+def test_dry_run_interrupt_during_a_db_query_is_not_fatal(
+    make_config, archive, source, tmp_path, fake_crawler, capsys, monkeypatch
+):
+    """dry-run でも、判定のクエリの途中の中断で壊れたセッションを立て直してから実行の記録を書く（#32）。"""
+    import ingest
+
+    write_file(os.path.join(source, "a.txt"), b"AAA")
+
+    def stop_mid_query(session, *args, **kwargs):
+        session.connection().invalidate()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ingest, "_process_one", stop_mid_query)
+    real_report = ingest._report_unavailable_owners
+
+    def report_reading_the_db(session, lookup):
+        from models import Archive
+
+        session.query(Archive).all()  # 後片付けの後の処理も DB を読む（つながっていない保存フォルダの重複の報告など）
+        return real_report(session, lookup)
+
+    monkeypatch.setattr(ingest, "_report_unavailable_owners", report_reading_the_db)
+    capsys.readouterr()
+    assert _add(make_config, archive, source, tmp_path, fake_crawler, dry_run=True) != main.EXIT_FATAL
+    assert any("run was interrupted" in line for line in _lines(capsys))

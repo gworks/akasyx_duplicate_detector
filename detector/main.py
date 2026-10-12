@@ -12,9 +12,17 @@ import dedupe
 import ingest as ingest_module
 import mover
 import report
+import stop_watch
 import verify
 from config import DetectorConfig
-from database import META_DIRNAME, archive_lock, get_session, legacy_db_path, master_db_lock
+from database import (
+    META_DIRNAME,
+    archive_lock,
+    commit_after_interrupt,
+    get_session,
+    legacy_db_path,
+    master_db_lock,
+)
 from errors import DetectorError, PreflightError
 from models import (
     MODE_ADD,
@@ -323,6 +331,10 @@ def run(config: DetectorConfig) -> int:
                 if status == "failed":
                     # 例外で抜けた場合、未コミットの変更を捨ててから実行行を書き戻す
                     session.rollback()
+                elif status == "interrupted":
+                    # 中断が DB の読み書きの途中に入ると、セッションは rollback するまで使えない（dry-run の判定の
+                    # クエリなど、各処理の後片付けが立て直さない経路もある。#32）
+                    commit_after_interrupt(session)
                 record.status = status
                 record.finished_at = datetime.now(timezone.utc)
                 _apply_counters(record, counters)
@@ -365,6 +377,9 @@ def main(argv: list[str] | None = None) -> int:
         f"{config.mode} started: archive folder={config.archive_root or '-'} / master DB={config.archive_db}"
     )
 
+    # UI が停止ファイルで中断を頼めるようにする（Windows では SIGINT が detector に届かない。#32）。中断を受け止める
+    # try の直前に立て、終わったら止める（その外で KeyboardInterrupt を起こさない）
+    watch = stop_watch.start_from_env()
     try:
         return run(config)
     except PreflightError as e:
@@ -378,7 +393,14 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         logger.warning("Interrupted by user")
         return EXIT_FATAL
+    finally:
+        if watch is not None:
+            watch.stop()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        # 実行が終わる間際に届いた中断（停止ファイルの見張りが止まる直前に起こしたものなど）。中断として終わる
+        sys.exit(EXIT_FATAL)

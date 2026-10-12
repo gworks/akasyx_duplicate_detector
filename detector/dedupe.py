@@ -10,7 +10,7 @@ from datetime import datetime
 import archives
 import mover
 from ingest import owning_query, own_data_matcher
-from database import tmp_dir
+from database import commit_after_interrupt, tmp_dir
 from models import (
     RESOLUTION_DELETED,
     RESOLUTION_GONE,
@@ -181,8 +181,10 @@ def run_delete_duplicates(session, config, ingest) -> tuple[str, dict]:
     ts_start = f"{datetime.now():%Y%m%d_%H%M%S}"
     csv_file = create_csv(config.log_dir, "dedupe_result", ts_start)
 
+    current = None  # 処理中の項目のパス（中断で記録を捨てたときに名前を出す）
     try:
         for item in items:
+            current = item.source_path_abs
             verdict, message = check_item(session, config, item, lookup)
             counters[verdict] = counters.get(verdict, 0) + 1
 
@@ -219,7 +221,13 @@ def run_delete_duplicates(session, config, ingest) -> tuple[str, dict]:
         status = "interrupted"
         logger.warning("Interrupted by user")
     finally:
-        session.commit()
+        if commit_after_interrupt(session):
+            # 1 件ごとに保存しているので、保存されなかったのは処理中の 1 件だけ。消した・退避したかもしれないので名前を出す
+            # （次の実行は「消えていた」と記録する。何をしたかは CSV にある。#32）
+            logger.warning(
+                f"A DB write was cut off (interrupted or failed): the result for {current} "
+                "was not saved to the DB (see the CSV)"
+            )
 
     if config.assume_yes and config.prune_empty_dirs and items:
         # 空ディレクトリの掃除は、元の取り込み実行が対象にした投入元ルートの中だけで行う
