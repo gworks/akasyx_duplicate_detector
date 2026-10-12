@@ -38,6 +38,8 @@ const dom = {
   runOutput: el('run-output'), runElsewhere: el('run-elsewhere'), runElsewhereText: el('run-elsewhere-text'),
   runElsewhereGo: el('run-elsewhere-go'),
   runLabel: el('run-label'), runInvalid: el('run-invalid'),
+  settings: el('settings'), openSettings: el('open-settings'), closeSettings: el('close-settings'),
+  defaultArchiveRoot: el('defaultArchiveRoot'),
 };
 
 let context = { repoRoot: '', dataDir: '', version: '', detectorFound: true };
@@ -67,6 +69,8 @@ let runLogDir = null;
 let runbarTitleText = '';
 let runbarTitlePending = false;
 let initialized = false;   // init が設定とタブを戻し終えたか（それまでに届いた終了の通知は、戻した後のタブで判定する）
+let archivesStale = false; // 一覧を読んだ後に実行が終わった（登録が変わりうる。設定画面を開いたときに読み直す）
+let autoFilledArchiveRoot = null; // 起動時に既定の保存フォルダから入れた欄の値（手で触るまで保存しない。#21）
 let runSerial = 0;         // 実行中にした回数（中断の応答がどの実行へのものかを見分ける）
 let runArchiveDb = null;   // 実行を始めたときの正本 DB の欄の値（Note: 行の保存フォルダ ID はこの DB のもの）
 // 出力の Note: 行が登録を外すよう案内した保存フォルダの ID（Set）。出力は実行したタブにしか出ないので、
@@ -116,6 +120,8 @@ function applyLanguage(next) {
   renderRunView();
   renderTabEffects();
   renderRunLabel();
+  renderDefaultsLine(lastDefaults);
+  renderDefaultArchiveOptions();
 }
 
 async function changeLanguage(next) {
@@ -126,11 +132,14 @@ async function changeLanguage(next) {
 
 // ---------------------------------------------------------------- フォーム
 
-/** 今のタブで有効なコントロール（他タブのパネルは無視する）。 */
+/**
+ * 今のタブで有効なコントロール（他タブのパネルは無視する）。設定画面の機能ごとの既定の区画（data-for-mode。#21）も
+ * 同じく、開いている機能の区画の値だけを使う（ほかの機能のコマンドに混ざらない）。
+ */
 function activeControls() {
   return [...document.querySelectorAll('[data-field], [data-group]')].filter((c) => {
-    const panel = c.closest('.mode-panel');
-    return !panel || panel.dataset.panel === mode;
+    const scope = c.closest('.mode-panel, [data-for-mode]');
+    return !scope || (scope.dataset.panel || scope.dataset.forMode) === mode;
   });
 }
 
@@ -176,6 +185,8 @@ function snapshot() {
     if (!c.id) continue;
     values[c.id] = c.type === 'checkbox' ? c.checked : c.value;
   }
+  // 起動時に既定の保存フォルダを入れただけの欄は、前回の入力として残さない（次の起動でも既定を使う。#21）
+  if (autoFilledArchiveRoot !== null && values.archiveRoot === autoFilledArchiveRoot) values.archiveRoot = '';
   const groups = {};
   for (const c of document.querySelectorAll('[data-group]')) {
     groups[`${c.dataset.group}:${c.value}`] = c.checked;
@@ -200,6 +211,7 @@ function restore(saved) {
     const control = el(id);
     if (!control) continue;
     if (control.type === 'checkbox') control.checked = Boolean(value);
+    else if (control.tagName === 'SELECT') selectValue(control, value);
     else control.value = value ?? '';
   }
   for (const [key, checked] of Object.entries(saved.groups || {})) {
@@ -210,14 +222,134 @@ function restore(saved) {
   if (typeof saved.mode === 'string') mode = saved.mode;
 }
 
+/**
+ * 選択肢に無い値でも選べるようにする（既定の保存フォルダは、一覧を読む前は選択肢が無い。保存した値を消さない）。
+ */
+function selectValue(select, value) {
+  const v = String(value ?? '');
+  if (v && ![...select.options].some((o) => o.value === v)) {
+    const option = document.createElement('option');
+    option.value = v;
+    option.textContent = v;
+    select.append(option);
+  }
+  select.value = v;
+}
+
+/** パス欄が空か。コマンドと同じく、空の引用符だけ（'' や ""）も空とみなす（commands.js の normalizePath と同じ）。 */
+function fieldIsEmpty(value) {
+  const v = String(value ?? '').trim();
+  return !v || /^(['"])\s*\1$/.test(v);
+}
+
+/** 登録済みの保存フォルダの実パス（一覧を読んであれば。#21）。 */
+function registeredRoots() {
+  return (listedArchives() || []).map((a) => a.root);
+}
+
+// 最後に読めた一覧の保存フォルダ（#21）。読み込み中・読めなかったときも、選択肢と候補はこれで出す（消したり作り直して
+// ドロップダウンを閉じたりしない）。正本 DB を替えたとき（別の DB の一覧になる）だけ捨てる
+let knownArchives = null;
+
+/** 最後に読めた一覧の保存フォルダ（まだ一度も読めていない・正本 DB を替えた後は null）。 */
+function listedArchives() {
+  if (archivesState && Array.isArray(archivesState.archives)) knownArchives = archivesState.archives;
+  return knownArchives;
+}
+
+/** 保存用フォルダの欄の候補: 最近使ったもの（欄の値）、続けて登録済みの保存フォルダ（main が欄の形に直したもの。#21）。 */
 function renderRecent() {
+  const registered = (listedArchives() || []).map((a) => a.field || a.root);
+  const paths = [...new Set([...recent, ...registered])];
+  if (paths.join('\n') === renderedRecent) return; // 変わらなければ作り直さない
+  renderedRecent = paths.join('\n');
   dom.recent.replaceChildren(
-    ...recent.map((path) => {
+    ...paths.map((path) => {
       const option = document.createElement('option');
       option.value = path;
       return option;
     })
   );
+}
+
+let renderedRecent = null;
+let renderedDefaultRoots = null;
+
+/**
+ * 既定の保存フォルダの選択肢（登録済みの保存フォルダ。今の値は一覧に無くても残す）。一覧が変わったときだけ作り直す
+ * （開いているドロップダウンを閉じない）。
+ */
+function renderDefaultArchiveOptions() {
+  const roots = registeredRoots();
+  if (roots.join('\n') !== renderedDefaultRoots) {
+    renderedDefaultRoots = roots.join('\n');
+    const current = dom.defaultArchiveRoot.value;
+    const none = dom.defaultArchiveRoot.options[0]; // 「なし」
+    dom.defaultArchiveRoot.replaceChildren(
+      none,
+      ...roots.map((root) => {
+        const option = document.createElement('option');
+        option.value = root;
+        return option;
+      })
+    );
+    selectValue(dom.defaultArchiveRoot, current);
+  }
+  // 文言は毎回付け直す（言語の切り替え・一覧が同じまま読み直したときも）。一覧を読んだのに登録されていない
+  // もの（登録を外した・正本 DB を替えた）には印を付ける。起動時に欄へ入れる前には一覧を読まないので、ここで分かるようにする
+  const listed = listedArchives() !== null;
+  for (const option of dom.defaultArchiveRoot.options) {
+    if (!option.value) continue; // 「なし」は data-i18n で訳す
+    const text = listed && !roots.includes(option.value)
+      ? t('default_archive_unregistered', { path: option.value })
+      : option.value;
+    // 変わったときだけ書き直す（開いているドロップダウンを閉じない）
+    if (option.textContent !== text) option.textContent = text;
+  }
+}
+
+// ------------------------------------------------------------ 設定画面（#21）
+
+/** 設定画面を開く。forMode を渡すと、その機能の既定の区画を見せる。 */
+function openSettings(forMode) {
+  // 応答待ちに押した実行の予約は取り消す（設定画面を開いたら、背後の実行は始めない）
+  runQueued = false;
+  queuedShown = null;
+  if (!dom.settings.open) dom.settings.showModal();
+  // 既定の保存フォルダの選択肢のため、一覧を読む。読むのは、まだ読んでいない・前に読めなかった・その後に実行が
+  // 終わった（登録が変わりうる）ときだけ（読む間は実行を止めるので、開くたびには読まない。実行中は読まない）
+  // 読み込み中なら頼まない（読み込み中の結果を捨てて読み直すと、実行を止める時間が延びる）
+  const failed = !!(archivesState && archivesState.error); // 前に読めなかった（控えの一覧は古い）
+  if (!running && !listInFlight && (!listedArchives() || failed || archivesStale)) loadArchives();
+  const section = forMode && dom.settings.querySelector(`[data-for-mode="${forMode}"]`);
+  if (section) section.scrollIntoView({ block: 'start' });
+}
+
+function closeSettings() {
+  if (dom.settings.open) dom.settings.close();
+}
+
+/**
+ * 実行画面の今の既定の 1 行（main がプレビューで組んだ引数から作ったもの）。今の機能の結果でなければ空にする
+ * （別の機能の既定や、設定を変える前の古い値を見せない。新しい応答が来たら描く）。
+ */
+function renderDefaultsLine(defaults) {
+  const items = defaults && defaults.mode === mode ? defaults.items : [];
+  for (const line of document.querySelectorAll('.defaults-line')) {
+    const target = line.querySelector('.defaults-items');
+    if (line.dataset.defaultsFor !== mode) {
+      target.replaceChildren(); // ほかの機能の行は古いまま残さない
+      continue;
+    }
+    target.replaceChildren(
+      ...items.map((i) => {
+        const node = document.createElement('span');
+        node.className = `defaults-item${i.changed ? ' changed' : ''}`;
+        node.textContent = t(i.key, i.vars);
+        return node;
+      })
+    );
+  }
 }
 
 function rememberRecent(path) {
@@ -242,6 +374,8 @@ let runNoteKey = null;    // 「印が変わったので実行していません
 /** 実行ボタン・⌘↵。応答待ちなら予約する（上の決まり）。見えていた印は main にも渡して照合させる。 */
 function requestRun() {
   if (running || starting) return;
+  // 設定画面を開いている間は始めない（背後の実行画面の印が見えていない。#21）
+  if (dom.settings.open) return;
   if (previewPending) {
     runQueued = true;
     // 押したときに押せない状態（組めない・一覧の読み込み中など）なら印を持たせない（応答の後でも始めない）
@@ -264,8 +398,10 @@ function refreshPreview({ keepQueue = false } = {}) {
   dom.copyCommand.disabled = true; // 写すのは最新の応答のコマンドだけ
   previewTimer = setTimeout(async () => {
     let result;
+    const previewForm = collectForm();
+    const previewMode = previewForm.mode;
     try {
-      result = await api.preview(collectForm());
+      result = await api.preview(previewForm);
     } catch (e) {
       console.error('preview failed', e);
       result = { command: null, error: t('preview_failed', { detail: e.message || String(e) }) };
@@ -273,6 +409,8 @@ function refreshPreview({ keepQueue = false } = {}) {
     if (serial !== previewSerial) return; // 後からフォームが変わった（新しい応答を待つ）
     previewPending = false;
     const { command, error, effect } = result;
+    lastDefaults = { mode: previewMode, items: result.defaults || [] };
+    renderDefaultsLine(lastDefaults);
     dom.copyCommand.disabled = !command;
     lastRunEffect = command ? effect : null;
     renderRunLabel();
@@ -286,12 +424,15 @@ function refreshPreview({ keepQueue = false } = {}) {
       const shown = queuedShown;
       runQueued = false;
       queuedShown = null;
-      if (Modes.sameEffect(shown, lastRunEffect) && !dom.run.disabled) start({ expectEffect: lastRunEffect });
-      // 押したときと印が変わった。黙って捨てず、確かめて押し直すよう知らせる（押したときに押せない状態だった
-      // ＝印が無かったなら、#20 以前と同じく何もしない。「変わった」は事実と違う）
-      else if (command && shown) {
-        runNoteKey = 'run_effect_changed';
-        showRunNote(t(runNoteKey));
+      // 設定画面が開いていれば始めない（背後の実行ボタンの印が見えていない。#21。開いたときに予約も取り消している）
+      if (!dom.settings.open) {
+        if (Modes.sameEffect(shown, lastRunEffect) && !dom.run.disabled) start({ expectEffect: lastRunEffect });
+        // 押したときと印が変わった。黙って捨てず、確かめて押し直すよう知らせる（押したときに押せない状態だった
+        // ＝印が無かったなら、#20 以前と同じく何もしない。「変わった」は事実と違う）
+        else if (command && shown) {
+          runNoteKey = 'run_effect_changed';
+          showRunNote(t(runNoteKey));
+        }
       }
     }
   }, 120);
@@ -326,6 +467,8 @@ function renderTabEffects() {
 
 // 実行ボタンの印（#20）。main がプレビューで組んだ引数から決めたもの（コマンドを組めないときは null）
 let lastRunEffect = null;
+// 今の既定の 1 行（#21）: { mode, items }。どの機能のプレビューの結果かを持つ（言語を切り替えたら描き直す）
+let lastDefaults = { mode: null, items: [] };
 
 /** 実行ボタンの色と文言。組んだ引数で実際に起きること（dry-run・--yes・退避先の有無などで変わる。#20）。 */
 function renderRunLabel() {
@@ -487,26 +630,43 @@ async function loadArchives() {
   if (reloadAfterList) {
     reloadAfterList = false;
     archivesState = null;
-    if (mode === 'archives' && !running) loadArchives();
+    if (listShown() && !running) loadArchives();
     else renderArchives(); // 実行中は読まない（実行中の断りを出す）
     return;
   }
   if (result.busy) {
     // 前の読み込み（閉じる前のウィンドウのもの等）や実行が終わるのを、読み込み中の表示のまま待って読み直す
-    if (mode === 'archives' && !running) {
-      retryTimer = setTimeout(loadArchives, 1000);
+    if (listShown() && !running) {
+      // 動く時点でも一覧を見ている画面が開いているときだけ読む（その間に設定画面を閉じたら読まない。読む間は実行を止める）
+      retryTimer = setTimeout(() => {
+        if (listShown() && !running) {
+          loadArchives();
+        } else {
+          archivesState = null; // 「読み込み中」のまま残さない（次に一覧を見る画面を開いたときに読む）
+          archivesStale = true; // 読み直しをあきらめた。控えの一覧は古いかもしれない
+          renderArchives();
+        }
+      }, 1000);
     } else {
       archivesState = null; // タブを開いたとき・実行が終わったときに読む
+      archivesStale = true; // 読み直しをあきらめた（上と同じ扱い）。次に一覧を見る画面を開いたら読む
       renderArchives();
     }
     return;
   }
   archivesState = result;
+  if (!result.error) archivesStale = false;
   renderArchives();
+}
+
+/** 一覧を見ている画面が開いているか（保存フォルダ一覧のタブ、または既定の保存フォルダを選ぶ設定画面。#21）。 */
+function listShown() {
+  return mode === 'archives' || dom.settings.open;
 }
 
 /** 正本 DB の指定が変わった。前の DB の一覧は捨てて読み直す。 */
 function invalidateArchives() {
+  knownArchives = null; // 前の DB の一覧（登録済みの保存フォルダ）は、読み込み中でも使わない
   if (listInFlight) {
     reloadAfterList = true;
     return;
@@ -514,7 +674,7 @@ function invalidateArchives() {
   clearTimeout(retryTimer);
   archivesState = null;
   renderArchives();
-  if (mode === 'archives') loadArchives();
+  if (listShown()) loadArchives();
 }
 
 function formatBytes(bytes) {
@@ -537,6 +697,9 @@ function chip(text, cls = '') {
 
 function renderArchives() {
   const state = archivesState;
+  // 登録済みの保存フォルダを、保存用フォルダの欄の候補と既定の保存フォルダの選択肢にも出す（#21）
+  renderRecent();
+  renderDefaultArchiveOptions();
   dom.archivesRefresh.disabled = running || listInFlight;
   updateRunButton();
   // 実行中は一覧を読まない（main が断る。終わったら読み直す。#19）。前に読んだ結果は残すが、実行中に出すものは
@@ -786,8 +949,11 @@ function setRunning(next, since = Date.now()) {
   if (next) {
     // busy で予約した読み直しは実行中は何もしないので取り消し、「読み込み中」のまま残さない（終わったら読み直す）
     clearTimeout(retryTimer);
-    if (!listInFlight && archivesState && archivesState.loading) archivesState = null;
-    if (mode === 'archives') renderArchives(); // 「実行中は読み直せない」の案内を出す（終わったときは下の loadArchives が描く）
+    if (!listInFlight && archivesState && archivesState.loading) {
+      archivesState = null;
+      archivesStale = true; // 読み直しをあきらめた。終わった後に一覧を見る画面を開いたら読む
+    }
+    if (listShown()) renderArchives(); // 「実行中は読み直せない」の案内を出す（終わったときは下の loadArchives が描く）
   }
 
   clearInterval(elapsedTimer);
@@ -805,8 +971,9 @@ function setRunning(next, since = Date.now()) {
   renderRunView();
   if (!next) {
     refreshPreview();
-    // 登録を外した後など、一覧を見ているなら読み直す
-    if (mode === 'archives') loadArchives();
+    // 登録を外した後など、一覧を見ているなら読み直す（見ていなければ、実行が終わったときに onExit が印を立て、
+    // 次に設定画面を開いたときに読む）
+    if (listShown()) loadArchives();
   }
 }
 
@@ -1139,6 +1306,35 @@ function wireRunControls() {
   dom.openCsv.addEventListener('click', () => lastCsvPath && api.reveal(lastCsvPath));
   dom.revealLog.addEventListener('click', () => api.open(logDir(runLogDir ?? undefined)));
   dom.openDataDir.addEventListener('click', () => api.openDataDir());
+  // 設定画面（#21）: 歯車・各機能の「設定を変える」で開き、×・背景・Esc で閉じる
+  dom.openSettings.addEventListener('click', () => openSettings());
+  for (const button of document.querySelectorAll('.defaults-change')) {
+    button.addEventListener('click', () => openSettings(button.dataset.settingsFor));
+  }
+  dom.closeSettings.addEventListener('click', closeSettings);
+  // 背景を押して背景で離したときだけ閉じる（欄で文字を選んで背景の上で離しても閉じない）。中身の settings-panel が
+  // 全面を覆うので、<dialog> そのものが的になるのは背景（::backdrop）を押したときだけ。Esc・フォーカスの閉じ込め・
+  // 閉じた後のフォーカスの戻し先は <dialog> の showModal に任せる
+  // click は押した要素と離した要素の共通の祖先に届くので、押したとき・離したときの両方を見る
+  // 背景かどうかは押した位置がダイアログの四角の外かで見る（枠線の上でも的は <dialog> になるため）
+  const onBackdrop = (e) => {
+    if (e.target !== dom.settings) return false;
+    const r = dom.settings.getBoundingClientRect();
+    return e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom;
+  };
+  let downOnBackdrop = false;
+  let upOnBackdrop = false;
+  dom.settings.addEventListener('mousedown', (e) => {
+    downOnBackdrop = onBackdrop(e);
+  });
+  dom.settings.addEventListener('mouseup', (e) => {
+    upOnBackdrop = onBackdrop(e);
+  });
+  dom.settings.addEventListener('click', (e) => {
+    if (downOnBackdrop && upOnBackdrop && e.target === dom.settings) closeSettings();
+    downOnBackdrop = false;
+    upOnBackdrop = false;
+  });
   document.addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
       e.preventDefault();
@@ -1153,6 +1349,8 @@ function wireRunEvents() {
   api.onExit((result) => {
     // 開き直し直後、getContext() の後〜復元前に終わった場合に古い状態で復元しないようにする
     context.run = null;
+    // 実行が終わった（登録が変わりうる）。次に設定画面を開いたときに一覧を読み直す（#21）
+    archivesStale = true;
     // 実行の素性は main の記録を正とする（開き直した直後、実行を取り戻す前に終わったときもここで決まる）
     if (result.mode) adoptRun(result);
     setRunning(false);
@@ -1197,6 +1395,32 @@ async function init() {
   // 走り続けている実行を先に取り戻す（setMode が archives の一覧を読みに行き、main に断られないように）
   if (context.run) resumeRun(context.run);
   setMode(mode);
+  // タブを戻し終えた（この後に届いた終了の通知は、今のタブで判定する）。下の問い合わせを待つ間に終わっても取り違えない
+  initialized = true;
+  // 保存用フォルダの欄が空なら、既定の保存フォルダを入れる（前回入力した値は上書きしない。#21）。実行を取り戻して
+  // タブを描いた後に行い、失敗しても起動は止めない（欄が空のままになるだけ）
+  if (fieldIsEmpty(el('archiveRoot').value) && dom.defaultArchiveRoot.value) {
+    try {
+      const field = el('archiveRoot');
+      // 打つ・参照・ドロップ（setPathField は change を出す）のどれかで手で触ったか。待つ前から見張り、待つ間に
+      // 触っていたら（打ってから消して空にした場合も）入れない。入れた後に触ったら、前回の入力として保存する
+      let touchedByUser = false;
+      const touched = () => {
+        touchedByUser = true;
+        autoFilledArchiveRoot = null;
+      };
+      field.addEventListener('input', touched, { once: true });
+      field.addEventListener('change', touched, { once: true });
+      const value = await api.toFieldValue(dom.defaultArchiveRoot.value);
+      if (!touchedByUser && fieldIsEmpty(field.value)) {
+        field.value = value;
+        autoFilledArchiveRoot = value; // 手で触るまでは保存しない（snapshot）
+        refreshPreview();
+      }
+    } catch (e) {
+      console.error('default archive folder', e);
+    }
+  }
 }
 
 // 途中で失敗しても、終了の通知を「init の前」として扱い続けないように

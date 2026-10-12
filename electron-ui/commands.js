@@ -208,5 +208,5 @@ function quoteArg(arg) {
 }
 
 module.exports = {
-  MODES, QUARANTINE_KINDS, FormError, buildArgs, formatCommand, quoteArg, normalizePath, toFieldValue,
+  MODES, QUARANTINE_KINDS, DEFAULT_FOLDER_LIMIT, DEFAULT_MIN_SIZE, FormError, buildArgs, formatCommand, quoteArg, normalizePath, toFieldValue,
 };
