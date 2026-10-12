@@ -185,7 +185,10 @@ function childEnv() {
   const extra = EXTRA_PATH_DIRS.join(path.delimiter);
   return {
     ...process.env,
-    // 逐次出力させる。無いとログが終了までまとめて届く
+    // 逐次出力させる。無いとログが終了までまとめて届く。配布版の実行形式はこの 2 つ（PYTHONUNBUFFERED・
+    // PYTHONIOENCODING）を読まないので、ビルドの --python-option で代わりを指定している（出力はバッファせず utf-8。
+    // UTF-8 モードなので utf-8 にできない文字は、stdout では strict ではなく surrogateescape で出す（stderr は
+    // backslashreplace）。packaging/build_python.sh・#24）
     PYTHONUNBUFFERED: '1',
     PYTHONIOENCODING: 'utf-8',
     // 処理中のファイル・失敗の行（JSON）を出させる。CLI では出ない（detector/ingest.py の UI_PROGRESS_ENV。#18）
