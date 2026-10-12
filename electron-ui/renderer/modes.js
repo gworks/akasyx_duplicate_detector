@@ -1,7 +1,7 @@
 // modes.js - 機能（タブ）の目的のまとまりと、何を変えるかの見分け（#20）。main（プレビュー）・画面（app.js）・node のテストから読む
 //
 // 取り込む（ファイルを動かす）→ 確認する（ファイルは動かさない）→ 準備・復旧（保存フォルダを用意したとき・
-// 正本 DB をなくしたとき）の順に並べる。#22 のかんたん取り込みは「取り込む」の先頭に入る。
+// 正本 DB をなくしたとき）の順に並べる。#22 のかんたん取り込みは「取り込む」の先頭。
 //
 // 印は「その操作自体がすること」。保存フォルダ一覧（archives）以外のどの実行も、始める前に保存フォルダの登録
 // （初めてなら .akasyx/archive.id を書く）と、前回中断した移動の後始末（detector/main.py の recover_pending）・
@@ -10,6 +10,9 @@
   // 機能ごとの表。tab: タブの印（その機能でできるいちばん大きな変更。
   // files=ファイルを動かす・消す / db=正本 DB の記録を変える / none=表示する） / run: 組んだ引数から実行ボタンの印を決める
   const MODE_INFO = {
+    // かんたん取り込み（#22）。CLI のコマンドではなく、既定の保存フォルダへの add を順番に実行する画面。
+    // 実行はドロップして確認のダイアログで許可したときだけ（実行ボタンは使わない）
+    quick: { tab: 'files', run: () => ['files', 'move'] },
     add: {
       tab: 'files',
       run: (args) => (args.includes('--dry-run') ? ['none', 'dry_run'] : ['files', 'move']),
@@ -35,9 +38,12 @@
     adopt: { tab: 'db', run: () => ['db', 'register'] },
   };
 
+  // CLI のコマンドに無い、画面だけのタブ（commands.js の MODES には入れない。buildArgs は知らない機能として断る）
+  const UI_MODES = ['quick'];
+
   // 目的のまとまりとタブの並び（ここが正本。index.html と同じ並びであることを modes.test.js が確かめる）
   const GROUPS = [
-    { id: 'ingest', modes: ['add', 'delete-duplicates'] },
+    { id: 'ingest', modes: ['quick', 'add', 'delete-duplicates'] },
     { id: 'check', modes: ['report', 'verify', 'archives'] },
     { id: 'setup', modes: ['adopt'] },
   ];
@@ -67,7 +73,7 @@
     return !!a && !!b && a.mode === b.mode && a.effect === b.effect && a.action === b.action;
   }
 
-  const api = { GROUPS, MODE_INFO, tabEffect, argsEffect, sameEffect };
+  const api = { GROUPS, UI_MODES, MODE_INFO, tabEffect, argsEffect, sameEffect };
   if (typeof module === 'object' && module.exports) module.exports = api;
   else root.Modes = api;
 })(this);

@@ -4,18 +4,20 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const { GROUPS, MODE_INFO, tabEffect, argsEffect, sameEffect } = require('./renderer/modes');
+const { GROUPS, UI_MODES, MODE_INFO, tabEffect, argsEffect, sameEffect } = require('./renderer/modes');
 const { MODES, buildArgs } = require('./commands');
 
 const html = fs.readFileSync(path.join(__dirname, 'renderer', 'index.html'), 'utf-8');
 
 test('すべての機能が、目的のまとまりのどれか 1 つにだけ入っている', () => {
   const grouped = GROUPS.flatMap((g) => g.modes);
-  assert.deepStrictEqual([...grouped].sort(), [...MODES].sort());
+  // 画面だけのタブ（かんたん取り込み。#22）は CLI のコマンドに無い
+  assert.deepStrictEqual([...grouped].sort(), [...MODES, ...UI_MODES].sort());
+  assert.ok(UI_MODES.every((m) => !MODES.includes(m)));
   assert.strictEqual(new Set(grouped).size, grouped.length);
   assert.deepStrictEqual(GROUPS.map((g) => g.id), ['ingest', 'check', 'setup']);
   // 機能ごとの表も、コマンドの一覧と同じものを持つ（足し忘れ・消し忘れを止める）
-  assert.deepStrictEqual(Object.keys(MODE_INFO).sort(), [...MODES].sort());
+  assert.deepStrictEqual(Object.keys(MODE_INFO).sort(), [...MODES, ...UI_MODES].sort());
 });
 
 test('タブの並びは目的のまとまりの順で、見出しの中に入っている（index.html）', () => {
@@ -37,6 +39,7 @@ test('フォームの値を集める data-group は、タブの見出しに使�
 });
 
 test('タブの印: ファイルを動かす機能・DB を変える機能・見るだけの機能', () => {
+  assert.strictEqual(tabEffect('quick'), 'files'); // かんたん取り込み（#22）も実際に取り込む
   assert.strictEqual(tabEffect('add'), 'files');
   assert.strictEqual(tabEffect('delete-duplicates'), 'files');
   assert.strictEqual(tabEffect('verify'), 'db');
@@ -113,4 +116,8 @@ test('知らない機能は「見るだけ」と言わない（何が起きる�
   assert.deepStrictEqual(argsEffect([]), { mode: undefined, effect: 'unknown', action: 'unknown' });
   assert.strictEqual(tabEffect('something-new'), 'unknown');
   assert.strictEqual(tabEffect('toString'), 'unknown'); // 継承したプロパティを機能と取り違えない
+});
+
+test('かんたん取り込み（#22）は「取り込む」の先頭', () => {
+  assert.deepStrictEqual(GROUPS[0].modes[0], 'quick');
 });

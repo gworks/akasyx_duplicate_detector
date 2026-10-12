@@ -37,6 +37,90 @@ function countsAsWarning(text) {
   return text.startsWith('Note:') || text.startsWith('Error:') || / (?:ERROR|WARNING) /.test(text);
 }
 
+// detector のログの行の形（detector/config.py の setup_logging の書式）。Traceback の終わりを見分けるのに使う
+const LOG_LINE = /^\d{4}-\d\d-\d\d \S+ [A-Z]+ /;
+
+/**
+ * 警告・エラーの行（countsAsWarning）と、断り（Error:）の続きの字下げした行・Traceback を、limit 行まで残す（#22）。
+ * かんたん取り込みの列の項目は、次の項目が始まると詳細ログが消えるので、終わった理由をこれで行に残す。
+ */
+function createNoticeCollector(limit = 20) {
+  // 先頭と末尾を半分ずつ残す（先頭は最初の警告、末尾は終わった理由。間を数えて捨てる）
+  const headLimit = Math.ceil(limit / 2);
+  const tailLimit = limit - headLimit;
+  const head = [];
+  const tail = [];
+  let omitted = 0;
+  let inError = false; // 直前が断りの行か、その続き（字下げした行が続く）
+  let inTrace = false; // Traceback の途中（stderr の、最後の例外の行まで）
+  const keep = (text) => {
+    if (head.length < headLimit) {
+      head.push(text);
+      return;
+    }
+    tail.push(text);
+    if (tail.length > tailLimit) { // 末尾は少ない（limit の半分）ので、先頭を 1 つずつ捨てる
+      tail.shift();
+      omitted += 1;
+    }
+  };
+  return {
+    /**
+     * warning: countsAsWarning の結果（呼び出し側で数えているなら渡す。省けばここで判定する）。
+     * stream: 'out' | 'err'（Traceback は stderr に出る。途中に混ざった stdout の行で終わりとみなさない）。
+     */
+    add(text, warning = countsAsWarning(text), stream = 'err') {
+      // detector が落ちたときの Traceback は、字下げした行と、最後の例外の行（字下げなし）まで残す
+      // 次のログの行（`YYYY-MM-DD 時刻 レベル …`）が来るまでを Traceback とみなす（例外のメッセージが複数行でも切らない）
+      if (inTrace && stream !== 'out') {
+        if (!LOG_LINE.test(text)) {
+          if (text.trim()) keep(text);
+          return;
+        }
+        inTrace = false; // ログの行は下の通常の扱いへ
+      }
+      if (stream !== 'out' && text.startsWith('Traceback (most recent call last):')) {
+        keep(text);
+        inTrace = true;
+        inError = false;
+        return;
+      }
+      if (warning) {
+        keep(text);
+        inError = text.startsWith('Error:');
+      } else if (inError && /^\s/.test(text)) {
+        keep(text);
+      } else {
+        inError = false;
+      }
+    },
+    snapshot: () => ({ lines: [...head, ...tail], omitted }),
+  };
+}
+
+/**
+ * 出力の末尾 limit 行を残す（古い行から捨て、捨てた行数を数える。#22）。実行ボタンから始めた実行の出力は、列の項目が
+ * 始まると画面から消えるので、出力の本文（状態・履歴などは本文が結果）を列の完了の行に残すのに使う。
+ */
+function createTailCollector(limit = 300) {
+  let lines = [];
+  let dropped = 0;
+  // 切り詰めは上限の 2 倍までためてからまとめて行う（出力の 1 行ごとに配列を写さない）
+  return {
+    add(text) {
+      lines.push(text);
+      if (lines.length >= limit * 2) {
+        dropped += lines.length - limit;
+        lines = lines.slice(-limit);
+      }
+    },
+    snapshot: () => {
+      const extra = Math.max(0, lines.length - limit);
+      return { lines: lines.slice(extra), omitted: dropped + extra };
+    },
+  };
+}
+
 /** `{...}` を読みます。オブジェクトでなければ null。 */
 function parseObject(json) {
   try {
@@ -258,4 +342,7 @@ function createRunState({ now = Date.now } = {}) {
   };
 }
 
-module.exports = { scanLine, parseArchivesJson, createRunState, countsAsWarning, FAILURE_LIST_LIMIT };
+module.exports = {
+  scanLine, parseArchivesJson, createRunState, countsAsWarning, createNoticeCollector, createTailCollector,
+  FAILURE_LIST_LIMIT,
+};

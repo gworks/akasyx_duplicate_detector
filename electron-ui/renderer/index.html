@@ -24,6 +24,7 @@
     <nav class="tabs" id="tabs">
       <div class="tab-group" data-tab-group="ingest">
         <span class="tab-group-label" data-i18n="group_ingest">Ingest</span>
+        <button type="button" class="tab" data-mode="quick"><span data-i18n="tab_quick">Quick add</span></button>
         <button type="button" class="tab" data-mode="add"><span data-i18n="tab_add">Add</span></button>
         <button type="button" class="tab" data-mode="delete-duplicates"><span data-i18n="tab_delete">Clean up duplicates</span></button>
       </div>
@@ -80,6 +81,41 @@
         </div>
         <datalist id="recent-archives"></datalist>
         <p class="hint" data-i18n-html="hint_archive_root_html"></p>
+      </div>
+
+      <!-- ---- かんたん取り込み（#22） ----
+           保存先は設定画面の既定の保存フォルダ、設定は取り込みの既定（毎回は聞かない）。ドロップしたら確認のダイアログを
+           出し、許可したものを順番待ちの列に入れて 1 つずつ取り込む。実行ボタンは使わない -->
+      <div class="mode-panel" data-panel="quick">
+        <div class="quick-target">
+          <span class="defaults-label" data-i18n="quick_archive_label">Archive folder:</span>
+          <code class="quick-archive" id="quick-archive"></code>
+          <button type="button" class="btn ghost defaults-change" data-settings-for="quick" data-i18n="defaults_change">Change settings</button>
+        </div>
+        <div class="defaults-line" data-defaults-for="quick">
+          <span class="defaults-label" data-i18n="defaults_label">Defaults:</span>
+          <span class="defaults-items"></span>
+        </div>
+        <p class="banner banner-warn" id="quick-no-archive" hidden>
+          <span data-i18n="quick_no_archive"></span>
+          <button type="button" class="btn" id="quick-choose-archive" data-i18n="quick_choose_archive">Choose an archive folder</button>
+        </p>
+        <!-- ドロップ欄。キーボード・ドラッグできない環境のために「選ぶ…」も置く（同じ確認を通る）。Windows・Linux の
+             選択ダイアログはファイルとフォルダを同時に選べないので、入口を分ける -->
+        <div class="quick-drop" id="quick-drop">
+          <span class="quick-drop-text" data-i18n="quick_drop">Drop files or folders here</span>
+          <div class="quick-pick">
+            <button type="button" class="btn" id="quick-pick-files" data-i18n="quick_pick_files">Choose files…</button>
+            <button type="button" class="btn" id="quick-pick-folders" data-i18n="quick_pick_folders">Choose folders…</button>
+          </div>
+        </div>
+        <p class="banner" id="quick-message" hidden></p>
+        <!-- 実行中の項目を中断すると列は一時停止する（待ちの項目は自動では始めない。再開で続ける） -->
+        <p class="banner banner-warn" id="quick-paused" hidden>
+          <span id="quick-paused-text"></span>
+          <button type="button" class="btn" id="quick-resume" data-i18n="quick_resume">Resume</button>
+        </p>
+        <ul class="quick-queue" id="quick-queue" data-i18n-aria-label="quick_queue_label" aria-label="Queue"></ul>
       </div>
 
       <!-- ---- add ---- -->
