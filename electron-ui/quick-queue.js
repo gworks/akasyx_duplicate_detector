@@ -3,8 +3,9 @@
 // ドロップしたものは確認のダイアログで許可したときだけ列に入り、1 つずつ add で取り込む。コマンドは許可した時点の
 // 設定で組んで列に固定する（待っている間に設定を変えても、ダイアログで見せた内容と違う形で実行しない）。
 // 受け付けないもの（保存フォルダそのもの・その中・それを含むフォルダ・列にすでにあるもの）は、ダイアログの前に断る
-// （detector も PreflightError で断るが、確認してから断られる流れにはしない）。保存フォルダの中にある保存フォルダ
-// （登録されていないもの）までは歩いて探さない（大きなフォルダで待たせない）。それは detector が走査の前に断る。
+// （detector も PreflightError で断るが、確認してから断られる流れにはしない）。落としたフォルダの中にある保存フォルダ
+// （登録されていないもの）も、時間とフォルダ数の上限の中で探して断る（#39）。探しきれなかったときは受け付け、
+// detector が走査の前に断る（大きなフォルダでダイアログを待たせない）。
 const path = require('node:path');
 const fs = require('node:fs');
 
@@ -30,7 +31,62 @@ const realFs = {
     }
     return false;
   },
+  /**
+   * dir の下の階層にある保存フォルダ（目印のあるフォルダ。dir 自身は含めない）を 1 つ探す（detector/archives.py の
+   * archives_below と同じく `.akasyx/` の中には入らず、読めないフォルダは飛ばす）。walkLinks のときはリンク先の
+   * フォルダにも入る（循環しても、deadline（時刻）か maxDirs（読むフォルダの数）で必ず止まる。inode で見張らないのは、
+   * inode が 0 になる共有で全部を「読んだ」と取り違えないため）。上限に達したら打ち切る。
+   * 戻り値 { found: パス|null, gaveUp: 打ち切った（読みきれていない）}
+   */
+  markerBelow: async (dir, { deadline = Infinity, maxDirs = Infinity, walkLinks = false } = {}) => {
+    const queue = [dir];
+    let truncated = false; // maxDirs を超えて積まなかったフォルダがある
+    for (let next = 0; next < queue.length; next += 1) {
+      if (Date.now() > deadline) return { found: null, gaveUp: true };
+      const d = queue[next];
+      let entries;
+      try {
+        // readdir で読む（opendir の 1 件ずつの読み取りは、種類を返さない共有で同期の lstat になり main を止める）
+        entries = await fs.promises.readdir(d, { withFileTypes: true });
+      } catch {
+        continue; // ファイル・読めないフォルダ（detector の走査も読めない）
+      }
+      for (const e of entries) {
+        if (Date.now() > deadline) return { found: null, gaveUp: true };
+        if (e.name === '.akasyx') {
+          // 目印は種類に関わらず見る（`.akasyx` 自体がリンクでも、detector の has_archive_marker はたどって見る）。中には入らない
+          // 落としたフォルダ自身の目印は見ない（上の階層として別に見ている）。目印の問い合わせも期限まで（つながって
+          // いない共有で返らなくても、全体の期限を使い切らない。期限が無ければ待つ）
+          if (d === dir) continue;
+          const wait = Number.isFinite(deadline) ? Math.max(1, deadline - Date.now()) : 0;
+          if (await askWithin(() => realFs.hasMarker(d), wait, false)) return { found: d, gaveUp: false };
+          continue;
+        }
+        if (queue.length >= maxDirs) {
+          // もう積まない（読むのは maxDirs 件まで）。このフォルダの残りは `.akasyx` の名前だけを見る（リンクを stat しない）
+          if (e.isDirectory() || e.isSymbolicLink()) truncated = true;
+          continue;
+        }
+        let isDir = e.isDirectory(); // シンボリックリンク・ジャンクションは false
+        if (!isDir && walkLinks && e.isSymbolicLink()) {
+          if (Date.now() > deadline) return { found: null, gaveUp: true };
+          try {
+            isDir = (await fs.promises.stat(path.join(d, e.name))).isDirectory();
+          } catch {
+            isDir = false;
+          }
+        }
+        if (isDir) queue.push(path.join(d, e.name));
+      }
+    }
+    return { found: null, gaveUp: truncated };
+  },
 };
+
+// 落としたフォルダの中を探す上限（時間は 1 回のドロップ全体で、受け付けると決まったものを探す間。フォルダ数は 1 件
+// あたり）。超えたら受け付け、detector が走査の前に確かめる（#39）
+const BELOW_SCAN_MS = 1500;
+const BELOW_SCAN_DIRS = 5000;
 
 /**
  * 絶対パスにし、real なら実体の位置にする（シンボリックリンクを解く。まだ無い・読めないときは書かれた位置）。
@@ -153,13 +209,16 @@ async function enclosingMarker(dir, { pathApi, fsx, timeoutMs = 0 }, cache = new
  */
 async function checkSources({
   sources, archiveRoot, registeredRoots = [], queuedKeys = [], runningKeys = [], platform = process.platform,
-  pathApi = path, fsx = realFs, timeoutMs = 0,
+  pathApi = path, fsx = realFs, timeoutMs = 0, belowMs = BELOW_SCAN_MS, belowDirs = BELOW_SCAN_DIRS,
+  followSymlinks = false,
 }) {
   // timeoutMs: 1 回の問い合わせを待つ上限（返らなければ、実体の位置は書かれた位置・存在は「応答がない」で断る・目印は無し）
   const opts = { platform, pathApi, fsx, timeoutMs };
   const accepted = [];
   const rejected = [];
-  const reject = (i, p, key, vars = {}) => rejected.push({ i, path: p, key, vars: { path: p, ...vars } });
+  // 断った記録を list に足す関数（記録の形はここだけで決める）
+  const rejectInto = (list) => (i, p, key, vars = {}) => list.push({ i, path: p, key, vars: { path: p, ...vars } });
+  const reject = rejectInto(rejected);
   const given = sources.map((s, i) => ({ i, p: String(s ?? '') })).filter((e) => e.p);
   // 保存先は detector が返した実パス（絶対パス）。そうでなければ決まっていないとみなす（相対パスは、ここで確かめる場所と
   // detector が実行する場所がずれる）
@@ -216,62 +275,138 @@ async function checkSources({
     let marker = null;
     if (exists === true) marker = (await markerOf(real)) || (written === real ? null : await markerOf(written));
     const keys = pairKeys(real, e.p, opts);
-    return { ...e, keys, exists, marker, len: Math.min(...keys.map((k) => k.length)) };
+    return { ...e, real, keys, exists, marker, len: Math.min(...keys.map((k) => k.length)) };
   })).sort((a, b) => a.len - b.len);
-  for (const { i, p, keys: mine, exists, marker } of entries) {
-    const overlap = roots.find((r) => mine.some((k) => overlapsAny([r.key], k, pathApi.sep)));
-    if (overlap) {
-      reject(i, p, 'quick_reject_archive', { archive: overlap.root });
-      continue;
-    }
-    // 列にあるものと同じか入れ子なら断る（同じ木を 2 回走査・移動しない）。こちらも両方の形で見る
-    if (mine.some((k) => overlapsAny(queuedKeys, k, pathApi.sep))) {
-      reject(i, p, 'quick_reject_queued');
-      continue;
-    }
-    // 実行ボタンから走っている取り込みと同じ木も断る（終わった直後に同じ木を走査・移動しない）
-    if (mine.some((k) => overlapsAny(runningKeys, k, pathApi.sep))) {
-      reject(i, p, 'quick_reject_running');
-      continue;
-    }
-    // 一緒に落とした（外側の）ものと同じ・その中にある（そちらと一緒に取り込まれる）。両方の形のキーで見る
-    const outer = accepted.find((a) => anyWithin(a.keys, mine, pathApi.sep));
-    if (outer) {
-      const same = outer.keys.some((ak) => mine.includes(ak));
-      reject(i, p, same ? 'quick_reject_duplicate' : 'quick_reject_nested', { other: outer.path });
-      continue;
-    }
-    // 返らなかった（つながっていない・遅い場所）は「見つからない」と言わない
-    if (exists === NO_ANSWER) {
-      reject(i, p, 'quick_reject_unreachable');
-      continue;
-    }
-    if (exists === UNREADABLE) {
-      reject(i, p, 'quick_reject_unreadable');
-      continue;
-    }
-    if (!exists) {
-      reject(i, p, 'quick_reject_missing');
-      continue;
-    }
-    if (marker) {
-      reject(i, p, 'quick_reject_in_archive', { archive: marker });
-      continue;
-    }
-    // 先に受け付けたものがこの中にあれば（実体の位置の長さで外側が後から来た）、それを外してこちらを取り込む
-    for (const inner of accepted.filter((a) => anyWithin(mine, a.keys, pathApi.sep))) {
-      accepted.splice(accepted.indexOf(inner), 1);
-      reject(inner.i, inner.path, 'quick_reject_nested', { other: p });
-      // その内側と一緒に取り込むはずだった（同じ・その中）と断ったものも、こちらと一緒に取り込まれる
-      for (const r of rejected) {
-        if (r.vars.other === inner.path && (r.key === 'quick_reject_duplicate' || r.key === 'quick_reject_nested')) {
-          r.key = 'quick_reject_nested';
-          r.vars.other = p;
+  // 受け付けるものを決める。below は中を探して見つかった保存フォルダ（落としたものの番号 → その落とし方の形のパス）。中を探した結果が
+  // 増えたら、最初から決め直す（外側が断られたら内側が受け付けられる、などの入れ子・重複の規則を 1 か所で守る。#39）
+  const decide = (below) => {
+    const acc = [];
+    const rej = [];
+    const no = rejectInto(rej);
+    for (const entry of entries) {
+      const { i, p, keys: mine, exists, marker } = entry;
+      const overlap = roots.find((r) => mine.some((k) => overlapsAny([r.key], k, pathApi.sep)));
+      if (overlap) {
+        no(i, p, 'quick_reject_archive', { archive: overlap.root });
+        continue;
+      }
+      // 列にあるものと同じか入れ子なら断る（同じ木を 2 回走査・移動しない）。こちらも両方の形で見る
+      if (mine.some((k) => overlapsAny(queuedKeys, k, pathApi.sep))) {
+        no(i, p, 'quick_reject_queued');
+        continue;
+      }
+      // 実行ボタンから走っている取り込みと同じ木も断る（終わった直後に同じ木を走査・移動しない）
+      if (mine.some((k) => overlapsAny(runningKeys, k, pathApi.sep))) {
+        no(i, p, 'quick_reject_running');
+        continue;
+      }
+      // 中に保存フォルダがある（#39）。入れ子の判定より先に断る（断ったものの中のものは、それと一緒には取り込まれない）
+      if (below.has(i)) {
+        no(i, p, 'quick_reject_contains_archive', { archive: below.get(i) });
+        continue;
+      }
+      // 一緒に落とした（外側の）ものと同じ・その中にある（そちらと一緒に取り込まれる）。両方の形のキーで見る
+      const outer = acc.find((a) => anyWithin(a.keys, mine, pathApi.sep));
+      if (outer) {
+        const same = outer.keys.some((ak) => mine.includes(ak));
+        no(i, p, same ? 'quick_reject_duplicate' : 'quick_reject_nested', { other: outer.path });
+        continue;
+      }
+      // 返らなかった（つながっていない・遅い場所）は「見つからない」と言わない
+      if (exists === NO_ANSWER) {
+        no(i, p, 'quick_reject_unreachable');
+        continue;
+      }
+      if (exists === UNREADABLE) {
+        no(i, p, 'quick_reject_unreadable');
+        continue;
+      }
+      if (!exists) {
+        no(i, p, 'quick_reject_missing');
+        continue;
+      }
+      if (marker) {
+        no(i, p, 'quick_reject_in_archive', { archive: marker });
+        continue;
+      }
+      // 先に受け付けたものがこの中にあれば（実体の位置の長さで外側が後から来た）、それを外してこちらを取り込む
+      for (const inner of acc.filter((a) => anyWithin(mine, a.keys, pathApi.sep))) {
+        acc.splice(acc.indexOf(inner), 1);
+        no(inner.i, inner.path, 'quick_reject_nested', { other: p });
+        // その内側と一緒に取り込むはずだった（同じ・その中）と断ったものも、こちらと一緒に取り込まれる
+        for (const r of rej) {
+          if (r.vars.other === inner.path && (r.key === 'quick_reject_duplicate' || r.key === 'quick_reject_nested')) {
+            r.key = 'quick_reject_nested';
+            r.vars.other = p;
+          }
         }
       }
+      acc.push({ i, path: p, key: mine[0], keys: mine, real: entry.real });
     }
-    accepted.push({ i, path: p, key: mine[0], keys: mine });
+    return { acc, rej };
+  };
+
+  // 受け付けると決まったフォルダの中にある保存フォルダを探す（#39）。時間はここから全体で belowMs まで（断る・入れ子の
+  // ものには使わない。遅い場所の問い合わせで使い切らない）。返らない・打ち切ったものは受け付けたまま（detector が走査の
+  // 前に断る）。Windows のジャンクションは、detector（os.walk）がリンクをたどらない設定でも中に入る。Node からは
+  // シンボリックリンクと見分けられないので、Windows ではリンク先のフォルダにも入る
+  // 見つけた保存フォルダ foundReal と、落としたもの entry の関係（#39）。内か外かは比較キー（大文字小文字・表記ゆれを
+  // そろえたもの）で、entry の実体の位置と落としたパスの位置の両方で見る（リンク・割り当てたドライブで落としたもの）。
+  // 戻り値: 'archive'（entry 自身かその上が保存フォルダ）/ 落としたパスの形での場所（entry の中にある。作れなければ
+  // 見つけた場所のまま）/ null（関係ない）
+  const relation = (entry, foundReal) => {
+    const fk = keyOf(pathApi.resolve(foundReal), platform);
+    for (const base of [entry.real, pathApi.resolve(entry.p)]) {
+      const bk = keyOf(base, platform);
+      if (keyWithin(fk, bk, pathApi.sep)) return 'archive';
+      if (!keyWithin(bk, fk, pathApi.sep)) continue;
+      const rel = pathApi.relative(base, foundReal);
+      const outside = !rel || rel === '..' || rel.startsWith(`..${pathApi.sep}`) || pathApi.isAbsolute(rel);
+      return outside ? foundReal : pathApi.join(entry.p, rel);
+    }
+    return null;
+  };
+  const below = new Map();
+  // 分かった保存フォルダ found を、落としたもの全部に割り当てる。中に含むもの（外側に加えて一緒に落とした内側も）は
+  // 読まずに断り、自身かその上が保存フォルダのものは保存フォルダの中として断る（目印の問い合わせが返らなかったもの）
+  const assign = (found) => {
+    for (const entry of entries) {
+      if (below.has(entry.i) || entry.marker) continue;
+      for (const f of found) {
+        const r = relation(entry, f);
+        if (r === 'archive') entry.marker = f;
+        else if (r) below.set(entry.i, r);
+        if (r) break;
+      }
+    }
+  };
+  // 落としたものの上の階層で分かった目印（保存フォルダ）も、一緒に落とした外側に割り当てる（外側の中を探しきれなくても）
+  assign([...new Set(entries.map((e) => e.marker).filter(Boolean))]);
+  const scanned = new Set();
+  let decided = decide(below);
+  if (belowMs > 0 && typeof fsx.markerBelow === 'function') {
+    const deadline = Date.now() + belowMs;
+    const walkLinks = followSymlinks || platform === 'win32';
+    const scan = async (a) => {
+      scanned.add(a.key);
+      const left = deadline - Date.now();
+      if (left <= 0) return null;
+      const ask = () => fsx.markerBelow(a.real, { deadline, maxDirs: belowDirs, walkLinks });
+      // 返らない問い合わせ（つながっていない共有の 1 回の読み取り）も、期限の後は待たない
+      const answer = await askWithin(ask, left, null);
+      return answer && answer.found ? answer.found : null;
+    };
+    for (;;) {
+      const round = decided.acc.filter((a) => !scanned.has(a.key));
+      if (!round.length || Date.now() >= deadline) break;
+      const found = (await mapLimit(round, QUERY_CONCURRENCY, scan)).filter(Boolean);
+      if (!found.length) break;
+      assign(found);
+      decided = decide(below); // 外側を断ったので、内側などを決め直す（新しく受け付けたものは次の回に中を探す）
+    }
   }
+  accepted.push(...decided.acc);
+  rejected.push(...decided.rej);
   return finish(accepted, rejected);
 }
 
@@ -280,7 +415,7 @@ function finish(accepted, rejected) {
   const byDrop = (a, b) => a.i - b.i;
   return {
     accepted: accepted.sort(byDrop).map(({ path: p, key, keys }) => ({ path: p, key, keys })),
-    rejected: rejected.sort(byDrop).map(({ i, ...rest }) => rest),
+    rejected: rejected.sort(byDrop).map(({ path: p, key, vars }) => ({ path: p, key, vars })),
   };
 }
 

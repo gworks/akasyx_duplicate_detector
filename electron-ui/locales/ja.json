@@ -237,6 +237,7 @@
   "quick_reject_no_archive": "{path}: 保存先が決まっていません",
   "quick_reject_archive": "{path}: 保存フォルダ（{archive}）そのもの、その中、またはそれを含むフォルダです",
   "quick_reject_in_archive": "{path}: 保存フォルダ（{archive}）の中にあります",
+  "quick_reject_contains_archive": "{path}: 中に保存フォルダ（{archive}）があります。保存フォルダを含まないフォルダを選んでください",
   "quick_reject_queued": "{path}: 順番待ち・実行中のもの、または一緒にドロップしたものと同じか、その中・それを含むフォルダです",
   "quick_reject_missing": "{path}: 見つかりません",
   "quick_confirm_message": "保存フォルダに保存しますか？",

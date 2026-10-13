@@ -1098,6 +1098,8 @@ ipcMain.handle('quick:submit', async (_event, request = {}) => {
   const { accepted, rejected } = await checkSources({
     sources, archiveRoot, registeredRoots, queuedKeys: quickQueue.activeKeys(), runningKeys: runningAddKeys(),
     timeoutMs: REALPATH_WAIT_MS,
+    // 中の保存フォルダを探すとき、detector と同じくシンボリックリンクをたどるか（取り込みの既定の設定。#39）
+    followSymlinks: Boolean(form.followSymlinks),
   });
   if (!accepted.length) return { queued: 0, rejected: reasons(rejected), error: null, canceled: false };
 

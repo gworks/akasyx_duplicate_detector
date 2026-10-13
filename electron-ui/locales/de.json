@@ -237,6 +237,7 @@
   "quick_reject_no_archive": "{path}: kein Archivordner gewählt",
   "quick_reject_archive": "{path}: ist der Archivordner ({archive}), liegt darin oder enthält ihn",
   "quick_reject_in_archive": "{path}: liegt in einem Archivordner ({archive})",
+  "quick_reject_contains_archive": "{path}: enthält einen Archivordner ({archive}). Wählen Sie einen Ordner ohne Archivordner",
   "quick_reject_queued": "{path}: ist identisch mit, liegt in oder enthält ein wartendes, laufendes oder gleichzeitig abgelegtes Element",
   "quick_reject_missing": "{path}: nicht gefunden",
   "quick_confirm_message": "Im Archivordner speichern?",

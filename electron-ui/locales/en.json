@@ -237,6 +237,7 @@
   "quick_reject_no_archive": "{path}: no archive folder is chosen",
   "quick_reject_archive": "{path}: it is the archive folder ({archive}), inside it, or contains it",
   "quick_reject_in_archive": "{path}: it is inside an archive folder ({archive})",
+  "quick_reject_contains_archive": "{path}: it contains an archive folder ({archive}). Choose a folder that does not include archive folders",
   "quick_reject_queued": "{path}: it is the same as, inside, or contains an item that is waiting, running, or dropped together with it",
   "quick_reject_missing": "{path}: not found",
   "quick_confirm_message": "Save to the archive folder?",

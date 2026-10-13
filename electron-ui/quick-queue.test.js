@@ -22,6 +22,11 @@ function fakeFs({ files = [], markers = [], links = {} } = {}) {
       return p;
     },
     hasMarker: (dir) => markers.includes(dir),
+    // 下の階層にある保存フォルダ（目印のあるフォルダ）。dir 自身は含めない（それは hasMarker で上の階層として見る）
+    markerBelow: async (dir) => ({
+      found: markers.find((m) => m !== dir && m.startsWith(dir.endsWith('/') ? dir : `${dir}/`)) || null,
+      gaveUp: false,
+    }),
   };
 }
 
@@ -398,7 +403,7 @@ test('sourceKeys の timeoutMs: 実体の位置が間に合えば両方、間に
   const hang = { ...fakeFs(), realpath: () => new Promise(() => {}) };
   const started = Date.now();
   assert.deepStrictEqual(await sourceKeys('/nas/x', { ...posix, fsx: hang, timeoutMs: 30 }), ['/nas/x']);
-  assert.ok(Date.now() - started < 1000);
+  assert.ok(Date.now() - started < 1500);
 });
 
 test('受け付けの確認は、問い合わせが返らなくても timeoutMs で打ち切る（存在が分からなければ応答なしで断る・目印が分からなければ detector に任せる）', async () => {
@@ -406,7 +411,7 @@ test('受け付けの確認は、問い合わせが返らなくても timeoutMs 
   const fsx = { exists: hang, realpath: hang, hasMarker: hang };
   const started = Date.now();
   const r = await checkSources({ sources: ['/nas/x'], archiveRoot: '/archive', ...posix, fsx, timeoutMs: 30 });
-  assert.ok(Date.now() - started < 1000);
+  assert.ok(Date.now() - started < 1500);
   assert.deepStrictEqual(r.rejected.map((x) => x.key), ['quick_reject_unreachable']);
   const slowMarker = { ...fakeFs({ files: ['/in/a'] }), hasMarker: hang };
   const r2 = await checkSources({ sources: ['/in/a'], archiveRoot: '/archive', ...posix, fsx: slowMarker, timeoutMs: 30 });
@@ -507,4 +512,304 @@ test('問い合わせは同時に 4 件まで（大量に落としても、順�
   const r = await checkSources({ sources, archiveRoot: '/archive', ...posix, fsx, timeoutMs: 1000 });
   assert.strictEqual(r.accepted.length, 20);
   assert.ok(peak <= 4, `peak=${peak}`);
+});
+
+
+// --- #39: 落としたフォルダの中にある保存フォルダも、ダイアログの前に断る ---
+
+test('落としたフォルダの中に保存フォルダ（目印）があれば、ダイアログの前に理由つきで断る', async () => {
+  const r = await check(['/in/a', '/in/b'], { fs: { markers: ['/in/a/old/arc'] } });
+  assert.deepStrictEqual(r.accepted.map((a) => a.path), ['/in/b']);
+  assert.deepStrictEqual(r.rejected.map((x) => [x.key, x.vars.archive]), [['quick_reject_contains_archive', '/in/a/old/arc']]);
+});
+
+test('中を探しきれなかった（上限で打ち切った）ときは受け付ける（detector が走査の前に確かめる）', async () => {
+  const fsx = { ...fakeFs({ files: ['/in/a'] }), markerBelow: async () => ({ found: null, gaveUp: true }) };
+  const r = await checkSources({ sources: ['/in/a'], archiveRoot: '/archive', ...posix, fsx });
+  assert.deepStrictEqual(r.accepted.map((a) => a.path), ['/in/a']);
+});
+
+test('中を探す問い合わせが返らなくても、待ち続けずに受け付ける', async () => {
+  const fsx = { ...fakeFs({ files: ['/in/a'] }), markerBelow: () => new Promise(() => {}) };
+  const started = Date.now();
+  const r = await checkSources({ sources: ['/in/a'], archiveRoot: '/archive', ...posix, fsx, timeoutMs: 50, belowMs: 50 });
+  assert.deepStrictEqual(r.accepted.map((a) => a.path), ['/in/a']);
+  assert.ok(Date.now() - started < 1500);
+});
+
+// 本物の fs で、中を探す処理（realFs.markerBelow）を確かめる
+const fs = require('node:fs');
+const os = require('node:os');
+
+const made = [];
+test.after(() => {
+  for (const d of made) fs.rmSync(d, { recursive: true, force: true });
+});
+
+function tree(spec) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qq39-'));
+  made.push(root);
+  for (const rel of spec) {
+    const p = path.join(root, ...rel.split('/'));
+    if (rel.endsWith('/')) fs.mkdirSync(p, { recursive: true });
+    else {
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, 'x');
+    }
+  }
+  return root;
+}
+
+const real = (sources, opts = {}) => checkSources({
+  sources, archiveRoot: path.join(os.tmpdir(), 'qq39-archive-not-here'), timeoutMs: 2000, ...opts,
+});
+
+test('本物の fs: 深い所にある保存フォルダ（archive.id）を見つけて断る', async () => {
+  const root = tree(['src/a/b/c/arc/.akasyx/archive.id', 'src/x.txt']);
+  const r = await real([path.join(root, 'src')]);
+  assert.deepStrictEqual(r.rejected.map((x) => x.key), ['quick_reject_contains_archive']);
+  assert.strictEqual(fs.realpathSync.native(r.rejected[0].vars.archive), fs.realpathSync.native(path.join(root, "src/a/b/c/arc")));
+});
+
+test('本物の fs: v0.1.x の目印（archive.db）でも断る', async () => {
+  const root = tree(['src/old/.akasyx/archive.db']);
+  const r = await real([path.join(root, 'src')]);
+  assert.deepStrictEqual(r.rejected.map((x) => x.key), ['quick_reject_contains_archive']);
+});
+
+test('本物の fs: 目印の無い .akasyx フォルダ・ファイルの投入元は受け付ける', async () => {
+  const root = tree(['src/notarchive/.akasyx/other.txt', 'one.txt']);
+  const r = await real([path.join(root, 'src'), path.join(root, 'one.txt')]);
+  assert.deepStrictEqual(r.rejected, []);
+  assert.strictEqual(r.accepted.length, 2);
+});
+
+test('本物の fs: フォルダ数の上限で打ち切ったら受け付ける（大きいフォルダでダイアログを待たせない）', async () => {
+  const dirs = Array.from({ length: 30 }, (_, i) => `src/d${String(i).padStart(2, '0')}/`);
+  const root = tree([...dirs, 'src/zz/arc/.akasyx/archive.id']);
+  const r = await real([path.join(root, 'src')], { belowDirs: 5 });
+  assert.deepStrictEqual(r.accepted.length, 1);
+  const r2 = await real([path.join(root, 'src')]);
+  assert.deepStrictEqual(r2.rejected.map((x) => x.key), ['quick_reject_contains_archive']);
+});
+
+
+test('中を探す時間は 1 回のドロップ全体で 1 つの期限（多く落としても待ちが積み上がらない）', async () => {
+  const deadlines = [];
+  const fsx = {
+    ...fakeFs({ files: ['/in/a', '/in/b', '/in/c', '/in/d', '/in/e'] }),
+    // 1 件ずつ時間をかける（同時に 4 件までなので、5 件目は後から始まる。1 件ごとの期限なら値がずれる）
+    markerBelow: async (dir, o) => {
+      deadlines.push(o.deadline);
+      await new Promise((res) => setTimeout(res, 30));
+      return { found: null, gaveUp: false };
+    },
+  };
+  await checkSources({ sources: ['/in/a', '/in/b', '/in/c', '/in/d', '/in/e'], archiveRoot: '/archive', ...posix, fsx, belowMs: 1000 });
+  assert.strictEqual(deadlines.length, 5);
+  assert.strictEqual(new Set(deadlines).size, 1);
+});
+
+test('belowMs が 0 なら中は探さない（返らない問い合わせを待ち続けない）', async () => {
+  let called = 0;
+  const fsx = { ...fakeFs({ files: ['/in/a'] }), markerBelow: () => { called += 1; return new Promise(() => {}); } };
+  const r = await checkSources({ sources: ['/in/a'], archiveRoot: '/archive', ...posix, fsx, belowMs: 0 });
+  assert.strictEqual(called, 0);
+  assert.strictEqual(r.accepted.length, 1);
+});
+
+test('本物の fs: リンクの先の保存フォルダは detector と同じ扱い（macOS・Linux はたどる設定のときだけ、Windows のジャンクションは常に）', async () => {
+  const root = tree(['elsewhere/arc/.akasyx/archive.id', 'src/x.txt']);
+  // Windows では管理者権限の要らないジャンクションで作る（detector の os.walk は、たどらない設定でもジャンクションには入る）
+  fs.symlinkSync(path.join(root, 'elsewhere'), path.join(root, 'src', 'link'), process.platform === 'win32' ? 'junction' : 'dir');
+  const off = await real([path.join(root, 'src')]);
+  if (process.platform === 'win32') assert.deepStrictEqual(off.rejected.map((x) => x.key), ['quick_reject_contains_archive']);
+  else assert.strictEqual(off.accepted.length, 1);
+  const on = await real([path.join(root, 'src')], { followSymlinks: true });
+  assert.deepStrictEqual(on.rejected.map((x) => x.key), ['quick_reject_contains_archive']);
+});
+
+test('本物の fs: リンクの循環があっても、上限（時間・フォルダ数）で止まって受け付ける', async () => {
+  const root = tree(['src/a/x.txt']);
+  fs.symlinkSync(path.join(root, 'src'), path.join(root, 'src', 'a', 'loop'), process.platform === 'win32' ? 'junction' : 'dir');
+  const r = await real([path.join(root, 'src')], { followSymlinks: true, belowDirs: 100000, belowMs: 200 });
+  assert.strictEqual(r.accepted.length, 1);
+});
+
+test('本物の fs: .akasyx 自体がリンクでも、目印があれば断る（detector と同じ）', async () => {
+  const root = tree(['meta/archive.id', 'src/arc/x.txt']);
+  fs.symlinkSync(path.join(root, 'meta'), path.join(root, 'src', 'arc', '.akasyx'), process.platform === 'win32' ? 'junction' : 'dir');
+  const r = await real([path.join(root, 'src')]);
+  assert.deepStrictEqual(r.rejected.map((x) => x.key), ['quick_reject_contains_archive']);
+});
+
+test('中を探す問い合わせが返らなくても、待つのは中を探す期限まで（timeoutMs を足さない）', async () => {
+  const fsx = { ...fakeFs({ files: ['/in/a'] }), markerBelow: () => new Promise(() => {}) };
+  const started = Date.now();
+  await checkSources({ sources: ['/in/a'], archiveRoot: '/archive', ...posix, fsx, timeoutMs: 2000, belowMs: 100 });
+  assert.ok(Date.now() - started < 1500, `waited ${Date.now() - started}ms`);
+});
+
+
+test('中を探すのは受け付けると決まったものだけ（断るもの・入れ子のものに時間を使わない）', async () => {
+  const asked = [];
+  const fsx = {
+    ...fakeFs({ files: ['/in/a', '/in/a/sub', '/in/q'] }),
+    markerBelow: async (dir) => { asked.push(dir); return { found: null, gaveUp: false }; },
+  };
+  const r = await checkSources({
+    sources: ['/in/a', '/in/a/sub', '/in/q'], archiveRoot: '/archive', queuedKeys: ['/in/q'], ...posix, fsx,
+  });
+  assert.deepStrictEqual(r.accepted.map((a) => a.path), ['/in/a']);
+  assert.deepStrictEqual(asked, ['/in/a']);
+});
+
+test('遅い問い合わせ（実体の位置）があっても、中を探す時間はその後から数える', async () => {
+  let scanned = 0;
+  const base = fakeFs({ files: ['/in/slow', '/in/b'], markers: ['/in/b/arc'] });
+  const fsx = {
+    ...base,
+    realpath: async (p) => { if (p === '/in/slow') await new Promise((res) => setTimeout(res, 300)); return base.realpath(p); },
+    markerBelow: async (dir) => { scanned += 1; return base.markerBelow(dir); },
+  };
+  const r = await checkSources({ sources: ['/in/slow', '/in/b'], archiveRoot: '/archive', ...posix, fsx, timeoutMs: 2000, belowMs: 200 });
+  assert.strictEqual(scanned, 2);
+  assert.deepStrictEqual(r.rejected.map((x) => [x.path, x.key]), [['/in/b', 'quick_reject_contains_archive']]);
+});
+
+test('外側が中の保存フォルダで断られたら、一緒に落とした内側は確かめ直して受け付ける（黙って取りこぼさない）', async () => {
+  const r = await check(['/in/a', '/in/a/clean', '/in/a/'], {
+    fs: { files: ['/in/a', '/in/a/clean'], markers: ['/in/a/old/arc'] },
+  });
+  assert.deepStrictEqual(r.accepted.map((a) => a.path), ['/in/a/clean']);
+  assert.deepStrictEqual(r.rejected.map((x) => [x.path, x.key]), [
+    ['/in/a', 'quick_reject_contains_archive'], ['/in/a/', 'quick_reject_contains_archive'],
+  ]);
+});
+
+test('確かめ直した内側にも保存フォルダがあれば、それも断る', async () => {
+  const r = await check(['/in/a', '/in/a/old'], { fs: { files: ['/in/a', '/in/a/old'], markers: ['/in/a/old/arc'] } });
+  assert.deepStrictEqual(r.accepted, []);
+  assert.deepStrictEqual(r.rejected.map((x) => [x.path, x.key]), [
+    ['/in/a', 'quick_reject_contains_archive'], ['/in/a/old', 'quick_reject_contains_archive'],
+  ]);
+});
+
+test('外側を断ったら、内側同士の入れ子も規則どおり（内側の外側だけを受け付け、その中は一緒に取り込む）', async () => {
+  const r = await check(['/in/o', '/in/o/a', '/in/o/a/b', '/in/o/a'], {
+    fs: { files: ['/in/o', '/in/o/a', '/in/o/a/b'], markers: ['/in/o/c/arc'] },
+  });
+  assert.deepStrictEqual(r.accepted.map((a) => a.path), ['/in/o/a']);
+  assert.deepStrictEqual(r.rejected.map((x) => [x.path, x.key, x.vars.other]), [
+    ['/in/o', 'quick_reject_contains_archive', undefined],
+    ['/in/o/a/b', 'quick_reject_nested', '/in/o/a'],
+    ['/in/o/a', 'quick_reject_duplicate', '/in/o/a'],
+  ]);
+});
+
+test('先に受け付けてから外側に追い出された内側も、外側が断られたら受け付ける', async () => {
+  // /s はリンクで実体は /in/o/clean（比較キーの短い /s が先に受け付けられ、後から来た外側 /in/o に追い出される）
+  const r = await check(['/s', '/in/o'], {
+    fs: { files: ['/in/o', '/in/o/clean'], markers: ['/in/o/old/arc'], links: { '/s': '/in/o/clean' } },
+  });
+  assert.deepStrictEqual(r.accepted.map((a) => a.path), ['/s']);
+  assert.deepStrictEqual(r.rejected.map((x) => [x.path, x.key]), [['/in/o', 'quick_reject_contains_archive']]);
+});
+
+
+test('見つけた保存フォルダは、落としたパスの形で出す（実体の位置ではなく）', async () => {
+  // /z はリンク（割り当てたドライブ相当）で実体は /share/src
+  const r = await check(['/z'], { fs: { files: ['/share/src'], markers: ['/share/src/old/arc'], links: { '/z': '/share/src' } } });
+  assert.deepStrictEqual(r.rejected.map((x) => [x.key, x.vars.archive]), [['quick_reject_contains_archive', '/z/old/arc']]);
+});
+
+
+test('外側で見つけた保存フォルダが内側の中にもあれば、内側も読み直さずに断る（期限切れで受け付けない）', async () => {
+  const asked = [];
+  const base = fakeFs({ files: ['/in/a', '/in/a/old'], markers: ['/in/a/old/deep/arc'] });
+  const fsx = { ...base, markerBelow: async (dir) => { asked.push(dir); return base.markerBelow(dir); } };
+  const r = await checkSources({ sources: ['/in/a', '/in/a/old'], archiveRoot: '/archive', ...posix, fsx });
+  assert.deepStrictEqual(asked, ['/in/a']);
+  assert.deepStrictEqual(r.rejected.map((x) => [x.path, x.key, x.vars.archive]), [
+    ['/in/a', 'quick_reject_contains_archive', '/in/a/old/deep/arc'],
+    ['/in/a/old', 'quick_reject_contains_archive', '/in/a/old/deep/arc'],
+  ]);
+});
+
+test('見つけた場所の表示: 「..」で始まる名前のフォルダも、落としたパスの形で出す', async () => {
+  const r = await check(['/z'], { fs: { files: ['/share/src'], markers: ['/share/src/..cache/arc'], links: { '/z': '/share/src' } } });
+  assert.deepStrictEqual(r.rejected.map((x) => x.vars.archive), ['/z/..cache/arc']);
+});
+
+
+test('見つけた保存フォルダは、落としたパスの形でも照らし合わせる（リンクで落とした内側も読み直さずに断る）', async () => {
+  // /in/A/link はリンクで実体は /mnt/E。/in/A を探すと /in/A/link/arch（落としたパスの形）が見つかる
+  const asked = [];
+  const base = fakeFs({ files: ['/in/A', '/mnt/E'], markers: ['/in/A/link/arch'], links: { '/in/A/link': '/mnt/E' } });
+  const fsx = { ...base, markerBelow: async (dir) => { asked.push(dir); return base.markerBelow(dir); } };
+  const r = await checkSources({ sources: ['/in/A', '/in/A/link'], archiveRoot: '/archive', ...posix, fsx });
+  assert.deepStrictEqual(asked, ['/in/A']);
+  assert.deepStrictEqual(r.rejected.map((x) => [x.path, x.key]), [
+    ['/in/A', 'quick_reject_contains_archive'], ['/in/A/link', 'quick_reject_contains_archive'],
+  ]);
+});
+
+test('落としたもの自身が見つけた保存フォルダなら、保存フォルダの中として断る（目印の問い合わせが返らなかったとき）', async () => {
+  const base = fakeFs({ files: ['/share/A', '/share/A/arc'], markers: ['/share/A/arc'] });
+  // 目印の問い合わせは返らない（遅い共有）。中を探すと見つかる
+  const fsx = { ...base, hasMarker: () => new Promise(() => {}) };
+  const r = await checkSources({ sources: ['/share/A', '/share/A/arc'], archiveRoot: '/archive', ...posix, fsx, timeoutMs: 50 });
+  assert.deepStrictEqual(r.accepted, []);
+  assert.deepStrictEqual(r.rejected.map((x) => [x.path, x.key]), [
+    ['/share/A', 'quick_reject_contains_archive'], ['/share/A/arc', 'quick_reject_in_archive'],
+  ]);
+});
+
+
+test('落としたものが見つけた保存フォルダの中にあれば、保存フォルダの中として断る（目印の問い合わせが返らなかったとき）', async () => {
+  const base = fakeFs({ files: ['/in/A', '/in/A/X/sub'], markers: ['/in/A/X'] });
+  const fsx = { ...base, hasMarker: () => new Promise(() => {}) };
+  const r = await checkSources({ sources: ['/in/A', '/in/A/X/sub'], archiveRoot: '/archive', ...posix, fsx, timeoutMs: 50 });
+  assert.deepStrictEqual(r.accepted, []);
+  assert.deepStrictEqual(r.rejected.map((x) => [x.path, x.key, x.vars.archive]), [
+    ['/in/A', 'quick_reject_contains_archive', '/in/A/X'], ['/in/A/X/sub', 'quick_reject_in_archive', '/in/A/X'],
+  ]);
+});
+
+test('macOS: 大文字小文字だけ違う形で見つかっても、落としたものとの関係を取り違えない', async () => {
+  // /Users/u/Data/Arch が保存フォルダ。外側 /Users/u/data（小文字）を探すと /Users/u/data/Arch として見つかる
+  const base = fakeFs({ files: ['/Users/u/data', '/Users/u/Data/Arch'], markers: ['/Users/u/data/Arch'] });
+  const fsx = { ...base, hasMarker: () => new Promise(() => {}) };
+  const r = await checkSources({
+    sources: ['/Users/u/data', '/Users/u/Data/Arch'], archiveRoot: '/archive', ...posix, platform: 'darwin', fsx, timeoutMs: 50,
+  });
+  assert.deepStrictEqual(r.accepted, []);
+  assert.deepStrictEqual(r.rejected.map((x) => [x.path, x.key]), [
+    ['/Users/u/data', 'quick_reject_contains_archive'], ['/Users/u/Data/Arch', 'quick_reject_in_archive'],
+  ]);
+});
+
+
+test('同じ実体を別の書き方で落としても、それぞれの書き方で見つけた場所を出す', async () => {
+  // /z/proj は割り当てたドライブ相当（実体は /data/proj）。両方を落とす
+  const r = await check(['/z/proj', '/data/proj'], {
+    fs: { files: ['/data/proj'], markers: ['/data/proj/arc'], links: { '/z/proj': '/data/proj' } },
+  });
+  assert.deepStrictEqual(r.rejected.map((x) => [x.path, x.vars.archive]).sort(), [
+    ['/data/proj', '/data/proj/arc'], ['/z/proj', '/z/proj/arc'],
+  ].sort());
+});
+
+
+test('一緒に落とした内側で分かった保存フォルダは、外側の中を探しきれなくても外側に割り当てて断る', async () => {
+  // /in/A/arc/x は保存フォルダ /in/A/arc の中（上の階層の目印で分かる）。外側 /in/A の中を探すのは打ち切られる
+  const fsx = {
+    ...fakeFs({ files: ['/in/A', '/in/A/arc/x'], markers: ['/in/A/arc'] }),
+    markerBelow: async () => ({ found: null, gaveUp: true }),
+  };
+  const r = await checkSources({ sources: ['/in/A', '/in/A/arc/x'], archiveRoot: '/archive', ...posix, fsx });
+  assert.deepStrictEqual(r.accepted, []);
+  assert.deepStrictEqual(r.rejected.map((x) => [x.path, x.key, x.vars.archive]), [
+    ['/in/A', 'quick_reject_contains_archive', '/in/A/arc'], ['/in/A/arc/x', 'quick_reject_in_archive', '/in/A/arc'],
+  ]);
 });

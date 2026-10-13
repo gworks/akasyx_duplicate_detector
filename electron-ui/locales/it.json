@@ -237,6 +237,7 @@
   "quick_reject_no_archive": "{path}: nessuna cartella di archivio scelta",
   "quick_reject_archive": "{path}: è la cartella di archivio ({archive}), si trova al suo interno o la contiene",
   "quick_reject_in_archive": "{path}: si trova in una cartella di archivio ({archive})",
+  "quick_reject_contains_archive": "{path}: contiene una cartella di archivio ({archive}). Scegli una cartella che non contenga cartelle di archivio",
   "quick_reject_queued": "{path}: è uguale a, si trova in, o contiene un elemento in attesa, in corso o trascinato insieme",
   "quick_reject_missing": "{path}: non trovato",
   "quick_confirm_message": "Salvare nella cartella di archivio?",
