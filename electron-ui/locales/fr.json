@@ -237,6 +237,7 @@
   "quick_reject_no_archive": "{path} : aucun dossier d’archive choisi",
   "quick_reject_archive": "{path} : c’est le dossier d’archive ({archive}), il s’y trouve ou il le contient",
   "quick_reject_in_archive": "{path} : se trouve dans un dossier d’archive ({archive})",
+  "quick_reject_contains_archive": "{path} : contient un dossier d’archive ({archive}). Choisissez un dossier qui n’en contient pas",
   "quick_reject_queued": "{path} : identique à, dans, ou contenant un élément en attente, en cours ou déposé en même temps",
   "quick_reject_missing": "{path} : introuvable",
   "quick_confirm_message": "Enregistrer dans le dossier d’archive ?",

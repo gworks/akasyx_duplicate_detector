@@ -237,6 +237,7 @@
   "quick_reject_no_archive": "{path}: arhiivikausta pole valitud",
   "quick_reject_archive": "{path}: see on arhiivikaust ({archive}), asub selles või sisaldab seda",
   "quick_reject_in_archive": "{path}: asub arhiivikaustas ({archive})",
+  "quick_reject_contains_archive": "{path}: sisaldab arhiivikausta ({archive}). Valige kaust, mis arhiivikaustu ei sisalda",
   "quick_reject_queued": "{path}: on sama, asub sees või sisaldab ootel, käimasolevat või koos lohistatud üksust",
   "quick_reject_missing": "{path}: ei leitud",
   "quick_confirm_message": "Kas salvestada arhiivikausta?",
