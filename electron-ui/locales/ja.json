@@ -265,5 +265,8 @@
   "quick_reject_not_absolute": "{path}: 場所が絶対パスではありません",
   "quick_reject_running": "{path}: 実行中の取り込み（実行ボタンで始めたもの）の投入元と同じか、その中・それを含むフォルダです",
   "quick_output_omitted": "（先頭の {count} 行は省きました。末尾だけを残しています）",
-  "quick_reject_unreadable": "{path}: 読めません（権限が無いなど）"
+  "quick_reject_unreadable": "{path}: 読めません（権限が無いなど）",
+  "quick_batch_name": "{folder} のファイル {count} 個",
+  "quick_batch_name_mixed": "ファイル {count} 個",
+  "quick_not_started": "始めていないファイルが {count} 個あります（取り込んでいません。もう一度ドロップしてください）"
 }

@@ -1316,8 +1316,18 @@ function renderQuickItem(item) {
   const name = document.createElement('div');
   name.className = 'quick-name';
   // 他のタブの実行の結果の行（列の項目に押し出された実行。mode を持つ）は、その機能の名前とコマンドを出す
-  name.textContent = item.mode ? t('quick_other_run', { name: modeLabel(item.mode) }) : fileLabel(item.source);
-  name.title = item.mode ? item.command || '' : item.source;
+  // まとめた項目（続けて落とした複数のファイル。#37）は、件数（全部が同じフォルダならフォルダ名も）を出し、ツールチップに
+  // ファイルを並べる
+  // sourceCount が 0 なのは、中断したまとめた項目で 1 件も処理しなかった完了の行（ファイルは列に戻した行にある。全部が同じ
+  // フォルダならフォルダ名は出す）
+  const count = item.sourceCount ?? 1;
+  if (item.mode) name.textContent = t('quick_other_run', { name: modeLabel(item.mode) });
+  else if (count !== 1 && item.folder) name.textContent = t('quick_batch_name', { folder: fileLabel(item.folder), count: count.toLocaleString(lang) });
+  else if (count !== 1) name.textContent = t('quick_batch_name_mixed', { count: count.toLocaleString(lang) });
+  else name.textContent = fileLabel(item.source);
+  const listedSources = (item.sources || []).join('\n');
+  const more = count > (item.sources || []).length ? `\n${t('quick_confirm_more', { count: (count - item.sources.length).toLocaleString(lang) })}` : '';
+  name.title = item.mode ? item.command || '' : count !== 1 ? listedSources + more || item.folder || '' : item.source;
   const detail = document.createElement('div');
   detail.className = 'quick-detail';
   body.append(name, detail);
@@ -1352,6 +1362,12 @@ function renderQuickItem(item) {
       const why = document.createElement('div');
       why.textContent = t(r.meaning.key, r.meaning.vars || {});
       detail.append(why);
+    }
+    // まとめた項目が途中で止まり、始めていないファイル（取り込んでいない。もう一度落とす。#37）
+    if (r.notStarted) {
+      const left = document.createElement('div');
+      left.textContent = t('quick_not_started', { count: Number(r.notStarted).toLocaleString(lang) });
+      detail.append(left);
     }
     if (r.failures && r.failures.length) detail.append(quickFailures(r));
     if (r.notices && r.notices.lines.length) detail.append(quickLines(r.notices, 'quick_notices', 'quick-notices'));

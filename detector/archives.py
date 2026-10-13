@@ -193,13 +193,14 @@ def has_archive_marker(directory: str) -> bool:
     return os.path.isfile(archive_id_path(directory)) or os.path.isfile(legacy_db_path(directory))
 
 
-def enclosing_archive(path: str) -> str | None:
+def enclosing_archive(path: str, lookup: "ArchiveLookup | None" = None) -> str | None:
     """path 自身か、その上位にある保存フォルダ（目印 has_archive_marker がある）を返します。無ければ None。
 
     正本 DB の登録ではなく実物の目印で見る。移動したまま開いていない保存フォルダ、別の正本 DB の
     保存フォルダも拾い、目印を消した（もう保存フォルダではない）フォルダは拾わない（#6）。
+    lookup を渡すと、フォルダごとの目印の有無を使い回す（同じフォルダの多くのファイルを確かめるとき。#37）。
     """
-    return ArchiveLookup().enclosing(path)
+    return (lookup or ArchiveLookup()).enclosing(path)
 
 
 def archives_below(

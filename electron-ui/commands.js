@@ -76,8 +76,11 @@ function isWindowsPath(p) {
  * フォーム1件から CLI 引数配列を作ります。不備は FormError で返します。
  * options.verbatimPaths: 保存フォルダ・投入元を正規化せずそのまま使う（main が確かめた実パスのとき。フォームの欄では
  * 渡せない＝画面から来たフォームで正規化を外せない）。
+ * options.sources: add の投入元を複数渡す（かんたん取り込みが続けて落としたファイルをまとめたもの。detector は複数の
+ * ファイルを 1 回で取り込む。#37）。これもフォームの欄では渡せない（実行ボタンの add は投入元 1 つ。main が重なりを確かめる
+ * のはその 1 つだけ）。
  */
-function buildArgs(form, { verbatimPaths = false } = {}) {
+function buildArgs(form, { verbatimPaths = false, sources = null } = {}) {
   const mode = trimmed(form && form.mode);
   if (!MODES.includes(mode)) {
     throw new FormError('err_unknown_command', { mode: mode || '-' });
@@ -100,11 +103,11 @@ function buildArgs(form, { verbatimPaths = false } = {}) {
   const args = [mode, archiveRoot];
 
   if (mode === 'add') {
-    const sourcePath = pathOf(form.sourcePath);
-    if (!sourcePath) {
+    const sourcePaths = (sources || [form.sourcePath]).map(pathOf);
+    if (!sourcePaths.length || sourcePaths.some((p) => !p)) {
       throw new FormError('err_source_required');
     }
-    args.push(sourcePath);
+    args.push(...sourcePaths);
 
     // 1 フォルダの上限件数。既定値と同じなら引数に出さず detector の既定に任せる
     const rawFolderLimit = trimmed(String(form.folderLimit ?? ''));

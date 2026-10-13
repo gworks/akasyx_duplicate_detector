@@ -265,5 +265,8 @@
   "quick_reject_not_absolute": "{path}: the location is not an absolute path",
   "quick_reject_running": "{path}: it is the same as, inside, or contains the source of the add that is running (started with the Run button)",
   "quick_output_omitted": "(the first {count} lines were left out; only the end is kept)",
-  "quick_reject_unreadable": "{path}: cannot be read (for example, no permission)"
+  "quick_reject_unreadable": "{path}: cannot be read (for example, no permission)",
+  "quick_batch_name": "{count} files in {folder}",
+  "quick_batch_name_mixed": "{count} files",
+  "quick_not_started": "{count} files were not started (not imported; drop them again)"
 }

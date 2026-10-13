@@ -186,6 +186,13 @@ class DestPlanner:
         self.folder_limit = max(1, int(getattr(config, "folder_limit", 500)))
         self._counts: dict[str, int] = {}
 
+    def snapshot(self) -> dict:
+        """フォルダごとの件数の写し（restore で戻す。複数のファイルの実行で、取り込まなかったファイルの分を戻す。#37）。"""
+        return dict(self._counts)
+
+    def restore(self, counts: dict) -> None:
+        self._counts = dict(counts)
+
     def resolve(self, scanned, extra_taken: set[str] | None = None) -> str:
         parts = [month_dir_of(scanned)]
         if self.dest_subdir:
