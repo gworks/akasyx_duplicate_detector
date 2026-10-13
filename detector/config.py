@@ -408,6 +408,8 @@ def setup_logging(config: DetectorConfig) -> None:
     console_handler.addFilter(lambda record: not getattr(record, "file_only", False))
     logging.basicConfig(
         level=logging.DEBUG,
+        # UI は「CSV report:」の INFO 行をこの形で拾う（electron-ui/detector-output.js の CSV_LINE）。変えるときは UI も直す
+        # （tests/test_csv_line_ui.py が落ちる。#26）
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         handlers=[file_handler, console_handler],
     )

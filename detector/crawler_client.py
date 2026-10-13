@@ -54,6 +54,54 @@ class ScannedFile:
     modified_at: datetime | None = None
     # 作成日時（crawler は macOS/BSD で st_birthtime、Windows で st_ctime、Linux は None）
     created_at: datetime | None = None
+    # ハッシュが無い理由（判定の結果の文言・CSV の Note になる）。分かるのは単一ファイルを直接読んだときだけで、
+    # crawler の行（読み取りエラーで filehash=NULL）は None（#25）
+    nohash_reason: str | None = None
+
+
+# 読んでいる間に変わった（消えた・差し替わったを含む）単一ファイルの判定の文言。もう一度実行すれば、その時点の版で
+# 判定し直せる（取り込めるとは限らない。空になっていれば空として扱う。#25）
+NOHASH_CHANGED_WHILE_READING = (
+    "Cannot classify: the file changed while it was being read; not ingested this time (run again to classify it)"
+)
+
+
+def _error_detail(e: OSError) -> str:
+    """例外の種類と OS の文（パスは含めない。str(e) はパスを含むので使わない）。OS の文は呼び出し（open・stat）と
+    環境で言語が変わるので、例外の種類（英語）を先に置き、CSV を英語で絞り込んでも見つかるようにする。"""
+    detail = e.strerror or (f"errno {e.errno}" if e.errno is not None else "no details")
+    return f"{type(e).__name__}: {detail}"
+
+
+def _nohash_reason_for(e: OSError, path: str, st: os.stat_result) -> str:
+    """読み取り・stat し直しの失敗から、判定の文言を決めます（読む前・読んだ後で同じ規則にする。#25）。
+
+    ファイルが消えた（FileNotFoundError で、入っていたフォルダは今もある）、または読む前の stat と今の版が違う
+    （別のものに差し替わった）なら読んでいる間に変わったもの。
+    それ以外（権限、つながっていない共有、フォルダごと届かない、ほかのプログラムが開いて締め出している）は読めなかった
+    もの。締め出し（閉じれば読める）も Windows の open は PermissionError（winerror なし）で返し、権限と見分けられない
+    ので、「もう一度実行すれば」とは約束しない（読めなかったことと OS の文だけを書く）。
+    Windows ではつながっていない共有も FileNotFoundError になり、winerror でも見分けられない（open は winerror を
+    持たず、stat は 3 を返す）ので、入っていたフォルダに届くかで見分ける。
+    この 2 つに分けられない境目（削除待ちのファイル、読み終えた後の stat だけが共有の切断で失敗した、など）は
+    「読めなかった」に寄せる（見分けを作り込まない。#25 のレビューで同じ箇所の指摘が続いたため、ここで止めた）。
+    """
+    if isinstance(e, FileNotFoundError):
+        if _folder_reachable(os.path.dirname(path)):
+            return NOHASH_CHANGED_WHILE_READING
+    else:
+        # 読む前に別のもの（フォルダ・書き換わったファイル）に差し替わって読めなかったのなら、変わったもの
+        try:
+            if _file_version(os.stat(path)) != _file_version(st):
+                return NOHASH_CHANGED_WHILE_READING
+        except OSError:
+            pass
+    return f"Cannot classify: the file could not be read ({_error_detail(e)})"
+
+
+def _folder_reachable(folder: str) -> bool:
+    """ファイルが入っていたフォルダに今も届くか（消えたのか、共有・フォルダごと届かないのかを見分ける）。"""
+    return os.path.isdir(folder)
 
 
 @dataclass
@@ -405,18 +453,24 @@ def scan_single_file(path: str, st: os.stat_result | None = None) -> ScannedFile
     if st is None:
         st = os.stat(path)
     name = os.path.basename(path)
+    nohash_reason = None
     try:
         filehash = hashing.file_hash(path)
         algo = hashing.HASH_ALGO
         # ハッシュを取った後に stat し直し、前と同じ版かを確かめる。stat の後・ハッシュの間に書き換わる・差し替わると、
         # 大きさ・日時（前の版）とハッシュ・中身（後の版）が食い違った記録になるので、ハッシュ無しとして移動しない（#18）
-        after = os.stat(path)
-        if _file_version(after) != _file_version(st):
-            logger.warning(f"The file changed while reading; not ingested this time: {path}")
-            filehash, algo = None, None
+        if _file_version(os.stat(path)) != _file_version(st):
+            nohash_reason = NOHASH_CHANGED_WHILE_READING
+            logger.warning(f"{nohash_reason}: {path}")
     except OSError as e:
-        # 読み取れなければ（ハッシュの間に消えた場合も）ハッシュ無しとして返す（判定側が skipped_nohash にする）
-        logger.warning(f"Failed to compute hash: {path}: {e}")
+        # 読み取り・stat し直しに失敗したらハッシュ無しとして返す（判定側が skipped_nohash にする）。警告は 1 件 1 行
+        # （UI は WARNING の行を数えて列の行に出す）で、元のエラーも残す（消えたのか、共有が切れたのかを見分けられるように）
+        nohash_reason = _nohash_reason_for(e, path, st)
+        if nohash_reason == NOHASH_CHANGED_WHILE_READING:
+            logger.warning(f"{nohash_reason}: {path} ({_error_detail(e)})")
+        else:
+            logger.warning(f"{nohash_reason}: {path}")  # 文言に例外の種類と OS の文が入っている
+    if nohash_reason is not None:
         filehash, algo = None, None
     return ScannedFile(
         name=name,
@@ -428,6 +482,7 @@ def scan_single_file(path: str, st: os.stat_result | None = None) -> ScannedFile
         mime_type=mimetypes.guess_type(path)[0],
         modified_at=datetime.fromtimestamp(st.st_mtime, tz=timezone.utc),
         created_at=birthtime_utc(st),
+        nohash_reason=nohash_reason,
     )
 
 
