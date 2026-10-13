@@ -20,6 +20,8 @@ const COMMON_FIELDS = ['archiveDb', 'crawlerRepo', 'dbDir', 'logDir'];
 const realFs = {
   exists: (p) => fs.promises.access(p).then(() => true, () => false),
   realpath: (p) => fs.promises.realpath(p),
+  // ファイル（リンクはたどる。detector の os.path.isdir と同じ向き）か。読めなければ false
+  isFile: (p) => fs.promises.stat(p).then((st) => st.isFile(), () => false),
   // detector/archives.py の has_archive_marker と同じ目印（v0.2 の archive.id と、まだ開いていない v0.1.x の archive.db）
   hasMarker: async (dir) => {
     for (const name of ['archive.id', 'archive.db']) {
@@ -203,8 +205,9 @@ async function enclosingMarker(dir, { pathApi, fsx, timeoutMs = 0 }, cache = new
  *   つながっていない場所かもしれないので、書かれた位置のまま比べる（realpath しない）
  * @param {string[]} o.queuedKeys 列にある（待ち・実行中の）ものの比較キー（実体の位置と書かれた位置の両方）
  * @param {string[]} o.runningKeys 実行ボタンから走っている（始めようとしている）取り込みの投入元の比較キー
- * @returns {Promise<{accepted: {path: string, key: string, keys: string[]}[], rejected: {path: string, key: string, vars: object}[]}>}
- *   accepted の keys は実体の位置と書かれた位置の比較キー（列に入れたら重複の判定に使う）
+ * @returns {Promise<{accepted: {path: string, key: string, keys: string[], file: boolean}[], rejected: {path: string, key: string, vars: object}[]}>}
+ *   accepted の keys は実体の位置と書かれた位置の比較キー（列に入れたら重複の判定に使う）。file はファイルか（フォルダ・
+ *   分からないものは false）
  *   rejected の key は理由の辞書のキー
  */
 async function checkSources({
@@ -274,8 +277,11 @@ async function checkSources({
     };
     let marker = null;
     if (exists === true) marker = (await markerOf(real)) || (written === real ? null : await markerOf(written));
+    // ファイルか（続けて落としたファイルは 1 回の実行にまとめる。#37）。分からなければファイルとしない（1 件ずつ実行する）
+    const file = exists === true && typeof fsx.isFile === 'function'
+      && (await askWithin(() => fsx.isFile(e.p), timeoutMs, false)) === true;
     const keys = pairKeys(real, e.p, opts);
-    return { ...e, real, keys, exists, marker, len: Math.min(...keys.map((k) => k.length)) };
+    return { ...e, real, keys, exists, marker, file, len: Math.min(...keys.map((k) => k.length)) };
   })).sort((a, b) => a.len - b.len);
   // 受け付けるものを決める。below は中を探して見つかった保存フォルダ（落としたものの番号 → その落とし方の形のパス）。中を探した結果が
   // 増えたら、最初から決め直す（外側が断られたら内側が受け付けられる、などの入れ子・重複の規則を 1 か所で守る。#39）
@@ -341,7 +347,7 @@ async function checkSources({
           }
         }
       }
-      acc.push({ i, path: p, key: mine[0], keys: mine, real: entry.real });
+      acc.push({ i, path: p, key: mine[0], keys: mine, real: entry.real, file: entry.file });
     }
     return { acc, rej };
   };
@@ -414,9 +420,153 @@ async function checkSources({
 function finish(accepted, rejected) {
   const byDrop = (a, b) => a.i - b.i;
   return {
-    accepted: accepted.sort(byDrop).map(({ path: p, key, keys }) => ({ path: p, key, keys })),
+    accepted: accepted.sort(byDrop).map(({ path: p, key, keys, file }) => ({ path: p, key, keys, file: !!file })),
     rejected: rejected.sort(byDrop).map(({ path: p, key, vars }) => ({ path: p, key, vars })),
   };
+}
+
+// まとめた 1 回の実行のコマンドラインの長さの上限。Windows のコマンドラインは全体で 32,767 文字まで（開発時は uv が
+// python を同じ引数で起動し直すので、起動するプログラムのパスの違いの分を残す）
+const GROUP_CMDLINE_CHARS = 30000;
+
+/**
+ * まとめた 1 回の実行に入れられる、投入元のパスの長さの合計（groupSources の maxChars）。fixedLength は投入元を除いた
+ * コマンド（起動するプログラム・保存フォルダ・設定の引数）の長さ。足りなくても 1 件ずつは入れる（groupSources）。
+ */
+function groupMaxChars(fixedLength) {
+  return Math.max(0, GROUP_CMDLINE_CHARS - fixedLength);
+}
+
+/**
+ * 受け付けたもの（checkSources の accepted）を、1 回の実行の単位にまとめる（#37）。続けて落としたファイルを 1 つにまとめ
+ * （長さの上限を超えたら分ける）、フォルダは 1 件ずつ。落とした順は変えない（親フォルダごとに集めると、交互に落としたとき
+ * 順が入れ替わり、同じ内容のどちらを取り込むか・保存先の名前が 1 件ずつのときと変わる）。
+ * 戻り値: { sources: パス[], key: 先頭の比較キー, keys: 全部の比較キー（列の重なりの判定に使う）, files: 1 件ずつの
+ * { path, keys }（後から一部を外して組み直すときに使う）, folder: 全部が同じフォルダならその場所（比較キーで見る）・違えば null }[]
+ */
+function groupSources(accepted, { platform = process.platform, pathApi = path, maxChars = groupMaxChars(0) } = {}) {
+  const groups = []; // { files: [{ path, keys }], file: ファイルのまとまりか }
+  let open = null; // 今足しているファイルのまとまり
+  let chars = 0;
+  const cost = (p) => p.length + 3;
+  for (const a of accepted) {
+    const entry = { path: a.path, keys: a.keys };
+    if (a.file && open && chars + cost(a.path) <= maxChars) {
+      open.files.push(entry);
+      chars += cost(a.path);
+      continue;
+    }
+    const one = { files: [entry], file: !!a.file };
+    groups.push(one);
+    open = a.file ? one : null; // フォルダを挟んだら区切る
+    chars = cost(a.path);
+  }
+  return groups.map((g) => {
+    const item = withFiles({}, g.files, { platform, pathApi });
+    return g.file ? item : { ...item, folder: null }; // フォルダは見出しのフォルダを持たない
+  });
+}
+
+/**
+ * 項目を、files（その一部）だけを持つ形にする。投入元・比較キー・見出しのフォルダは files からだけ決める（ここ 1 か所）。
+ * コマンドは呼び出し側が組み直す。
+ */
+function withFiles(item, files, { platform = process.platform, pathApi = path } = {}) {
+  const sources = files.map((f) => f.path);
+  const keys = [...new Set(files.flatMap((f) => f.keys))];
+  return {
+    ...item, source: sources[0], sources, files, key: files[0].keys[0], keys, folder: sharedFolder(sources, { platform, pathApi }),
+  };
+}
+
+/**
+ * 中断したまとめた項目の完了の行に残す形（処理した processed 件だけ。残りは列に戻した行にある。1 件も処理していなければ
+ * ファイル 0 個）。件数が分からない・1 件だけの項目・全部処理したなら null（行は元のまま）。
+ */
+function doneAfter(item, processed) {
+  const split = splitAt(item, processed);
+  if (!split || !split.rest.length) return null;
+  // 1 件も処理していなければファイル 0 個。フォルダ名は残す（どのドロップの行か分かるように）
+  if (!split.done.length) return { source: '', sources: [], key: null, keys: [], folder: item.folder ?? null };
+  const { source, sources, key, keys, folder } = withFiles(item, split.done);
+  return { source, sources, key, keys, folder };
+}
+
+/** paths（ファイル）が全部同じフォルダならその場所（落としたパスの形）、違えば null。同じかは比較キーで見る。 */
+function sharedFolder(paths, { platform = process.platform, pathApi = path } = {}) {
+  const parentKey = (p) => keyOf(pathApi.dirname(pathApi.resolve(p)), platform);
+  const first = parentKey(paths[0]);
+  return paths.every((p) => parentKey(p) === first) ? pathApi.dirname(paths[0]) : null;
+}
+
+/**
+ * 列に入れる直前に、ほかのものと重なったファイルを外す（確認のダイアログを待つ間に、別のドロップ・実行ボタンの取り込みが
+ * 同じものを始めた）。reasonOf(keys) は重なりの理由（辞書のキー）か null。まとめた項目は重なったファイルだけを外し、残りを
+ * rebuild(項目, 残りのパス) で組み直す（コマンドを作り直す）。戻り値 { fresh: 入れる項目, late: 外したもの（理由つき）}
+ */
+function dropTaken(items, reasonOf, rebuild) {
+  const fresh = [];
+  const late = [];
+  for (const item of items) {
+    const keep = item.files.filter((f) => {
+      const reason = reasonOf(f.keys);
+      if (reason) late.push({ path: f.path, key: reason, vars: { path: f.path } });
+      return !reason;
+    });
+    if (!keep.length) continue;
+    if (keep.length === item.files.length) {
+      fresh.push(item);
+      continue;
+    }
+    const next = withFiles(item, keep);
+    fresh.push(rebuild(next, next.sources));
+  }
+  return { fresh, late };
+}
+
+/**
+ * まとめた項目（複数のファイル）を中断したときに、まだ始めていないファイルの項目（列に戻して「再開」で続ける。1 件ずつの
+ * 項目だったときと同じく、止めた項目より後のものは失われない）。processed は detector が判定を出し終えた件数（ファイルは
+ * 渡した順に処理される）。戻すものが無い・1 件だけの項目・件数が分からないときは null。rebuild(項目, 残りのパス) で
+ * コマンドを組み直す。
+ */
+function remainderAfter(item, processed, rebuild) {
+  const split = splitAt(item, processed);
+  if (!split || !split.rest.length) return null;
+  const { id: _id, status: _status, result: _result, runId: _runId, ...rest } = item;
+  const next = withFiles(rest, split.rest);
+  return rebuild(next, next.sources);
+}
+
+/**
+ * まとめた項目（複数のファイル）を、detector が結果の行を出し終えた processed 件（渡した順に処理される）で分ける。
+ * { done: 処理したファイル, rest: 始めていないファイル }。1 件だけの項目・件数が分からないときは null（3 つの関数の判定を
+ * ここ 1 か所で決める）。
+ */
+function splitAt(item, processed) {
+  const files = item.files || [];
+  if (files.length < 2 || !Number.isInteger(processed) || processed < 0) return null;
+  const at = Math.min(processed, files.length);
+  return { done: files.slice(0, at), rest: files.slice(at) };
+}
+
+/**
+ * まとめた項目（複数のファイル）が中断以外で終わったとき（致命的エラー・断り・強制終了）の、始めていないファイルの数
+ * （列には戻さない。同じ理由で止まり続けないように。行に出して、もう一度落としてもらう）。1 件だけの項目・件数が
+ * 分からないときは 0。
+ */
+function unstartedCount(item, processed) {
+  const split = splitAt(item, processed);
+  return split ? split.rest.length : 0;
+}
+
+/**
+ * 終わったまとめた項目の、始めていないファイルを列に戻すか。中断したときだけ。中断と同時に detector が断った（終了コード
+ * 3。同じ理由でもう一度断られる）なら戻さず、始めていない件数を行に出す。終了コード 1 は戻す（ロックを待つ間などの中断も
+ * 1 で終わる。戻した列は一時停止するので、同じエラーでも繰り返さない）。
+ */
+function requeuesAfter(summary) {
+  return !!summary.stoppedByUser && summary.code !== 3;
 }
 
 /** 画面のフォームから、取り込みに使う欄だけを取り出して add のフォームにする。 */
@@ -429,9 +579,11 @@ function addForm(form, archiveRoot, sourcePath) {
 /**
  * かんたん取り込み 1 件のコマンドの引数（既定の保存フォルダへの add）。保存フォルダと投入元は確かめた実パスのまま入れる
  * （verbatimPaths。パス欄の正規化は前後の空白を落とすので、名前の前後に空白があると別のパスになる）。
+ * source は 1 件か、まとめたファイルの配列（groupSources。1 回の add に全部を渡す。#37）。
  */
 function buildQuickArgs(form, source) {
-  return buildArgs(addForm(form, String(form.defaultArchiveRoot ?? ''), String(source)), { verbatimPaths: true });
+  const sources = (Array.isArray(source) ? source : [source]).map(String);
+  return buildArgs(addForm(form, String(form.defaultArchiveRoot ?? ''), sources[0]), { verbatimPaths: true, sources });
 }
 
 /** プレビュー（今の既定の 1 行）用の add のフォーム。投入元は空（previewDefaults が仮の値を入れる）。 */
@@ -465,6 +617,13 @@ function createQueue({ keepDone = 20 } = {}) {
       items.push(...created);
       return created;
     },
+    /** 待ちの項目の先頭に入れる（中断したまとめた項目の残り。ほかの待ちより先に続ける）。 */
+    addFront(list) {
+      const created = list.map((i) => ({ ...i, id: nextId++, status: 'waiting', result: null }));
+      const at = items.findIndex((x) => x.status === 'waiting');
+      items.splice(at < 0 ? items.length : at, 0, ...created);
+      return created;
+    },
     nextWaiting: () => (paused ? null : items.find((i) => i.status === 'waiting') || null),
     pause() {
       paused = hasWaiting();
@@ -480,11 +639,20 @@ function createQueue({ keepDone = 20 } = {}) {
       i.status = 'running';
       i.runId = runId;
     },
-    markDone(id, result) {
+    /** 完了にする。fields は行に出すものの差し替え（中断したまとめた項目を処理した分だけにする。doneAfter）。 */
+    markDone(id, result, fields = null) {
       const i = find(id);
       if (!i) return;
+      if (fields) Object.assign(i, fields);
       i.status = 'done';
       i.result = result;
+      // 行に出さないもの（設定のフォーム・ファイルごとの比較キー・コマンドとその引数）は捨てる（完了の行は 20 件まで残り、
+      // 列の写しを送るたびに写す。まとめた項目のコマンドは 3 万文字近くになる。完了の行は重複の判定にも使わない）
+      delete i.form;
+      delete i.files;
+      delete i.keys;
+      delete i.args;
+      delete i.command;
       trimDone();
     },
     /**
@@ -518,5 +686,5 @@ function createQueue({ keepDone = 20 } = {}) {
 }
 
 module.exports = {
-  pairKeys, sourceKeys, keyWithin, overlapsAny, checkSources, createQueue, buildQuickArgs, quickPreviewForm,
+  pairKeys, sourceKeys, keyWithin, overlapsAny, checkSources, createQueue, buildQuickArgs, quickPreviewForm, groupSources, dropTaken, groupMaxChars, remainderAfter, unstartedCount, doneAfter, requeuesAfter,
 };

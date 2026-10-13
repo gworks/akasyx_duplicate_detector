@@ -160,6 +160,8 @@ class DetectorConfig:
     mode: str
     archive_root: str | None
     source_path: str | None = None
+    # add に渡された投入元すべて（2 件以上はファイルだけ。1 回の実行で順に取り込む。#37）。source_path は今処理している 1 件
+    source_paths: list[str] = field(default_factory=list)
     # 正本 DB のパス（全保存フォルダ共通・1 ファイル）
     archive_db: str = field(default_factory=_default_archive_db)
     # 実行時に resolve_archive() が埋める。ar_archives.id
@@ -226,7 +228,10 @@ def build_parser() -> argparse.ArgumentParser:
     # --- add -----------------------------------------------------------------
     p_add = sub.add_parser(MODE_ADD, help="scan a source and import its files into the archive folder")
     p_add.add_argument("archive_root", help="archive folder")
-    p_add.add_argument("source_path", help="source file or folder")
+    p_add.add_argument(
+        "source_path", nargs="+",
+        help="source file or folder (several files can be given; they are imported in one run)",
+    )
     p_add.add_argument(
         "--folder-limit", type=int, default=DEFAULT_FOLDER_LIMIT, metavar="N",
         help="max number of files placed directly in one folder; overflow goes into "
@@ -350,6 +355,7 @@ def parse_arguments(argv: list[str] | None = None) -> DetectorConfig:
     args = parser.parse_args(argv)
     if getattr(args, "folder_limit", DEFAULT_FOLDER_LIMIT) < 1:
         parser.error("--folder-limit must be 1 or greater")
+    sources = [os.path.abspath(p) for p in (getattr(args, "source_path", None) or [])]
 
     return DetectorConfig(
         mode=args.mode,
@@ -359,11 +365,8 @@ def parse_arguments(argv: list[str] | None = None) -> DetectorConfig:
             else None
         ),
         archive_db=os.path.abspath(args.archive_db or _default_archive_db()),
-        source_path=(
-            os.path.abspath(args.source_path)
-            if getattr(args, "source_path", None)
-            else None
-        ),
+        source_path=sources[0] if sources else None,
+        source_paths=sources,
         dest_subdir=getattr(args, "dest_subdir", None),
         crawler_repo=os.path.abspath(args.crawler_repo or _default_crawler_repo()),
         siblings_bin=_default_siblings_bin(),
@@ -416,5 +419,11 @@ def setup_logging(config: DetectorConfig) -> None:
 
 
 def config_snapshot(config: DetectorConfig) -> dict:
-    """実行時設定のスナップショット（ar_ingests.config_json 用 — 再現性のため）。"""
-    return dataclasses.asdict(config)
+    """実行時設定のスナップショット（ar_ingests.config_json 用 — 再現性のため）。
+
+    投入元の一覧（source_paths）は入れない。複数のファイルの実行では記録がファイルごとで、その記録の投入元は source_path
+    （一覧を全部の記録に書くと、件数の 2 乗で DB が大きくなる。#37）。
+    """
+    snapshot = dataclasses.asdict(config)
+    snapshot.pop("source_paths", None)
+    return snapshot

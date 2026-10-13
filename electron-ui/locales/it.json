@@ -265,5 +265,8 @@
   "quick_reject_not_absolute": "{path}: la posizione non è un percorso assoluto",
   "quick_reject_running": "{path}: è uguale a, si trova in, o contiene l’origine dell’aggiunta in corso (avviata con il pulsante Esegui)",
   "quick_output_omitted": "(le prime {count} righe sono state omesse; si conserva solo la fine)",
-  "quick_reject_unreadable": "{path}: non leggibile (ad esempio, permessi mancanti)"
+  "quick_reject_unreadable": "{path}: non leggibile (ad esempio, permessi mancanti)",
+  "quick_batch_name": "{count} file in {folder}",
+  "quick_batch_name_mixed": "{count} file",
+  "quick_not_started": "{count} file non sono stati avviati (non importati; trascinali di nuovo)"
 }

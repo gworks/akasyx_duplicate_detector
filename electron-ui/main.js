@@ -17,12 +17,16 @@ const { argsEffect, sameEffect } = require('./renderer/modes');
 const { summarizeArgs, previewDefaults } = require('./defaults-summary');
 // かんたん取り込み（#22）: ドロップされたものの受け付けと順番待ちの列
 const {
-  checkSources, pairKeys, sourceKeys, overlapsAny, createQueue, buildQuickArgs, quickPreviewForm,
+  checkSources, pairKeys, sourceKeys, overlapsAny, createQueue, buildQuickArgs, quickPreviewForm, groupSources, dropTaken, groupMaxChars, remainderAfter, unstartedCount, doneAfter, requeuesAfter,
 } = require('./quick-queue');
 
 // 確認のダイアログに並べる投入元・コマンドの数（多く落としても画面からはみ出さない。残りは件数で出す）
 const QUICK_CONFIRM_SOURCES = 10;
 const QUICK_CONFIRM_COMMANDS = 2;
+// 確認のダイアログに出すコマンド 1 つの文字数（まとめたファイルの数だけ長くなる。#37。実際のコマンドは詳細ログに出る）
+const QUICK_CONFIRM_COMMAND_CHARS = 600;
+// 列の写しに載せる、まとめた項目のファイルの数（行の見出しのツールチップ用。全部は確認のダイアログと CSV にある）
+const QUICK_VIEW_SOURCES = 20;
 const QUICK_FAILURES = 100; // 列の完了の行に持たせる失敗の一覧の件数
 // 実行ボタンの取り込みの投入元の実体の位置を待つ上限（列との重なりを見るため。つながっていない場所で止めない）
 const REALPATH_WAIT_MS = 2000;
@@ -957,10 +961,14 @@ function launch(args, identity, onFinish = null) {
 
 /** 列の中身（画面に要るものだけ）と、一時停止しているか。 */
 function quickQueueView() {
-  // mode・command は他のタブの実行の結果の行だけが持つ（addDone）
+  // mode・command は他のタブの実行の結果の行だけに送る（addDone。列の項目のコマンドは画面で使わず、まとめた項目では
+  // 3 万文字近くになる。列を送るたびに写さない）
+  // sources・sourceCount はまとめたファイル（#37。1 件のときも 1 つ）
   const items = quickQueue.list().map((i) => ({
-    id: i.id, source: i.source, status: i.status, result: i.result, mode: i.mode || null, command: i.command,
+    id: i.id, source: i.source, status: i.status, result: i.result, mode: i.mode || null, command: i.mode ? i.command : null,
     runId: i.runId ?? null,
+    sources: (i.sources || []).slice(0, QUICK_VIEW_SOURCES), sourceCount: (i.sources || []).length,
+    folder: i.folder || null, // まとめたファイルが全部同じフォルダならその場所（行の見出しに使う）
   }));
   return { items, paused: quickQueue.isPaused() };
 }
@@ -1022,7 +1030,24 @@ function pumpQuickQueue() {
   let started;
   try {
     started = launch(next.args, next.identity, (summary) => {
-      quickQueue.markDone(next.id, quickResult(summary));
+      // まとめた項目（続けて落としたファイル。#37）を中断したら、まだ始めていないファイルを列の先頭に戻す（下で一時停止
+      // するので、「再開」で続けられる。1 件ずつの項目だったときと同じく、止めた後のものを失わない）。完了の行は処理した
+      // 分だけにする。中断と同時に断られた（終了コード 3）とき、アプリを終えるところ（待ちの列は捨てた）なら戻さない
+      // （中断以外で止まったときと同じく、始めていない件数を行に出す。requeuesAfter）。
+      // 中断したファイルが移動を終えた直後だったときは、戻した先頭のファイルはもう無い。黙って外さず、番が来たときに
+      // detector が行に出す。完了にすると項目のファイルの一覧を捨てるので、戻す分はその前に作る
+      const requeue = !quitting && requeuesAfter(summary);
+      let rest = null;
+      try {
+        rest = requeue ? remainderAfter(next, summary.processed, quickRebuild) : null;
+      } catch (e) {
+        // 組み直せなかった（設定の値など）。項目を実行中のまま残さず、完了にして始めていない件数を出す
+        console.error('quick requeue', e);
+      }
+      // 列に戻さなかったまとめた項目は、始めていないファイルの数を行に残す
+      const notStarted = rest ? 0 : unstartedCount(next, summary.processed);
+      quickQueue.markDone(next.id, { ...quickResult(summary), notStarted }, rest ? doneAfter(next, summary.processed) : null);
+      if (rest) quickQueue.addFront([rest]);
       pauseQueueAfter(summary, true); // 中断・起動できなかったときは、待ちの項目を「再開」まで止める
       sendQuickQueue();
     });
@@ -1031,6 +1056,7 @@ function pumpQuickQueue() {
     // 「再開」で続ける。起動していたら、launch が止め終わるのを待つ）
     quickQueue.markDone(next.id, {
       ...quickResult({}), meaning: { level: 'error', key: 'launch_failed_detail', vars: { detail: e.message || String(e) } },
+      notStarted: unstartedCount(next, 0), // まとめた項目なら、1 件も取り込んでいないことを行に出す（#37）
     });
     pauseQueueAfter({ launchFailed: true }, true); // 起動できなかった。待ちの項目は「再開」まで止める
     sendQuickQueue();
@@ -1052,6 +1078,17 @@ function pumpQuickQueue() {
  */
 function runningAddKeys() {
   return [...((activeRun && activeRun.sourceKeys) || []), ...reservedAddKeys];
+}
+
+/** まとめた項目の一部のファイルで、許可したときの設定（item.form）のままコマンドを組み直す。 */
+function quickRebuild(item, sources) {
+  const args = buildQuickArgs(item.form, sources);
+  return { ...item, args, command: formatCommand(args, commandBase()) };
+}
+
+/** 長い行を limit 文字で切る（ダイアログの詳細用）。 */
+function clipped(text, limit) {
+  return text.length > limit ? `${text.slice(0, limit)} …` : text;
 }
 
 /** 先頭の limit 行と、残りの件数（ダイアログの詳細用）。 */
@@ -1103,13 +1140,17 @@ ipcMain.handle('quick:submit', async (_event, request = {}) => {
   });
   if (!accepted.length) return { queued: 0, rejected: reasons(rejected), error: null, canceled: false };
 
-  // 組めないとき（設定の値が不正など）はダイアログを出さずに断る
+  // 組めないとき（設定の値が不正など）はダイアログを出さずに断る。続けて落としたファイルは 1 回の実行にまとめる（#37）
   let items;
   try {
-    items = accepted.map((a) => {
-      const args = buildQuickArgs(form, a.path);
+    // まとめる長さは、投入元を除いたコマンドの長さを引いて決める（設定のパスが長くても、起動できない長さにしない）
+    const fixed = formatCommand(buildQuickArgs(form, ['x']), commandBase()).length - 1; // 'x' は投入元の仮の 1 文字
+    items = groupSources(accepted, { maxChars: groupMaxChars(fixed) }).map((g) => {
+      const args = buildQuickArgs(form, g.sources);
       return {
-        source: a.path, key: a.key, keys: a.keys, args, command: formatCommand(args, commandBase()),
+        // form は許可したときの設定（中断した残りを列に戻すとき、同じ設定でコマンドを組み直す）
+        source: g.sources[0], sources: g.sources, files: g.files, key: g.key, keys: g.keys, folder: g.folder, args, form,
+        command: formatCommand(args, commandBase()),
         identity: { mode: 'quick', logDir: form.logDir || '', archiveDb: form.archiveDb || '' },
       };
     });
@@ -1130,29 +1171,29 @@ ipcMain.handle('quick:submit', async (_event, request = {}) => {
     defaultId: 0,
     cancelId: 0,
     message: tr('quick_confirm_message'),
-    detail: `${tr('quick_confirm_sources')}\n${listed(items.map((i) => `  ${i.source}`), QUICK_CONFIRM_SOURCES)}\n\n`
+    detail: `${tr('quick_confirm_sources')}\n${listed(items.flatMap((i) => i.sources.map((p) => `  ${p}`)), QUICK_CONFIRM_SOURCES)}\n\n`
       + `${tr('quick_confirm_archive', { path: archiveRoot })}\n${tr('quick_confirm_settings', { settings })}${skipped}${pausedNote}`
-      + `\n\n${listed(items.map((i) => i.command), QUICK_CONFIRM_COMMANDS)}`,
+      + `\n\n${listed(items.map((i) => clipped(i.command, QUICK_CONFIRM_COMMAND_CHARS)), QUICK_CONFIRM_COMMANDS)}`,
   });
   // 待つ間にアプリの終了が始まった（待ちの列は捨てた）なら入れない
   if (response !== 1 || quitting) return { queued: 0, rejected: reasons(rejected), error: null, canceled: true };
 
-  // ダイアログを待つ間に同じもの・入れ子のものが列に入った（別のドロップ）なら、それは入れない
+  // ダイアログを待つ間に同じもの・入れ子のものが列に入った（別のドロップ）なら、それは入れない。まとめた項目は重なった
+  // ファイルだけを外し、残りでコマンドを組み直す（外したものは理由つきで知らせる）
   const queued = quickQueue.activeKeys();
   const runningKeys = runningAddKeys();
-  const reasonOf = (i) => {
-    if (i.keys.some((k) => overlapsAny(queued, k))) return 'quick_reject_queued';
-    if (i.keys.some((k) => overlapsAny(runningKeys, k))) return 'quick_reject_running';
+  const reasonOf = (keys) => {
+    if (keys.some((k) => overlapsAny(queued, k))) return 'quick_reject_queued';
+    if (keys.some((k) => overlapsAny(runningKeys, k))) return 'quick_reject_running';
     return null;
   };
-  const judged = items.map((i) => ({ i, reason: reasonOf(i) }));
-  const fresh = judged.filter((j) => !j.reason).map((j) => j.i);
-  const late = judged.filter((j) => j.reason)
-    .map(({ i, reason }) => ({ path: i.source, key: reason, vars: { path: i.source } }));
+  const { fresh, late } = dropTaken(items, reasonOf, quickRebuild);
   quickQueue.add(fresh);
   sendQuickQueue();
   pumpQuickQueue();
-  return { queued: fresh.length, rejected: reasons([...rejected, ...late]), error: null, canceled: false };
+  return {
+    queued: fresh.reduce((n, i) => n + i.sources.length, 0), rejected: reasons([...rejected, ...late]), error: null, canceled: false,
+  };
 });
 
 ipcMain.handle('run:stop', (_event, runId) => {

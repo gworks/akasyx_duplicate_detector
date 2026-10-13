@@ -4,7 +4,7 @@ const assert = require('node:assert');
 const path = require('node:path');
 
 const {
-  sourceKeys, keyWithin, checkSources, createQueue, buildQuickArgs, quickPreviewForm,
+  sourceKeys, keyWithin, checkSources, createQueue, buildQuickArgs, quickPreviewForm, groupSources, dropTaken, groupMaxChars, remainderAfter, unstartedCount, doneAfter, requeuesAfter,
 } = require('./quick-queue');
 
 // 実体の位置の比較キー（sourceKeys の先頭）
@@ -812,4 +812,190 @@ test('一緒に落とした内側で分かった保存フォルダは、外側�
   assert.deepStrictEqual(r.rejected.map((x) => [x.path, x.key, x.vars.archive]), [
     ['/in/A', 'quick_reject_contains_archive', '/in/A/arc'], ['/in/A/arc/x', 'quick_reject_in_archive', '/in/A/arc'],
   ]);
+});
+
+// ---- 多くのファイルをまとめて 1 回の実行に（#37）
+
+// regular はファイル（フォルダでないもの）。isFile はそれだけを true にする
+const filesFs = (regular, extra = {}) => {
+  const base = fakeFs({ files: ['/in', '/in/sub', '/other', ...regular], ...extra });
+  return { ...base, isFile: async (p) => regular.includes(p) };
+};
+
+test('受け付けたものがファイルかどうかを返す（フォルダ・分からないものはファイルとしない）', async () => {
+  const fsx = filesFs(['/in/a.txt']);
+  const r = await checkSources({ sources: ['/in/a.txt', '/in/sub'], archiveRoot: '/archive', ...posix, fsx });
+  assert.deepStrictEqual(r.accepted.map((a) => [a.path, a.file]), [['/in/a.txt', true], ['/in/sub', false]]);
+  // isFile を持たない fs・返らない問い合わせはファイルとしない（1 件ずつ実行する。今までどおり）
+  const slow = { ...fsx, isFile: () => new Promise(() => {}) };
+  const r2 = await checkSources({ sources: ['/in/a.txt'], archiveRoot: '/archive', ...posix, fsx: slow, timeoutMs: 20 });
+  assert.deepStrictEqual(r2.accepted.map((a) => a.file), [false]);
+});
+
+test('100 個のファイルを 1 回で落とすと、1 つの実行にまとまる', async () => {
+  const many = Array.from({ length: 100 }, (_, i) => `/in/f${i}.txt`);
+  const fsx = filesFs(many);
+  const r = await checkSources({ sources: [...many, '/in/sub'], archiveRoot: '/archive', ...posix, fsx });
+  const groups = groupSources(r.accepted, posix);
+  assert.deepStrictEqual(groups.map((g) => g.sources.length), [100, 1]);
+  assert.deepStrictEqual(groups[0].sources, many); // 落とした順のまま
+  assert.strictEqual(groups[0].folder, '/in'); // 全部が同じフォルダ（行の見出しに使う）
+  assert.deepStrictEqual(groups[1].sources, ['/in/sub']); // フォルダは 1 件ずつ
+  // 列の重なりの判定には、まとめたファイル全部のキーを使う
+  assert.ok(groups[0].keys.includes('/in/f99.txt'));
+  assert.strictEqual(groups[0].key, '/in/f0.txt');
+});
+
+test('まとめるのは続けて落としたファイルだけ（落とした順を変えない。フォルダを挟んだら分ける）', () => {
+  const entry = (p, file = true) => ({ path: p, key: p, keys: [p], file });
+  // 親フォルダが交互でも順はそのまま（同じ内容のどちらを取り込むか・保存先の名前が、1 件ずつのときと同じ）
+  const mixed = groupSources([entry('/A/first'), entry('/B/second'), entry('/A/third')], posix);
+  assert.deepStrictEqual(mixed.map((g) => g.sources), [['/A/first', '/B/second', '/A/third']]);
+  assert.strictEqual(mixed[0].folder, null); // 違うフォルダが混ざる
+  const split = groupSources([entry('/A/a'), entry('/A/dir', false), entry('/A/b')], posix);
+  assert.deepStrictEqual(split.map((g) => g.sources), [['/A/a'], ['/A/dir'], ['/A/b']]);
+  // 同じフォルダかは比較キーで見る（macOS は大文字小文字違いも同じフォルダ）
+  const cased = [entry('/In/a.txt'), entry('/in/b.txt')];
+  assert.strictEqual(groupSources(cased, { ...posix, platform: 'darwin' })[0].folder, '/In');
+  assert.strictEqual(groupSources(cased, posix)[0].folder, null);
+});
+
+test('まとめた引数が長すぎるときは分ける（Windows のコマンドラインの長さの上限）', () => {
+  const accepted = Array.from({ length: 10 }, (_, i) => {
+    const p = `/in/${String(i).padStart(2, '0')}${'x'.repeat(90)}.txt`;
+    return { path: p, key: p, keys: [p], file: true };
+  });
+  const groups = groupSources(accepted, { ...posix, maxChars: 400 });
+  assert.ok(groups.length > 1);
+  assert.deepStrictEqual(groups.flatMap((g) => g.sources), accepted.map((a) => a.path)); // 漏れも重なりも無い
+  for (const g of groups) assert.ok(g.sources.reduce((n, p) => n + p.length + 3, 0) <= 400 || g.sources.length === 1);
+});
+
+test('まとめた項目のコマンドは、ファイルをすべて投入元に並べた 1 回の add', () => {
+  const args = buildQuickArgs(form, ['/in/a', '/in/b', '/in/c']);
+  assert.deepStrictEqual(args.slice(0, 5), ['add', '/archive', '/in/a', '/in/b', '/in/c']);
+  assert.strictEqual(args.filter((a) => a.startsWith('/in/')).length, 3);
+  assert.deepStrictEqual(buildQuickArgs(form, '/in/a').slice(0, 3), ['add', '/archive', '/in/a']); // 1 件は今までどおり
+});
+
+test('まとめた項目の 2 件目以降のファイルも、列の重なりの判定に使われる', async () => {
+  const fsx = filesFs(['/in/a.txt', '/in/b.txt']);
+  const r = await checkSources({ sources: ['/in/a.txt', '/in/b.txt'], archiveRoot: '/archive', ...posix, fsx });
+  const q = createQueue();
+  q.add(groupSources(r.accepted, posix).map((g) => ({ ...g, source: g.sources[0], args: [] })));
+  const again = await checkSources({
+    sources: ['/in/b.txt'], archiveRoot: '/archive', queuedKeys: q.activeKeys(), ...posix, fsx,
+  });
+  assert.deepStrictEqual(again.rejected.map((x) => x.key), ['quick_reject_queued']);
+});
+
+test('列に入れる直前に重なったファイルだけを外し、まとめた項目の残りでコマンドを組み直す', () => {
+  const accepted = ['/in/a.txt', '/in/b.txt', '/in/c.txt'].map((p) => ({ path: p, key: p, keys: [p], file: true }));
+  const items = groupSources(accepted, posix).map((g) => ({ ...g, source: g.sources[0], args: buildQuickArgs(form, g.sources) }));
+  const taken = ['/in/b.txt'];
+  const { fresh, late } = dropTaken(items, (keys) => (keys.some((k) => taken.includes(k)) ? 'quick_reject_queued' : null),
+    (item, sources) => ({ ...item, args: buildQuickArgs(form, sources) }));
+  assert.deepStrictEqual(late.map((x) => [x.path, x.key]), [['/in/b.txt', 'quick_reject_queued']]);
+  assert.strictEqual(fresh.length, 1);
+  assert.deepStrictEqual(fresh[0].sources, ['/in/a.txt', '/in/c.txt']);
+  assert.deepStrictEqual(fresh[0].args.slice(0, 4), ['add', '/archive', '/in/a.txt', '/in/c.txt']);
+  assert.deepStrictEqual(fresh[0].keys, ['/in/a.txt', '/in/c.txt']); // 外したファイルのキーで列を塞がない
+  // 全部が重なれば項目ごと入れない。重ならなければそのまま
+  assert.deepStrictEqual(dropTaken(items, () => 'quick_reject_running', (i) => i).fresh, []);
+  assert.strictEqual(dropTaken(items, () => null, () => assert.fail('組み直さない')).fresh[0], items[0]);
+});
+
+test('まとめる長さは、投入元を除いたコマンドの長さを引いた残り（設定のパスが長いほど小さくまとめる）', () => {
+  assert.ok(groupMaxChars(500) > groupMaxChars(5000));
+  assert.strictEqual(groupMaxChars(500) + 500, groupMaxChars(0));
+  assert.ok(groupMaxChars(0) + 2767 <= 32767); // Windows の上限に余裕を残す
+  // 残りが無くても 1 件ずつは入れる
+  const accepted = ['/in/a.txt', '/in/b.txt'].map((p) => ({ path: p, key: p, keys: [p], file: true }));
+  assert.deepStrictEqual(groupSources(accepted, { ...posix, maxChars: groupMaxChars(40000) }).map((g) => g.sources), [['/in/a.txt'], ['/in/b.txt']]);
+});
+
+test('まとめた項目を中断したら、まだ始めていないファイルを待ちの項目として列の先頭に戻す（再開で続けられる）', () => {
+  const accepted = ['/in/a.txt', '/in/b.txt', '/in/c.txt', '/in/d.txt'].map((p) => ({ path: p, key: p, keys: [p], file: true }));
+  const [group] = groupSources(accepted, posix);
+  const q = createQueue();
+  const [other] = q.add([item('/x')]);
+  const [running] = q.add([{ ...group, source: group.sources[0], args: buildQuickArgs(form, group.sources) }]);
+  // 列の 2 番目にあった項目が先に始まった体で、まとめた項目を実行中にする
+  q.markRunning(running.id, 7);
+  const rest = remainderAfter(running, 1, (it, sources) => ({ ...it, args: buildQuickArgs(form, sources) }));
+  assert.deepStrictEqual(rest.sources, ['/in/b.txt', '/in/c.txt', '/in/d.txt']); // 1 件は済んだ
+  assert.deepStrictEqual(rest.keys, ['/in/b.txt', '/in/c.txt', '/in/d.txt']);
+  assert.deepStrictEqual(rest.args.slice(2, 5), ['/in/b.txt', '/in/c.txt', '/in/d.txt']);
+  const snapshot = { ...running }; // 完了にするとファイルの一覧を捨てるので、後の確かめ用に写しておく
+  q.markDone(running.id, {});
+  const [back] = q.addFront([rest]);
+  q.pause();
+  assert.ok(q.isPaused());
+  q.resume();
+  assert.strictEqual(q.nextWaiting().id, back.id); // 先頭に戻った（ほかの待ちより先）
+  assert.notStrictEqual(back.id, other.id);
+  // 全部済んだ・1 件だけの項目・件数が分からないときは戻さない
+  assert.strictEqual(remainderAfter(snapshot, 4, (i) => i), null);
+  assert.strictEqual(remainderAfter({ ...snapshot, files: [snapshot.files[0]], sources: ['/in/a.txt'] }, 0, (i) => i), null);
+  assert.strictEqual(remainderAfter(snapshot, null, (i) => i), null);
+});
+
+test('まとめた項目が中断以外で終わったら、始めていないファイルの数を数える（黙って消さず、行に出す）', () => {
+  const files = ['/in/a', '/in/b', '/in/c'].map((p) => ({ path: p, keys: [p] }));
+  assert.strictEqual(unstartedCount({ files }, 1), 2);
+  assert.strictEqual(unstartedCount({ files }, 3), 0);
+  assert.strictEqual(unstartedCount({ files }, 0), 3); // 断られて 1 件も始めなかった
+  assert.strictEqual(unstartedCount({ files: [files[0]] }, 0), 0); // 1 件だけの項目は今までどおり（終わり方で分かる）
+  assert.strictEqual(unstartedCount({ files }, undefined), 0); // 件数が分からなければ出さない
+});
+
+test('列に戻した残りのフォルダの見出しは、残ったファイルから決め直す', () => {
+  const entry = (p) => ({ path: p, key: p, keys: [p], file: true });
+  const [group] = groupSources([entry('/a/x1'), entry('/b/y1'), entry('/b/y2')], posix);
+  assert.strictEqual(group.folder, null);
+  const rest = remainderAfter(group, 1, (i) => i);
+  assert.strictEqual(rest.folder, '/b'); // 残りは全部 /b
+  const { fresh } = dropTaken([group], (keys) => (keys.includes('/b/y1') ? 'quick_reject_queued' : null), (i) => i);
+  assert.strictEqual(fresh[0].folder, null); // /a と /b が残る
+});
+
+test('中断したまとめた項目の完了の行は、処理した分だけにする（残りは列に戻した行にある）', () => {
+  const accepted = ['/in/a', '/in/b', '/in/c', '/in/d'].map((p) => ({ path: p, key: p, keys: [p], file: true }));
+  const [group] = groupSources(accepted, posix);
+  const q = createQueue();
+  const [item] = q.add([{ ...group, source: group.sources[0], args: ['add'], command: 'add …', form: { big: 'x' } }]);
+  q.markRunning(item.id, 1);
+  q.markDone(item.id, { code: 0 }, doneAfter(item, 1));
+  const done = q.list().find((i) => i.id === item.id);
+  assert.deepStrictEqual(done.sources, ['/in/a']);
+  // 完了したら、行に出さないもの（設定のフォーム・ファイルごとの比較キー・コマンドの引数）は捨てる
+  assert.strictEqual(done.form, undefined);
+  assert.strictEqual(done.files, undefined);
+  assert.strictEqual(done.args, undefined);
+  // 比較キー・コマンドも捨てる（まとめた項目は 3 万文字近くになる。完了の行は重複の判定にも使わない。R21）
+  assert.strictEqual(done.keys, undefined);
+  assert.strictEqual(done.command, undefined);
+  // 1 件も処理していなければ、完了の行はファイル 0 個（全部が列に戻した行にある。同じファイルを 2 行に並べない）。
+  // フォルダ名は残す（どのドロップの行か分かるように。R21）
+  assert.deepStrictEqual(doneAfter({ ...group }, 0), { source: '', sources: [], key: null, keys: [], folder: '/in' });
+});
+
+test('まとめる長さの既定は、コマンドの長さの上限から決める（上限は 1 か所）', () => {
+  const accepted = Array.from({ length: 400 }, (_, i) => {
+    const p = `/in/${String(i).padStart(3, '0')}${'x'.repeat(90)}.txt`;
+    return { path: p, key: p, keys: [p], file: true };
+  });
+  const groups = groupSources(accepted, posix);
+  const chars = (g) => g.sources.reduce((n, p) => n + p.length + 3, 0);
+  assert.ok(groups.length > 1);
+  assert.ok(chars(groups[0]) <= groupMaxChars(0) && chars(groups[0]) > groupMaxChars(0) - 100);
+});
+
+test('列に戻すのは中断で終わったときだけ（中断と同時に断られたら戻さない）', () => {
+  assert.ok(requeuesAfter({ stoppedByUser: true, code: 0 }));
+  assert.ok(requeuesAfter({ stoppedByUser: true, code: 2 }));
+  assert.ok(requeuesAfter({ stoppedByUser: true, code: null, signal: 'SIGKILL' })); // 応えずに強制終了した
+  assert.ok(requeuesAfter({ stoppedByUser: true, code: 1 })); // ロックを待つ間の中断（列は一時停止する）
+  assert.ok(!requeuesAfter({ stoppedByUser: true, code: 3 }));
+  assert.ok(!requeuesAfter({ stoppedByUser: false, code: 0 }));
 });

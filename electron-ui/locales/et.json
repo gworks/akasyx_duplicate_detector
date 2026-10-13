@@ -265,5 +265,8 @@
   "quick_reject_not_absolute": "{path}: asukoht ei ole absoluutne tee",
   "quick_reject_running": "{path}: on sama, asub sees või sisaldab käimasoleva lisamise allikat (käivitatud nupuga)",
   "quick_output_omitted": "(esimesed {count} rida jäeti välja; alles on ainult lõpp)",
-  "quick_reject_unreadable": "{path}: ei saa lugeda (näiteks puudub õigus)"
+  "quick_reject_unreadable": "{path}: ei saa lugeda (näiteks puudub õigus)",
+  "quick_batch_name": "{count} faili kaustas {folder}",
+  "quick_batch_name_mixed": "{count} faili",
+  "quick_not_started": "{count} faili jäi alustamata (ei imporditud; lohista need uuesti)"
 }

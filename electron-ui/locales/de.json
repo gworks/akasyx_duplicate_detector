@@ -265,5 +265,8 @@
   "quick_reject_not_absolute": "{path}: der Ort ist kein absoluter Pfad",
   "quick_reject_running": "{path}: ist identisch mit, liegt in oder enthält die Quelle des laufenden Hinzufügens (über die Schaltfläche gestartet)",
   "quick_output_omitted": "(die ersten {count} Zeilen wurden ausgelassen; nur das Ende wird behalten)",
-  "quick_reject_unreadable": "{path}: kann nicht gelesen werden (z. B. keine Berechtigung)"
+  "quick_reject_unreadable": "{path}: kann nicht gelesen werden (z. B. keine Berechtigung)",
+  "quick_batch_name": "{count} Dateien in {folder}",
+  "quick_batch_name_mixed": "{count} Dateien",
+  "quick_not_started": "{count} Dateien wurden nicht begonnen (nicht übernommen; bitte erneut ablegen)"
 }

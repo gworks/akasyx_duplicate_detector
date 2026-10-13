@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import sqlite3
+import stat as stat_module
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from sqlalchemy import and_, case, or_
@@ -247,13 +249,17 @@ def _count_total(scan) -> int | None:
         return None
 
 
-def _collect_files(config, ui_lines: bool = False):
+def _collect_files(config, ui_lines: bool = False, batch: "Batch | None" = None, st: os.stat_result | None = None):
     """投入元を走査して ScannedFile のイテレータと crawler スキャン情報を返します。
 
     ui_lines は UI 向けの行を出すか（run_add で 1 回だけ読んだ値。途中で食い違わないように）。
+    batch があれば（複数のファイルの 1 件。#37）、段階は実行全体で 1 回だけなので出さない。st は呼び出し側が先に取った
+    単一ファイルの stat（stat し直す間に消えて、1 件の失敗でなく実行全体の致命的エラーにならないように）。
     """
     source = config.source_path
-    if os.path.isdir(source):
+    # 呼び出し側の stat があればそれで決める（複数のファイルの実行では、番の確認でファイルと分かった stat が来る。その後に
+    # フォルダに替わっても、フォルダとして走査しない。#37）
+    if (stat_module.S_ISDIR(st.st_mode) if st is not None else os.path.isdir(source)):
         _print_stage("scan")
         try:
             # .DS_Store 等の OS メタデータは保存する価値が無く、取り込むと保存フォルダが汚れる
@@ -269,8 +275,10 @@ def _collect_files(config, ui_lines: bool = False):
         return _announce_each(crawler_client.read_files(scan.db_path, scan.scan_id), ui_lines), scan
     # 単一ファイルは crawler を使わず直接読む（設計書 §6.4）。消えている・読めないときは、CSV や段階を出す前に
     # 止める（stat だけ先に。ハッシュは時間がかかるのでループの中で取り、その前に段階と処理中のファイルを出す）
-    st = os.stat(source)
-    _print_stage("ingest")
+    if st is None:
+        st = os.stat(source)
+    if batch is None:
+        _print_stage("ingest")
     return _scan_single_file_lazily(source, st, ui_lines), None
 
 
@@ -310,10 +318,126 @@ def resolve_dest_subdir(config) -> str | None:
     return None
 
 
-def run_add(session, config, ingest) -> tuple[str, dict]:
-    """投入元を取り込みます。戻り値は (実行ステータス, result 別件数)。"""
-    ui_lines = _ui_progress()
-    files, scan = _collect_files(config, ui_lines)
+@dataclass
+class Batch:
+    """複数のファイルを 1 回の add で取り込むときに、ファイルをまたいで共有するもの（#37）。
+
+    実行の記録（ar_ingests）はファイルごとに分けるが、出力は 1 回の実行の形にする: CSV は 1 つ、件数（Total）・段階・
+    判定の終わり（Ingest finished）は全体で 1 回、進み具合は通し番号。dry-run の予定（保存先・内容・フォルダごとの件数）
+    も共有する（実際の実行と同じく、2 件目の同じ内容は重複になり、同じ名前は別の保存先になり、上限を超えたら枝に入る。
+    実際の実行は DB とディスクに結果があるので、保存先の計画はファイルごとに作る）。
+    """
+
+    csv_file: str
+    total: int
+    ui_lines: bool
+    processed: int = 0
+    lookup: "archives.ArchiveLookup" = field(default_factory=lambda: archives.ArchiveLookup())
+    reserved: set = field(default_factory=set)
+    virtual_hashes: set = field(default_factory=set)
+    planner: "mover.DestPlanner | None" = None  # dry-run の保存先の計画（実際の実行ではファイルごとに作る）
+
+    def save_plan(self, dry_run: bool):
+        """ファイルをまたいで持つものの写し（dry-run の予定（保存先・内容・フォルダの件数）、つながっていない保存フォルダの
+        重複の件数）。restore_plan で戻す。dry-run でなければ予定は空で、保存先の計画は失敗したら作り直すので写さない。"""
+        counts = self.planner.snapshot() if dry_run and self.planner is not None else None
+        return dry_run, set(self.reserved), set(self.virtual_hashes), counts, dict(self.lookup.unavailable_duplicates)
+
+    def restore_plan(self, plan) -> None:
+        dry_run, reserved, virtual_hashes, counts, unavailable = plan
+        self.reserved.clear()
+        self.reserved.update(reserved)
+        self.virtual_hashes.clear()
+        self.virtual_hashes.update(virtual_hashes)
+        self.lookup.unavailable_duplicates.clear()
+        self.lookup.unavailable_duplicates.update(unavailable)
+        if dry_run:
+            if counts is None:
+                self.planner = None  # 写したときは計画がまだ無かった
+            elif self.planner is not None:
+                self.planner.restore(counts)
+
+
+def start_batch(config, total: int) -> Batch:
+    """複数のファイルの取り込みを始めます（段階・全体の件数（呼び出し側が回すファイルの数）を出し、CSV を作る）。"""
+    batch = Batch(
+        csv_file=create_csv(config.log_dir, "add_result", f"{datetime.now():%Y%m%d_%H%M%S}"),
+        total=total,
+        ui_lines=_ui_progress(),
+    )
+    _print_stage("ingest")
+    print(f"Total: {batch.total} files", flush=True)
+    return batch
+
+
+def record_failed(batch: Batch, path: str, message: str) -> None:
+    """取り込めなかったファイルを、失敗の 1 件として残します（実行全体は止めない。#37）。
+
+    順番が来たときに無い・フォルダ・重複・置き場所で断る・そのファイルの処理で致命的エラーが起きた、のいずれか。CSV・
+    失敗の行・進み具合には必ず出す（黙って減らさない）。
+    """
+    record_result(batch, path, RESULT_FAILED, "", message)
+
+
+def record_result(batch: Batch, path: str, result: str, stored_rel: str, message: str, size="") -> None:
+    """判定のループの外で決まったファイルの結果を、CSV と進み具合に 1 件として出します（#37）。"""
+    if batch.ui_lines:
+        # 処理中のファイルとして知らせてから結果を出す（判定のループと同じ。UI が前のファイルを出し続けない）
+        _print_path_line("Current file", path=path)
+    _write_result(
+        batch.csv_file, [os.path.basename(path), path, result, size, stored_rel, message],
+        path=path, result=result, message=message, ui_lines=batch.ui_lines, batch=batch,
+    )
+
+
+def _write_result(csv_file, row, *, path, result, message, ui_lines, batch=None, processed=0, of_total="") -> None:
+    """1 件の結果を出します: CSV の行 → 失敗の行（失敗のとき）→ 進み具合。判定のループと、ループの外で決まった結果（#37）の
+    両方がここを通る（行の形と順を 1 か所で決める。UI は Progress の行を数えて、始めていないファイルを決める）。
+
+    複数のファイルの実行（batch）では、通し番号を CSV の行を書いたときだけ進め、進み具合は通し番号で出す（processed・
+    of_total は渡さない）。1 件の実行では、呼び出し側の番号（processed・of_total）で出す。
+    """
+    csv_update(csv_file, row)
+    if batch is not None:
+        batch.processed += 1
+        processed, of_total = batch.processed, f"/{batch.total}"
+    if result == RESULT_FAILED:
+        # どの経路で failed になっても、パス入りの WARNING でログファイルに残す（1 件 1 行）。UI から起動したときは
+        # JSON の行（失敗の一覧）で知らせ、WARNING は詳細ログ（コンソール）には流さない（失敗が多いと詳細ログを
+        # 埋めて、ほかの警告を押し出すため。全件は CSV とログファイル）
+        logger.warning(f"Failed: {path}: {message or ''}", extra={"file_only": ui_lines})
+        if ui_lines:
+            _print_path_line("Failed", path=path, message=message or "")
+    # UI から起動したときは 1 件ずつ flush する（PYTHONUNBUFFERED が効かない起動でも遅れて届かないように）。
+    # CLI でリダイレクトしたときに 1 件ごとの書き込みにはしない
+    print(f"Progress: {processed}{of_total} files ({result})", flush=ui_lines)
+
+
+def finish_batch(session, batch: Batch, completed: bool) -> None:
+    """複数のファイルの取り込みを終えます（判定の終わり・後片付けの段階・CSV の場所を 1 回だけ出す）。"""
+    try:
+        if batch.ui_lines:
+            print("Ingest finished", flush=True)
+        if completed:
+            _print_stage("cleanup")
+        _report_unavailable_owners(session, batch.lookup)
+        if completed:
+            _print_stage("done")
+    finally:
+        # ファイルごとの結果は CSV にしか無い。後片付けで止まっても場所は出す（UI はこの行で CSV のリンクを出す）
+        logger.info(f"CSV report: {batch.csv_file}")
+
+
+def run_add(
+    session, config, ingest, batch: Batch | None = None, st: os.stat_result | None = None
+) -> tuple[str, dict]:
+    """投入元を取り込みます。戻り値は (実行ステータス, result 別件数)。
+
+    batch があれば、複数のファイルのうち config.source_path の 1 件を取り込む（出力は batch がまとめる。st はその
+    ファイルの番に取った stat。#37）。
+    """
+    ui_lines = batch.ui_lines if batch is not None else _ui_progress()
+    files, scan = _collect_files(config, ui_lines, batch, st)
     # 判定の段階に入った後は、ループの前の準備（件数の数え上げなど）で止まっても、判定の終わり（Ingest finished）を出す。
     # UI は処理中のファイルと残り時間を止める（#18。UI 向けの区切り）
     try:
@@ -322,28 +446,47 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
             ingest.crawler_scan_id = scan.scan_id
             session.commit()
 
-        planner = mover.DestPlanner(session, config, resolve_dest_subdir(config))
+        if batch is not None:
+            # 保存先の階層名はファイルなら全部同じ（--dest-subdir か、付けない）。投入元を見て決めない（確かめた後に
+            # フォルダに替わったファイルで、残りのファイルの保存先を変えない）
+            if config.dry_run:
+                # dry-run の予定（フォルダごとの件数）は計画の中にしか無いので、実行全体で共有する
+                if batch.planner is None:
+                    batch.planner = mover.DestPlanner(session, config, config.dest_subdir or None)
+                planner = batch.planner
+            else:
+                # 実際の実行はファイルごとに作り直す（1 件ずつのときと同じく、ディスクと DB の実際の件数で決める。移動に
+                # 失敗したファイルの分を数えたままにしない）
+                planner = mover.DestPlanner(session, config, config.dest_subdir or None)
+        else:
+            planner = mover.DestPlanner(session, config, resolve_dest_subdir(config))
         counters: dict[str, int] = {}
-        reserved: set[str] = set()       # dry-run 用: 予約済みの保存先（casefold）
-        virtual_hashes: set = set()      # dry-run 用: 取り込み予定の内容
+        if batch is not None:
+            reserved, virtual_hashes = batch.reserved, batch.virtual_hashes
+            csv_file, lookup = batch.csv_file, batch.lookup
+        else:
+            reserved = set()        # dry-run 用: 予約済みの保存先（casefold）
+            virtual_hashes = set()  # dry-run 用: 取り込み予定の内容
+            csv_file = create_csv(config.log_dir, "add_result", f"{datetime.now():%Y%m%d_%H%M%S}")
+            lookup = archives.ArchiveLookup()
         status = "completed"
 
-        ts_start = f"{datetime.now():%Y%m%d_%H%M%S}"
-        csv_file = create_csv(config.log_dir, "add_result", ts_start)
         processed = 0
         is_own = own_data_matcher(config)
-        lookup = archives.ArchiveLookup()
         in_archive = archive_matcher(config, lookup)
 
         try:
-            # 件数の数え上げは大きい DB では時間がかかるので、中断をループと同じく受け止める try の中で行う
-            total = _count_total(scan)
-            if total is not None:
-                print(f"Total: {total} files", flush=True)
+            if batch is not None:
+                total = batch.total  # 全体の件数は start_batch が出した
+            else:
+                # 件数の数え上げは大きい DB では時間がかかるので、中断をループと同じく受け止める try の中で行う
+                total = _count_total(scan)
+                if total is not None:
+                    print(f"Total: {total} files", flush=True)
             of_total = f"/{total}" if total is not None else ""
 
             for scanned in files:
-                processed += 1
+                processed += 1  # このファイルの記録の件数（途中の commit の間隔に使う）
                 if is_own(scanned.path_abs):
                     # 取り込まないが、CSV とサマリには残す（黙って減らすと件数が合わず取りこぼしに見える）
                     result, stored_rel = RESULT_SKIPPED_OWN_DATA, None
@@ -360,29 +503,13 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
                         session, config, ingest, scanned, planner, reserved, virtual_hashes, lookup
                     )
                 counters[result] = counters.get(result, 0) + 1
-                csv_update(
+                _write_result(
                     csv_file,
-                    [
-                        scanned.name,
-                        scanned.path_abs,
-                        result,
-                        scanned.size,
-                        stored_rel or "",
-                        message or "",
-                    ],
+                    [scanned.name, scanned.path_abs, result, scanned.size, stored_rel or "", message or ""],
+                    path=scanned.path_abs, result=result, message=message, ui_lines=ui_lines,
+                    # 複数のファイルの実行では通し番号（batch が数える）、1 件の実行ではこのループの番号
+                    **({"batch": batch} if batch is not None else {"processed": processed, "of_total": of_total}),
                 )
-                if result == RESULT_FAILED:
-                    # どの経路で failed になっても、パス入りの WARNING でログファイルに残す（1 件 1 行）。UI から起動したときは
-                    # JSON の行（失敗の一覧）で知らせ、WARNING は詳細ログ（コンソール）には流さない（失敗が多いと詳細ログを
-                    # 埋めて、ほかの警告を押し出すため。全件は CSV とログファイル）
-                    logger.warning(
-                        f"Failed: {scanned.path_abs}: {message or ''}", extra={"file_only": ui_lines}
-                    )
-                    if ui_lines:
-                        _print_path_line("Failed", path=scanned.path_abs, message=message or "")
-                # UI から起動したときは 1 件ずつ flush する（PYTHONUNBUFFERED が効かない起動でも遅れて届かないように）。
-                # CLI でリダイレクトしたときに 1 件ごとの書き込みにはしない
-                print(f"Progress: {processed}{of_total} files ({result})", flush=ui_lines)
                 if not config.dry_run and processed % COMMIT_INTERVAL == 0:
                     session.commit()
         except KeyboardInterrupt:
@@ -401,8 +528,12 @@ def run_add(session, config, ingest) -> tuple[str, dict]:
     finally:
         # 一覧（crawler DB の接続）はここで閉じる。中断・例外で抜けても、後片付けの間まで開いたままにしない
         files.close()
-        if ui_lines:
+        if ui_lines and batch is None:
             print("Ingest finished", flush=True)
+
+    if batch is not None:
+        # 段階・つながっていない保存フォルダの知らせ・CSV の場所は、全部のファイルが済んでから finish_batch が出す
+        return status, counters
 
     # 段階は、前の段階が最後まで済んだときだけ進める（UI は「次の段階が出たら前の段階は完了」とだけ読む。#18）。
     # 中断したときも後片付けは走るが、判定が済んだとは出さない
