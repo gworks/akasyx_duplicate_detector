@@ -19,6 +19,10 @@ const { summarizeArgs, previewDefaults } = require('./defaults-summary');
 const {
   checkSources, pairKeys, sourceKeys, overlapsAny, createQueue, buildQuickArgs, quickPreviewForm, groupSources, dropTaken, groupMaxChars, remainderAfter, unstartedCount, doneAfter, requeuesAfter,
 } = require('./quick-queue');
+// 列・実行の履歴の写しを差分で送る（#36）。画面と同じファイルを使う
+const { createListSync } = require('./renderer/list-sync');
+// 実行ボタンの実行の出力の履歴（#38）
+const { createRunHistory } = require('./run-history');
 
 // 確認のダイアログに並べる投入元・コマンドの数（多く落としても画面からはみ出さない。残りは件数で出す）
 const QUICK_CONFIRM_SOURCES = 10;
@@ -27,7 +31,7 @@ const QUICK_CONFIRM_COMMANDS = 2;
 const QUICK_CONFIRM_COMMAND_CHARS = 600;
 // 列の写しに載せる、まとめた項目のファイルの数（行の見出しのツールチップ用。全部は確認のダイアログと CSV にある）
 const QUICK_VIEW_SOURCES = 20;
-const QUICK_FAILURES = 100; // 列の完了の行に持たせる失敗の一覧の件数
+const QUICK_FAILURES = 100; // 列の完了の行・実行の履歴に持たせる失敗の一覧の件数
 // 実行ボタンの取り込みの投入元の実体の位置を待つ上限（列との重なりを見るため。つながっていない場所で止めない）
 const REALPATH_WAIT_MS = 2000;
 
@@ -79,10 +83,9 @@ const quickQueue = createQueue();
 let quitting = false;
 let stopKillTimer = null;  // Windows で停止ファイルを作った後、応えなければ木ごと止める予約（#32）
 let runSeq = 0;            // 実行の通し番号（activeRun.id。中断がどの実行へのものかを見分ける）
-// 実行ボタンから始めた実行の、最後の結果（#22）。列の項目が始まると画面の出力が置き換わるので、そのときに列の完了の
-// 行として残す。実行ボタンで次の実行を始めたら（自分の操作で置き換えた）捨てる
-// （finish で入れ、pumpQuickQueue で列に移し、run:start で捨てる）
-let lastOtherRun = null;
+// 実行ボタンから始めた実行の結果（#38）。詳細ログは次の実行（列の項目を含む）で置き換わるので、画面のそのタブから
+// 前の実行の出力を開けるように残す（列の項目の結果は列の行にある）
+const runHistory = createRunHistory();
 let reservedAddKeys = [];  // 実行ボタンの取り込みが起動するまでの投入元の比較キー（実体の位置を待つ間の予約。#22）
 // 最後に読めた登録済みの保存フォルダと、そのときの正本 DB の欄の値（archives:list。かんたん取り込みの重なりの確認に、
 // 同じ正本 DB のときだけ使う）
@@ -356,8 +359,8 @@ function createStreamPump(send, { keepOutput = true } = {}) {
   let adoptPath = null;        // 断りの案内が示す、adopt が要るフォルダ
   let warnings = 0;            // 警告・エラーの行の数（開き直す前に出たものも、終わったときに詳細ログを開く判断に使う）
   const notices = createNoticeCollector(); // 警告・エラーの行そのもの（かんたん取り込みの列の行に残す。#22）
-  // 出力の末尾（crawler の行は除く）。実行ボタンから始めた実行の出力は、列の項目が始まると画面から消えるので行に残す
-  // （列の項目の行には持たせないので、そのときは集めない。keepOutput=false）
+  // 出力の末尾（crawler の行は除く）。実行ボタンから始めた実行の出力は、次の実行が始まると画面から消えるので履歴に
+  // 残す（#38。列の項目の行には持たせないので、そのときは集めない。keepOutput=false）
   const tail = keepOutput ? createTailCollector() : null;
 
   const flush = () => {
@@ -728,8 +731,6 @@ ipcMain.handle('archives:list', (_event, form) => {
 });
 
 ipcMain.handle('run:start', async (_event, form) => {
-  // 画面は実行ボタンを押した時点で前の出力を消している（始まらなくても）。前の結果を列に残す必要はもう無い（#22）
-  lastOtherRun = null;
   // 確認ダイアログを待っている間も含めて 1 本に絞る（child は spawn 後にしか立たない）
   if (runBusy()) return { started: false, error: tr('busy') };
   starting = true;
@@ -865,16 +866,25 @@ function launch(args, identity, onFinish = null) {
       // 実行で登録が変わりうる（登録を外す・初めての保存フォルダの登録）。main が持つ一覧は捨て、次に読んだものを使う
       lastListed = { archiveDb: null, roots: [] };
       // 開き直した画面が実行を取り戻す前に終わったときも、出力の持ち主とその実行のログ・DB が分かるように（#19）。
-      // 出力の末尾・警告の行は列の行に残すためのもの（画面は使わないので送らない）
+      // 出力の末尾・警告の行は列の行・履歴に残すためのもの（終了の通知では送らない）
+      // runId: 出力欄に出ている実行（画面は履歴からこの実行を除く。#38。始まったという応答より先に終わっても）
       const { output: _output, notices: _notices, ...exitPayload } = summary;
-      send('run:exit', exitPayload);
+      send('run:exit', { ...exitPayload, runId: run.id });
       if (onFinish) {
         onFinish(summary);
       } else {
-        // 実行ボタンから始めた実行の結果。この後に列の項目が始まると画面の出力が置き換わるので、そのときに列の
-        // 完了の行として残す（pumpQuickQueue。#22）
+        // 実行ボタンから始めた実行の結果を履歴に残す（#38。この後に列の項目が始まると詳細ログが置き換わる）。
         // 出力の本文（末尾）も残す（状態・履歴などは本文が結果。列の項目の行には持たせない。量を抑える）
-        lastOtherRun = { mode: identity.mode, command, result: { ...quickResult(summary), output: summary.output } };
+        // 残せなくても、列を止めない（下の一時停止の判定と次の項目へ進む）
+        try {
+          runHistory.add({
+            id: run.id, mode: identity.mode, command, finishedAt: Date.now(),
+            result: { ...runResult(summary), output: summary.output },
+          });
+          sendRunHistory();
+        } catch (e) {
+          console.error('run history', e);
+        }
         // ファイルを動かす実行の中断・起動できなかったときは、待っている列の項目も止める（画面に「再開」を出す）
         if (pauseQueueAfter(summary, run.movesFiles)) sendQuickQueue();
       }
@@ -959,29 +969,43 @@ function launch(args, identity, onFinish = null) {
 
 // --- かんたん取り込み（#22） -------------------------------------------------
 
-/** 列の中身（画面に要るものだけ）と、一時停止しているか。 */
-function quickQueueView() {
-  // mode・command は他のタブの実行の結果の行だけに送る（addDone。列の項目のコマンドは画面で使わず、まとめた項目では
-  // 3 万文字近くになる。列を送るたびに写さない）
-  // sources・sourceCount はまとめたファイル（#37。1 件のときも 1 つ）
-  const items = quickQueue.list().map((i) => ({
-    id: i.id, source: i.source, status: i.status, result: i.result, mode: i.mode || null, command: i.mode ? i.command : null,
-    runId: i.runId ?? null,
+/**
+ * 列の項目の、画面に要るものだけ。コマンドは送らない（画面で使わず、まとめた項目では 3 万文字近くになる）。
+ * sources・sourceCount はまとめたファイル（#37。1 件のときも 1 つ）
+ */
+function quickItemView(i) {
+  return {
+    id: i.id, source: i.source, status: i.status, result: i.result, runId: i.runId ?? null,
     sources: (i.sources || []).slice(0, QUICK_VIEW_SOURCES), sourceCount: (i.sources || []).length,
     folder: i.folder || null, // まとめたファイルが全部同じフォルダならその場所（行の見出しに使う）
-  }));
-  return { items, paused: quickQueue.isPaused() };
+  };
 }
+
+// 列の写しは差分で送る（#36。変わった行・消えた行の id・並び順と、一時停止しているか）。終わった行の結果は
+// 終わったときに 1 度だけ送る。画面を開き直したとき・写しが飛んだときは quick:list で全体を返す
+const quickSync = createListSync(quickItemView);
+const quickMeta = () => ({ paused: quickQueue.isPaused() });
 
 function sendQuickQueue() {
-  sendToWindow('quick:queue', quickQueueView());
+  const diff = quickSync.diff(quickQueue.list(), quickMeta());
+  if (diff) sendToWindow('quick:queue', diff);
 }
 
-/** 列の項目の結果（完了した項目から結果を開けるように）。失敗の一覧は送られた分（上限あり）。 */
-function quickResult(s) {
+// 実行の履歴の写しも差分で送る（#38・#36。残したものは変わらないので、足した 1 件と捨てた id だけ）。画面に要るものだけ
+const historySync = createListSync((e) => ({
+  id: e.id, mode: e.mode, command: e.command, finishedAt: e.finishedAt, result: e.result,
+}));
+
+function sendRunHistory() {
+  const diff = historySync.diff(runHistory.list());
+  if (diff) sendToWindow('run:history', diff);
+}
+
+/** 終わった実行の結果（列の完了の行と実行の履歴の両方。#38）。失敗の一覧は送られた分（上限あり）。 */
+function runResult(s) {
   return {
     code: s.code ?? null, stoppedByUser: !!s.stoppedByUser, meaning: s.meaning, tally: s.tally || {},
-    // 失敗の一覧は先頭 QUICK_FAILURES 件まで（列の写しは変わるたびに丸ごと送る。全件は CSV にある）
+    // 失敗の一覧は先頭 QUICK_FAILURES 件まで（完了の行は 20 件まで残り、開き直した画面へは全体を送る。全件は CSV にある）
     failureCount: s.failureCount || 0, failures: (s.failures || []).slice(0, QUICK_FAILURES),
     failuresOmitted: (s.failuresOmitted || 0) + Math.max(0, (s.failures || []).length - QUICK_FAILURES),
     csvPath: s.csvPath || null,
@@ -1022,11 +1046,6 @@ function pumpQuickQueue() {
   if (quitting || runBusy()) return;
   const next = quickQueue.nextWaiting();
   if (!next) return;
-  // 画面に出ている他のタブの実行の結果は、この項目の出力に置き換わる。列の完了の行として残す（項目より前に並ぶ）
-  if (lastOtherRun) {
-    quickQueue.addDone(lastOtherRun);
-    lastOtherRun = null;
-  }
   let started;
   try {
     started = launch(next.args, next.identity, (summary) => {
@@ -1046,7 +1065,7 @@ function pumpQuickQueue() {
       }
       // 列に戻さなかったまとめた項目は、始めていないファイルの数を行に残す
       const notStarted = rest ? 0 : unstartedCount(next, summary.processed);
-      quickQueue.markDone(next.id, { ...quickResult(summary), notStarted }, rest ? doneAfter(next, summary.processed) : null);
+      quickQueue.markDone(next.id, { ...runResult(summary), notStarted }, rest ? doneAfter(next, summary.processed) : null);
       if (rest) quickQueue.addFront([rest]);
       pauseQueueAfter(summary, true); // 中断・起動できなかったときは、待ちの項目を「再開」まで止める
       sendQuickQueue();
@@ -1055,7 +1074,7 @@ function pumpQuickQueue() {
     // 起動の途中で投げた（引数の不正など）。完了として理由を残し、列を一時停止する（次も同じ理由で失敗しうる。
     // 「再開」で続ける。起動していたら、launch が止め終わるのを待つ）
     quickQueue.markDone(next.id, {
-      ...quickResult({}), meaning: { level: 'error', key: 'launch_failed_detail', vars: { detail: e.message || String(e) } },
+      ...runResult({}), meaning: { level: 'error', key: 'launch_failed_detail', vars: { detail: e.message || String(e) } },
       notStarted: unstartedCount(next, 0), // まとめた項目なら、1 件も取り込んでいないことを行に出す（#37）
     });
     pauseQueueAfter({ launchFailed: true }, true); // 起動できなかった。待ちの項目は「再開」まで止める
@@ -1097,13 +1116,9 @@ function listed(lines, limit) {
   return [...lines.slice(0, limit), ...(rest > 0 ? [tr('quick_confirm_more', { count: rest })] : [])].join('\n');
 }
 
-ipcMain.handle('quick:list', () => quickQueueView());
-
-// 画面が出力を消した（クリア）。前の実行の結果は画面から消えたので、列に残す必要は無い（#22）
-ipcMain.handle('run:output-cleared', () => {
-  lastOtherRun = null;
-  return true;
-});
+// 全体の写し（開き直した画面・差分の通し番号が飛んだ画面。#36）
+ipcMain.handle('quick:list', () => quickSync.full(quickQueue.list(), quickMeta()));
+ipcMain.handle('run:history-list', () => historySync.full(runHistory.list()));
 
 // 一時停止した列を再開する
 ipcMain.handle('quick:resume', () => {

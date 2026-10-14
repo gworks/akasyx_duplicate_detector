@@ -231,6 +231,12 @@
         <button type="button" class="btn" id="run-elsewhere-go" data-i18n="runbar_go">Show</button>
       </div>
 
+      <!-- このタブで実行ボタンから始めた、前の実行の出力（#38。詳細ログは次の実行で置き換わる。今出ている実行は除く） -->
+      <details class="run-history" id="run-history" hidden>
+        <summary id="run-history-summary"></summary>
+        <ul class="quick-queue run-history-list" id="run-history-list"></ul>
+      </details>
+
       <!-- 出力はそれを実行したタブのもの（#19。他のタブでは隠す） -->
       <div class="run-output" id="run-output">
         <p class="banner" id="status" hidden></p>
@@ -414,6 +420,7 @@
 
   <script src="modes.js"></script>
   <script src="run-view.js"></script>
+  <script src="list-sync.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
