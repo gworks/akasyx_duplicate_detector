@@ -4,8 +4,9 @@ const assert = require('node:assert');
 const path = require('node:path');
 
 const {
-  sourceKeys, keyWithin, checkSources, createQueue, buildQuickArgs, quickPreviewForm, groupSources, dropTaken, groupMaxChars, remainderAfter, unstartedCount, doneAfter, requeuesAfter,
+  sourceKeys, keyWithin, checkSources, createQueue, buildQuickArgs, quickPreviewForm, groupSources, dropTaken, groupBudget, argCost, quickCommand, remainderAfter, unstartedCount, doneAfter, requeuesAfter,
 } = require('./quick-queue');
+const { formatCommand } = require('./commands');
 
 // 実体の位置の比較キー（sourceKeys の先頭）
 const pathKey = async (p, opts) => (await sourceKeys(p, opts))[0];
@@ -849,15 +850,17 @@ test('まとめるのは続けて落としたファイルだけ（落とした�
   assert.strictEqual(groupSources(cased, posix)[0].folder, null);
 });
 
-test('まとめた引数が長すぎるときは分ける（Windows のコマンドラインの長さの上限）', () => {
+test('まとめた引数が長すぎるときは分ける（コマンドラインの長さの上限）', () => {
   const accepted = Array.from({ length: 10 }, (_, i) => {
     const p = `/in/${String(i).padStart(2, '0')}${'x'.repeat(90)}.txt`;
     return { path: p, key: p, keys: [p], file: true };
   });
-  const groups = groupSources(accepted, { ...posix, maxChars: 400 });
-  assert.ok(groups.length > 1);
-  assert.deepStrictEqual(groups.flatMap((g) => g.sources), accepted.map((a) => a.path)); // 漏れも重なりも無い
-  for (const g of groups) assert.ok(g.sources.reduce((n, p) => n + p.length + 3, 0) <= 400 || g.sources.length === 1);
+  for (const platform of ['win32', 'linux']) {
+    const groups = groupSources(accepted, { ...posix, platform, maxChars: 400 });
+    assert.ok(groups.length > 1);
+    assert.deepStrictEqual(groups.flatMap((g) => g.sources), accepted.map((a) => a.path)); // 漏れも重なりも無い
+    for (const g of groups) assert.ok(g.sources.reduce((n, p) => n + argCost(p, platform), 0) <= 400 || g.sources.length === 1);
+  }
 });
 
 test('まとめた項目のコマンドは、ファイルをすべて投入元に並べた 1 回の add', () => {
@@ -895,12 +898,71 @@ test('列に入れる直前に重なったファイルだけを外し、まと�
 });
 
 test('まとめる長さは、投入元を除いたコマンドの長さを引いた残り（設定のパスが長いほど小さくまとめる）', () => {
-  assert.ok(groupMaxChars(500) > groupMaxChars(5000));
-  assert.strictEqual(groupMaxChars(500) + 500, groupMaxChars(0));
-  assert.ok(groupMaxChars(0) + 2767 <= 32767); // Windows の上限に余裕を残す
+  const short = ['uv', 'run', 'main.py', 'add', '/archive'];
+  const long = [...short, '--log-dir', `/${'d'.repeat(5000)}`];
+  for (const platform of ['win32', 'darwin', 'linux']) {
+    assert.ok(groupBudget(short, { platform, env: {} }) > groupBudget(long, { platform, env: {} }));
+  }
+  // Windows: 今までどおり、コマンドライン全体を 3 万文字までにする（32,767 文字の上限に余裕を残す）
+  assert.strictEqual(groupBudget(short, { platform: 'win32', env: {} }), 30000 - ('uv run main.py add /archive'.length + 1));
+  assert.strictEqual(groupBudget(short, { platform: 'win32', env: { BIG: 'x'.repeat(100000) } }), groupBudget(short, { platform: 'win32', env: {} })); // 環境変数は数えない
   // 残りが無くても 1 件ずつは入れる
   const accepted = ['/in/a.txt', '/in/b.txt'].map((p) => ({ path: p, key: p, keys: [p], file: true }));
-  assert.deepStrictEqual(groupSources(accepted, { ...posix, maxChars: groupMaxChars(40000) }).map((g) => g.sources), [['/in/a.txt'], ['/in/b.txt']]);
+  const none = groupBudget([`/${'d'.repeat(40000)}`], { platform: 'win32', env: {} });
+  assert.strictEqual(none, 0);
+  assert.deepStrictEqual(groupSources(accepted, { ...posix, platform: 'win32', maxChars: none }).map((g) => g.sources), [['/in/a.txt'], ['/in/b.txt']]);
+});
+
+test('macOS・Linux は引数と環境変数の合計（ARG_MAX）で上限を決める。数千のファイルでも 1 回にまとまる（#46）', () => {
+  const env = { PATH: '/usr/bin:/bin', HOME: '/Users/me' };
+  const fixed = ['uv', 'run', 'main.py', 'add', '/archive'];
+  const accepted = Array.from({ length: 3000 }, (_, i) => {
+    const p = `/Users/me/Downloads/in/file-${String(i).padStart(4, '0')}-${'n'.repeat(40)}.pdf`;
+    return { path: p, key: p, keys: [p], file: true };
+  });
+  for (const platform of ['darwin', 'linux']) {
+    const maxChars = groupBudget(fixed, { platform, env });
+    assert.strictEqual(groupSources(accepted, { ...posix, platform, maxChars }).length, 1);
+  }
+  // Windows は今までどおり 3 万文字ごとに分ける
+  const win = groupSources(accepted, { ...posix, platform: 'win32', maxChars: groupBudget(fixed, { platform: 'win32', env }) });
+  assert.ok(win.length >= 3);
+  assert.deepStrictEqual(win.flatMap((g) => g.sources), accepted.map((a) => a.path));
+});
+
+test('macOS・Linux の上限は、その機械の ARG_MAX が 1 MiB より小さければそれに合わせる（Linux はスタックの上限で変わる）', () => {
+  const fixed = ['uv', 'run', 'main.py', 'add', '/archive'];
+  const env = { HOME: '/home/me' };
+  const full = groupBudget(fixed, { platform: 'linux', env });
+  assert.strictEqual(groupBudget(fixed, { platform: 'linux', env, argMax: 4 * 1024 * 1024 }), full); // 大きくても 1 MiB まで
+  const small = groupBudget(fixed, { platform: 'linux', env, argMax: 512 * 1024 });
+  assert.strictEqual(full - small, 512 * 1024);
+  // 上限が小さい機械（Linux の最小 128 KiB）では余裕も小さくし（上限の 1/4）、環境変数が大きくてもまとめられる
+  assert.ok(groupBudget(fixed, { platform: 'linux', env: { BIG: 'x'.repeat(70 * 1024) }, argMax: 128 * 1024 }) > 16 * 1024);
+  // 足りなければ 0 にとどめる（1 件ずつは入れる）
+  assert.strictEqual(groupBudget(fixed, { platform: 'linux', env: { BIG: 'x'.repeat(200 * 1024) }, argMax: 128 * 1024 }), 0);
+});
+
+test('macOS・Linux の長さはバイト数で数え、ARG_MAX（1 MiB）を超えない（環境変数・終端・ポインタの分も引く）', () => {
+  // UTF-8 で 1 文字 3 バイトの名前も、バイト数で数える（文字数で数えると上限を超える）
+  assert.strictEqual(argCost('/あ', 'darwin'), Buffer.byteLength('/あ') + 1 + 8);
+  assert.strictEqual(argCost('/あ', 'win32'), '/あ'.length + 3);
+  const env = { HOME: '/Users/me', BIG: 'y'.repeat(200000) };
+  const fixed = ['uv', 'run', 'main.py', 'add', '/archive'];
+  assert.ok(groupBudget(fixed, { platform: 'darwin', env }) < groupBudget(fixed, { platform: 'darwin', env: { HOME: '/Users/me' } }) - 200000);
+  const accepted = Array.from({ length: 20000 }, (_, i) => {
+    const p = `/in/${'あ'.repeat(30)}-${i}.txt`;
+    return { path: p, key: p, keys: [p], file: true };
+  });
+  const maxChars = groupBudget(fixed, { platform: 'darwin', env });
+  const groups = groupSources(accepted, { ...posix, platform: 'darwin', maxChars });
+  assert.ok(groups.length > 1);
+  assert.deepStrictEqual(groups.flatMap((g) => g.sources), accepted.map((a) => a.path));
+  const envBytes = Object.entries(env).reduce((n, [k, v]) => n + Buffer.byteLength(`${k}=${v}`) + 1 + 8, 0);
+  for (const g of groups) {
+    const argBytes = [...fixed, ...g.sources].reduce((n, a) => n + Buffer.byteLength(a) + 1 + 8, 0);
+    assert.ok(argBytes + envBytes <= 1024 * 1024);
+  }
 });
 
 test('まとめた項目を中断したら、まだ始めていないファイルを待ちの項目として列の先頭に戻す（再開で続けられる）', () => {
@@ -961,7 +1023,7 @@ test('中断したまとめた項目の完了の行は、処理した分だけ�
   assert.strictEqual(done.form, undefined);
   assert.strictEqual(done.files, undefined);
   assert.strictEqual(done.args, undefined);
-  // 比較キー・コマンドも捨てる（まとめた項目は 3 万文字近くになる。完了の行は重複の判定にも使わない。R21）
+  // 比較キー・コマンドも捨てる（まとめた項目は 3 万文字（macOS・Linux は 1 MiB）近くになる。完了の行は重複の判定にも使わない。R21）
   assert.strictEqual(done.keys, undefined);
   assert.strictEqual(done.command, undefined);
   // 1 件も処理していなければ、完了の行はファイル 0 個（全部が列に戻した行にある。同じファイルを 2 行に並べない）。
@@ -974,10 +1036,12 @@ test('まとめる長さの既定は、コマンドの長さの上限から決�
     const p = `/in/${String(i).padStart(3, '0')}${'x'.repeat(90)}.txt`;
     return { path: p, key: p, keys: [p], file: true };
   });
-  const groups = groupSources(accepted, posix);
-  const chars = (g) => g.sources.reduce((n, p) => n + p.length + 3, 0);
+  const win = { ...posix, platform: 'win32' };
+  const groups = groupSources(accepted, win);
+  const chars = (g) => g.sources.reduce((n, p) => n + argCost(p, 'win32'), 0);
+  const budget = groupBudget([], { platform: 'win32' });
   assert.ok(groups.length > 1);
-  assert.ok(chars(groups[0]) <= groupMaxChars(0) && chars(groups[0]) > groupMaxChars(0) - 100);
+  assert.ok(chars(groups[0]) <= budget && chars(groups[0]) > budget - 100);
 });
 
 test('列に戻すのは中断で終わったときだけ（中断と同時に断られたら戻さない）', () => {
@@ -987,4 +1051,26 @@ test('列に戻すのは中断で終わったときだけ（中断と同時に�
   assert.ok(requeuesAfter({ stoppedByUser: true, code: 1 })); // ロックを待つ間の中断（列は一時停止する）
   assert.ok(!requeuesAfter({ stoppedByUser: true, code: 3 }));
   assert.ok(!requeuesAfter({ stoppedByUser: false, code: 0 }));
+});
+
+test('列の項目の画面に出すコマンドは、引数の切れ目で投入元を減らし、設定の引数は全部残す（#46）', () => {
+  const sources = Array.from({ length: 5000 }, (_, i) => `/in/${'あ'.repeat(10)}😀-${i}.txt`);
+  const shown = quickCommand(form, sources, ['uv', 'run', 'main.py']);
+  assert.ok(shown.length < 2200);
+  // 貼り付けても、正しい設定で先頭のファイルだけを取り込むコマンドになる（残りの数は次の行。Windows の cmd でも引数にならない）
+  const [cmd, rest] = shown.split('\n# ');
+  const n = Number(/\+(\d+)/.exec(rest)[1]);
+  const listed = sources.slice(0, sources.length - n);
+  assert.ok(listed.length >= 1 && n > 0);
+  assert.strictEqual(cmd, formatCommand(buildQuickArgs(form, listed), ['uv', 'run', 'main.py']));
+  assert.ok(!/[\uD800-\uDBFF]$/.test(cmd)); // 文字の途中で切らない
+  // 短ければ全部
+  const few = ['/in/a.txt', '/in/b.txt'];
+  assert.strictEqual(quickCommand(form, few, ['uv', 'run', 'main.py']), formatCommand(buildQuickArgs(form, few), ['uv', 'run', 'main.py']));
+  // 確認のダイアログは短い上限で同じ形にする（引数の途中で切らず、残りの数を出す）
+  const dialog = quickCommand(form, sources, ['uv', 'run', 'main.py'], 600);
+  assert.ok(dialog.split('\n')[0].length <= 600 && /\n# … \+\d+$/.test(dialog));
+  // 1 件目だけで長くても、1 件は出す
+  const huge = [`/${'z'.repeat(5000)}`, '/in/b.txt'];
+  assert.ok(quickCommand(form, huge, ['uv']).includes(huge[0]));
 });

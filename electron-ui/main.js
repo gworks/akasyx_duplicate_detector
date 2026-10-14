@@ -1,6 +1,6 @@
 // main.js - メインプロセス。ウィンドウ、フォルダ選択、detector CLI の子プロセス起動
 const { app, BrowserWindow, dialog, ipcMain, shell, clipboard } = require('electron');
-const { spawn } = require('node:child_process');
+const { spawn, execFile } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const crypto = require('node:crypto');
@@ -17,7 +17,7 @@ const { argsEffect, sameEffect } = require('./renderer/modes');
 const { summarizeArgs, previewDefaults } = require('./defaults-summary');
 // かんたん取り込み（#22）: ドロップされたものの受け付けと順番待ちの列
 const {
-  checkSources, pairKeys, sourceKeys, overlapsAny, createQueue, buildQuickArgs, quickPreviewForm, groupSources, dropTaken, groupMaxChars, remainderAfter, unstartedCount, doneAfter, requeuesAfter,
+  checkSources, pairKeys, sourceKeys, overlapsAny, createQueue, buildQuickArgs, quickPreviewForm, groupSources, dropTaken, groupBudget, quickCommand, remainderAfter, unstartedCount, doneAfter, requeuesAfter,
 } = require('./quick-queue');
 // 列・実行の履歴の写しを差分で送る（#36）。画面と同じファイルを使う
 const { createListSync } = require('./renderer/list-sync');
@@ -27,10 +27,12 @@ const { createRunHistory } = require('./run-history');
 // 確認のダイアログに並べる投入元・コマンドの数（多く落としても画面からはみ出さない。残りは件数で出す）
 const QUICK_CONFIRM_SOURCES = 10;
 const QUICK_CONFIRM_COMMANDS = 2;
-// 確認のダイアログに出すコマンド 1 つの文字数（まとめたファイルの数だけ長くなる。#37。実際のコマンドは詳細ログに出る）
+// 確認のダイアログに出すコマンド 1 つの文字数の目安（まとめたファイルの数だけ長くなる。#37。引数の切れ目で切る。#46）
 const QUICK_CONFIRM_COMMAND_CHARS = 600;
 // 列の写しに載せる、まとめた項目のファイルの数（行の見出しのツールチップ用。全部は確認のダイアログと CSV にある）
 const QUICK_VIEW_SOURCES = 20;
+// まとめる長さを測るときの、投入元の仮の値（これを除いた引数を、投入元以外のコマンドの長さとして数える。#46）
+const QUICK_SOURCE_PROBE = '\u0000source';
 const QUICK_FAILURES = 100; // 列の完了の行・実行の履歴に持たせる失敗の一覧の件数
 // 実行ボタンの取り込みの投入元の実体の位置を待つ上限（列との重なりを見るため。つながっていない場所で止めない）
 const REALPATH_WAIT_MS = 2000;
@@ -173,6 +175,34 @@ function resolveUv() {
   return 'uv'; // PATH 頼み。見つからなければ spawn の error で伝わる
 }
 
+/** detector を起動するときのプログラムと先頭の引数（spawnDetector と、まとめる長さを測るときに使う）。 */
+function spawnBase() {
+  return DETECTOR_EXE ? commandBase() : [resolveUv(), 'run', 'main.py'];
+}
+
+let argMaxRead = null;
+/**
+ * この機械の ARG_MAX（macOS・Linux。まとめる長さの上限に使う。#46）。getconf で読む（main を止めないよう非同期。起動時に
+ * 先に読み始める）。読めた値だけを覚え、読めなかったら次に頼まれたときに読み直す。読めない間は、macOS は決まった値の
+ * 1 MiB、Linux は取りうる最小の 128 KiB（スタックの上限が小さい環境でも起動できない長さにしない）。
+ */
+function hostArgMax() {
+  if (!argMaxRead) {
+    argMaxRead = new Promise((resolve) => {
+      execFile('getconf', ['ARG_MAX'], { encoding: 'utf-8', timeout: 2000 }, (err, stdout) => {
+        const value = err ? NaN : Number.parseInt(stdout, 10);
+        if (Number.isFinite(value) && value > 0) {
+          resolve(value);
+          return;
+        }
+        argMaxRead = null; // 次に読み直す
+        resolve(process.platform === 'darwin' ? 1024 * 1024 : 128 * 1024);
+      });
+    });
+  }
+  return argMaxRead;
+}
+
 function appVersion() {
   // 配布版では version.txt を同梱しない。electron-builder が package.json の version を焼き込む
   if (app.isPackaged) return app.getVersion();
@@ -227,6 +257,7 @@ function createWindow() {
 
 app.whenReady().then(() => {
   createWindow();
+  if (process.platform !== 'win32') hostArgMax(); // 最初のドロップで待たせないよう、先に読み始める（#46）
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
@@ -636,7 +667,7 @@ function dropStopFile(file) {
 
 /** detector を起動します。uv は PATH が最小限でも見つかるよう絶対パスで起動する（表示は `uv` のまま）。 */
 function spawnDetector(args, { extraEnv = {}, ...options } = {}) {
-  const [program, ...baseArgs] = DETECTOR_EXE ? commandBase() : [resolveUv(), 'run', 'main.py'];
+  const [program, ...baseArgs] = spawnBase();
   // extraEnv: この実行だけに渡す環境変数（停止ファイルの場所。#32）
   const proc = spawn(program, [...baseArgs, ...args], { cwd: RUN_DIR, env: { ...childEnv(), ...extraEnv }, ...options });
   return { proc, program };
@@ -822,14 +853,16 @@ async function startRun(form) {
 /**
  * detector を起動して、出力を画面へ送る（実行ボタンからも、かんたん取り込みの列からも。同時に 1 本だけ）。
  * identity は実行の素性（mode は出力の持ち主のタブ）。onFinish は終わったときに集計を受け取る（列の結果の記録。#22）。
+ * shown は画面に出すコマンド（列の項目が組んだもの。省略すれば args から組む）。
  * spawn が同期で投げたとき（引数の不正など）は、まだ何も変えていないのでそのまま例外を返す。起動した後の準備で
  * 投げたときは、起動したものを止め、何も実行していない状態に戻して例外を返す（終了の通知は出さない。始まったことを
  * 画面に伝えていないため）。
  */
-function launch(args, identity, onFinish = null) {
+function launch(args, identity, onFinish = null, shown = null) {
   // 起動時のウィンドウではなく「今のウィンドウ」へ送る。閉じて開き直しても制御を失わないようにする
   const send = sendToWindow;
-  const command = formatCommand(args, commandBase());
+  // 画面に出すコマンド（始まりの知らせ・開き直した画面）。列の項目は組んだときのもの（まとめた項目は短くしてある。#46）
+  const command = shown ?? formatCommand(args, commandBase());
   stoppedByUser = false;
 
   // detached: 中断をプロセスグループごと送るため（uv の下の python にも届く）
@@ -970,7 +1003,7 @@ function launch(args, identity, onFinish = null) {
 // --- かんたん取り込み（#22） -------------------------------------------------
 
 /**
- * 列の項目の、画面に要るものだけ。コマンドは送らない（画面で使わず、まとめた項目では 3 万文字近くになる）。
+ * 列の項目の、画面に要るものだけ。コマンドは送らない（画面で使わず、まとめた項目では、Windows で 3 万文字・macOS・Linux で 1 MiB 近くになる。#46）。
  * sources・sourceCount はまとめたファイル（#37。1 件のときも 1 つ）
  */
 function quickItemView(i) {
@@ -1069,7 +1102,7 @@ function pumpQuickQueue() {
       if (rest) quickQueue.addFront([rest]);
       pauseQueueAfter(summary, true); // 中断・起動できなかったときは、待ちの項目を「再開」まで止める
       sendQuickQueue();
-    });
+    }, next.command);
   } catch (e) {
     // 起動の途中で投げた（引数の不正など）。完了として理由を残し、列を一時停止する（次も同じ理由で失敗しうる。
     // 「再開」で続ける。起動していたら、launch が止め終わるのを待つ）
@@ -1102,12 +1135,7 @@ function runningAddKeys() {
 /** まとめた項目の一部のファイルで、許可したときの設定（item.form）のままコマンドを組み直す。 */
 function quickRebuild(item, sources) {
   const args = buildQuickArgs(item.form, sources);
-  return { ...item, args, command: formatCommand(args, commandBase()) };
-}
-
-/** 長い行を limit 文字で切る（ダイアログの詳細用）。 */
-function clipped(text, limit) {
-  return text.length > limit ? `${text.slice(0, limit)} …` : text;
+  return { ...item, args, command: quickCommand(item.form, sources, commandBase()) };
 }
 
 /** 先頭の limit 行と、残りの件数（ダイアログの詳細用）。 */
@@ -1158,14 +1186,17 @@ ipcMain.handle('quick:submit', async (_event, request = {}) => {
   // 組めないとき（設定の値が不正など）はダイアログを出さずに断る。続けて落としたファイルは 1 回の実行にまとめる（#37）
   let items;
   try {
-    // まとめる長さは、投入元を除いたコマンドの長さを引いて決める（設定のパスが長くても、起動できない長さにしない）
-    const fixed = formatCommand(buildQuickArgs(form, ['x']), commandBase()).length - 1; // 'x' は投入元の仮の 1 文字
-    items = groupSources(accepted, { maxChars: groupMaxChars(fixed) }).map((g) => {
+    // まとめる長さは、投入元を除いたコマンド（と macOS・Linux では渡す環境変数）の長さを引いて決める（設定のパスが
+    // 長くても、起動できない長さにしない。#46）。実行ごとに足す停止ファイルの場所（extraEnv）は groupBudget の余裕に収まる
+    const probe = buildQuickArgs(form, [QUICK_SOURCE_PROBE]);
+    const fixedArgs = [...spawnBase(), ...probe.filter((a) => a !== QUICK_SOURCE_PROBE)];
+    const argMax = process.platform === 'win32' ? undefined : await hostArgMax();
+    items = groupSources(accepted, { maxChars: groupBudget(fixedArgs, { env: childEnv(), argMax }) }).map((g) => {
       const args = buildQuickArgs(form, g.sources);
       return {
         // form は許可したときの設定（中断した残りを列に戻すとき、同じ設定でコマンドを組み直す）
         source: g.sources[0], sources: g.sources, files: g.files, key: g.key, keys: g.keys, folder: g.folder, args, form,
-        command: formatCommand(args, commandBase()),
+        command: quickCommand(form, g.sources, commandBase()), // 画面に出す分だけ（#46）
         identity: { mode: 'quick', logDir: form.logDir || '', archiveDb: form.archiveDb || '' },
       };
     });
@@ -1188,7 +1219,7 @@ ipcMain.handle('quick:submit', async (_event, request = {}) => {
     message: tr('quick_confirm_message'),
     detail: `${tr('quick_confirm_sources')}\n${listed(items.flatMap((i) => i.sources.map((p) => `  ${p}`)), QUICK_CONFIRM_SOURCES)}\n\n`
       + `${tr('quick_confirm_archive', { path: archiveRoot })}\n${tr('quick_confirm_settings', { settings })}${skipped}${pausedNote}`
-      + `\n\n${listed(items.map((i) => clipped(i.command, QUICK_CONFIRM_COMMAND_CHARS)), QUICK_CONFIRM_COMMANDS)}`,
+      + `\n\n${listed(items.map((i) => quickCommand(i.form, i.sources, commandBase(), QUICK_CONFIRM_COMMAND_CHARS)), QUICK_CONFIRM_COMMANDS)}`,
   });
   // 待つ間にアプリの終了が始まった（待ちの列は捨てた）なら入れない
   if (response !== 1 || quitting) return { queued: 0, rejected: reasons(rejected), error: null, canceled: true };
