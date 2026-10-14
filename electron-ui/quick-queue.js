@@ -9,7 +9,7 @@
 const path = require('node:path');
 const fs = require('node:fs');
 
-const { buildArgs, toFieldValue } = require('./commands');
+const { buildArgs, toFieldValue, quoteArg, formatCommand } = require('./commands');
 
 // 取り込みに使う設定の欄（設定画面の取り込みの既定と、システムの設定）。取り込みタブの保存用フォルダ・投入元・
 // dry-run は使わない（かんたん取り込みは既定の保存フォルダへ、実際に取り込む）
@@ -425,16 +425,60 @@ function finish(accepted, rejected) {
   };
 }
 
-// まとめた 1 回の実行のコマンドラインの長さの上限。Windows のコマンドラインは全体で 32,767 文字まで（開発時は uv が
-// python を同じ引数で起動し直すので、起動するプログラムのパスの違いの分を残す）
+// まとめた 1 回の実行のコマンドラインの長さの上限（OS ごと。#46）。
+// Windows: コマンドラインは全体で 32,767 文字まで（開発時は uv が python を同じ引数で起動し直すので、起動するプログラムの
+// パスの違いの分を残す）。環境変数は別に数える。
+// macOS・Linux: 引数と環境変数を合わせたバイト数（1 つごとに終端の 1 バイトとポインタの 8 バイトを足す）が ARG_MAX まで。
+// macOS は 1 MiB、Linux はスタックの上限の 1/4（既定 2 MiB。最小 128 KiB）なので、1 MiB とその機械の ARG_MAX（main が
+// getconf で読む）の小さい方に合わせる。開発時に uv が
+// python を起動し直すときに足す環境変数（VIRTUAL_ENV など）とプログラムのパスの分として、64 KiB（上限の 1/4 まで）を残す
 const GROUP_CMDLINE_CHARS = 30000;
+const POSIX_ARG_MAX = 1024 * 1024;
+const POSIX_ARG_RESERVE = 64 * 1024;
+
+/** 引数 1 つが上限のうちに占める長さ。Windows は文字数（引用符と区切りの分を足す）、macOS・Linux はバイト数。 */
+function argCost(arg, platform = process.platform) {
+  const s = String(arg);
+  return platform === 'win32' ? s.length + 3 : Buffer.byteLength(s) + 1 + 8;
+}
 
 /**
- * まとめた 1 回の実行に入れられる、投入元のパスの長さの合計（groupSources の maxChars）。fixedLength は投入元を除いた
- * コマンド（起動するプログラム・保存フォルダ・設定の引数）の長さ。足りなくても 1 件ずつは入れる（groupSources）。
+ * まとめた 1 回の実行に入れられる、投入元のパスの長さの合計（groupSources の maxChars。単位は argCost）。
+ * fixedArgs は投入元を除いたコマンド（起動するプログラム・保存フォルダ・設定の引数）、env は渡す環境変数、argMax は
+ * その機械の ARG_MAX（env と argMax は macOS・Linux だけ使う）。足りなくても 1 件ずつは入れる（groupSources）。
  */
-function groupMaxChars(fixedLength) {
-  return Math.max(0, GROUP_CMDLINE_CHARS - fixedLength);
+function groupBudget(fixedArgs, { platform = process.platform, env = process.env, argMax = POSIX_ARG_MAX } = {}) {
+  if (platform === 'win32') {
+    // 投入元の前の区切りの 1 文字も数える
+    return Math.max(0, GROUP_CMDLINE_CHARS - (fixedArgs.map(quoteArg).join(' ').length + 1));
+  }
+  const fixed = fixedArgs.reduce((n, a) => n + argCost(a, platform), 0);
+  const envBytes = Object.entries(env || {}).reduce((n, [k, v]) => n + argCost(`${k}=${v}`, platform), 0);
+  const limit = Math.min(POSIX_ARG_MAX, argMax);
+  // 余裕は上限の 1/4 まで（上限の小さい機械で、余裕だけで上限を使い切ってまとめられなくならないように）
+  const reserve = Math.min(POSIX_ARG_RESERVE, Math.floor(limit / 4));
+  return Math.max(0, limit - reserve - fixed - envBytes);
+}
+
+// 列の項目の、画面に出すコマンドの文字数の目安（出力欄の `$` の行・実行バー。確認のダイアログは main が別に決める。まとめた項目のコマンドは
+// macOS・Linux で 1 MiB 近くになり、窓を開き直すたびにも送るので、全部は持たない。#46。1 件ずつの結果は CSV と失敗の一覧にある）
+const QUICK_SHOWN_COMMAND_CHARS = 2000;
+
+/**
+ * 列の項目の、画面に出すコマンド。長ければ投入元を先頭から入るだけにし、残りの数を次の行（`# … +N`）に付ける。
+ * 切るのは引数の切れ目で、設定の引数（保存フォルダ・DB・ログの場所など）は全部残す（貼り付けて実行しても、違う場所・
+ * 違う設定で取り込まない）。残りの数は同じ行に置かない（Windows の cmd では `#` がコメントにならず、引数として渡る）。
+ * 投入元は少なくとも 1 件は出す。limit は 1 行目の文字数の目安（確認のダイアログはもっと短くする）。
+ */
+function quickCommand(form, sources, base, limit = QUICK_SHOWN_COMMAND_CHARS) {
+  const head = (n) => formatCommand(buildQuickArgs(form, sources.slice(0, n)), base);
+  let n = 1;
+  let length = head(1).length;
+  while (n < sources.length && length + 1 + quoteArg(sources[n]).length <= limit) {
+    length += 1 + quoteArg(sources[n]).length;
+    n += 1;
+  }
+  return n === sources.length ? head(n) : `${head(n)}\n# … +${sources.length - n}`;
 }
 
 /**
@@ -444,11 +488,11 @@ function groupMaxChars(fixedLength) {
  * 戻り値: { sources: パス[], key: 先頭の比較キー, keys: 全部の比較キー（列の重なりの判定に使う）, files: 1 件ずつの
  * { path, keys }（後から一部を外して組み直すときに使う）, folder: 全部が同じフォルダならその場所（比較キーで見る）・違えば null }[]
  */
-function groupSources(accepted, { platform = process.platform, pathApi = path, maxChars = groupMaxChars(0) } = {}) {
+function groupSources(accepted, { platform = process.platform, pathApi = path, maxChars = groupBudget([], { platform }) } = {}) {
   const groups = []; // { files: [{ path, keys }], file: ファイルのまとまりか }
   let open = null; // 今足しているファイルのまとまり
   let chars = 0;
-  const cost = (p) => p.length + 3;
+  const cost = (p) => argCost(p, platform);
   for (const a of accepted) {
     const entry = { path: a.path, keys: a.keys };
     if (a.file && open && chars + cost(a.path) <= maxChars) {
@@ -654,7 +698,7 @@ function createQueue({ keepDone = 20 } = {}) {
         i.status = 'done';
         i.result = result;
         // 行に出さないもの（設定のフォーム・ファイルごとの比較キー・コマンドとその引数）は捨てる（完了の行は 20 件まで
-        // 残る。まとめた項目のコマンドは 3 万文字近くになる。完了の行は重複の判定にも使わない）
+        // 残る。まとめた項目のコマンドは、Windows で 3 万文字・macOS・Linux で 1 MiB 近くになる。完了の行は重複の判定にも使わない）
         delete i.form;
         delete i.files;
         delete i.keys;
@@ -682,5 +726,5 @@ function createQueue({ keepDone = 20 } = {}) {
 }
 
 module.exports = {
-  pairKeys, sourceKeys, keyWithin, overlapsAny, checkSources, createQueue, buildQuickArgs, quickPreviewForm, groupSources, dropTaken, groupMaxChars, remainderAfter, unstartedCount, doneAfter, requeuesAfter,
+  pairKeys, sourceKeys, keyWithin, overlapsAny, checkSources, createQueue, buildQuickArgs, quickPreviewForm, groupSources, dropTaken, groupBudget, argCost, quickCommand, remainderAfter, unstartedCount, doneAfter, requeuesAfter,
 };
