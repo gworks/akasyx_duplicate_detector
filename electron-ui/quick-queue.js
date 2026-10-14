@@ -593,8 +593,9 @@ function quickPreviewForm(form) {
 }
 
 /**
- * 順番待ちの列。項目: { id, source, key, args, command, status: waiting|running|done, result }。
+ * 順番待ちの列。項目: { id, rev, source, key, args, command, status: waiting|running|done, result }。
  * 完了したものは結果を見られるように残すが、keepDone 件を超えたら古いものから捨てる。
+ * rev は項目の版（中身を変えるたびに上げる。画面へは版が変わった項目だけを送る。#36）。
  */
 function createQueue({ keepDone = 20 } = {}) {
   let items = [];
@@ -604,6 +605,13 @@ function createQueue({ keepDone = 20 } = {}) {
   let paused = false;
   const hasWaiting = () => items.some((i) => i.status === 'waiting');
   const find = (id) => items.find((i) => i.id === id);
+  // 項目の中身を変える（版を上げる。画面へは版が変わった項目だけを送るので、変えるときは必ずここを通す。#36）
+  const update = (id, change) => {
+    const i = find(id);
+    if (!i) return;
+    change(i);
+    i.rev += 1;
+  };
   // 完了の記録は keepDone 件まで（古いものから捨てる。待ち・実行中は捨てない）
   const trimDone = () => {
     const done = items.filter((x) => x.status === 'done');
@@ -613,13 +621,13 @@ function createQueue({ keepDone = 20 } = {}) {
   return {
     add(list) {
       if (!hasWaiting()) paused = false; // 待ちが無いまま止まっていた（取り消し尽くした等）なら、新しいものは止めない
-      const created = list.map((i) => ({ ...i, id: nextId++, status: 'waiting', result: null }));
+      const created = list.map((i) => ({ ...i, id: nextId++, rev: 1, status: 'waiting', result: null }));
       items.push(...created);
       return created;
     },
     /** 待ちの項目の先頭に入れる（中断したまとめた項目の残り。ほかの待ちより先に続ける）。 */
     addFront(list) {
-      const created = list.map((i) => ({ ...i, id: nextId++, status: 'waiting', result: null }));
+      const created = list.map((i) => ({ ...i, id: nextId++, rev: 1, status: 'waiting', result: null }));
       const at = items.findIndex((x) => x.status === 'waiting');
       items.splice(at < 0 ? items.length : at, 0, ...created);
       return created;
@@ -634,38 +642,26 @@ function createQueue({ keepDone = 20 } = {}) {
     isPaused: () => paused && hasWaiting(),
     /** 実行中にする。runId はその実行の id（行の中断は、この id で頼む）。 */
     markRunning(id, runId = null) {
-      const i = find(id);
-      if (!i) return;
-      i.status = 'running';
-      i.runId = runId;
+      update(id, (i) => {
+        i.status = 'running';
+        i.runId = runId;
+      });
     },
     /** 完了にする。fields は行に出すものの差し替え（中断したまとめた項目を処理した分だけにする。doneAfter）。 */
     markDone(id, result, fields = null) {
-      const i = find(id);
-      if (!i) return;
-      if (fields) Object.assign(i, fields);
-      i.status = 'done';
-      i.result = result;
-      // 行に出さないもの（設定のフォーム・ファイルごとの比較キー・コマンドとその引数）は捨てる（完了の行は 20 件まで残り、
-      // 列の写しを送るたびに写す。まとめた項目のコマンドは 3 万文字近くになる。完了の行は重複の判定にも使わない）
-      delete i.form;
-      delete i.files;
-      delete i.keys;
-      delete i.args;
-      delete i.command;
+      update(id, (i) => {
+        if (fields) Object.assign(i, fields);
+        i.status = 'done';
+        i.result = result;
+        // 行に出さないもの（設定のフォーム・ファイルごとの比較キー・コマンドとその引数）は捨てる（完了の行は 20 件まで
+        // 残る。まとめた項目のコマンドは 3 万文字近くになる。完了の行は重複の判定にも使わない）
+        delete i.form;
+        delete i.files;
+        delete i.keys;
+        delete i.args;
+        delete i.command;
+      });
       trimDone();
-    },
-    /**
-     * 他のタブの実行の結果を完了の行として足す（列の次の項目が始まると、出力の表示が置き換わるため。
-     * mode は実行したタブ。source・key は持たないので、重複の判定には使わない）。
-     */
-    addDone({ mode, command, result }) {
-      const done = { id: nextId++, source: '', key: null, mode, command, status: 'done', result };
-      // 終わった順に並ぶよう、待ち・実行中の項目より前に入れる
-      const at = items.findIndex((x) => x.status !== 'done');
-      items.splice(at < 0 ? items.length : at, 0, done);
-      trimDone();
-      return { ...done };
     },
     /** 待ちの項目だけ取り消せる。取り消したら true。 */
     cancel(id) {

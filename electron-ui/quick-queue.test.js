@@ -262,17 +262,6 @@ test('登録済みの保存フォルダは書かれた位置で比べる（つ�
   assert.ok(!touched.some((p) => p.startsWith('/nas')), touched.join(','));
 });
 
-test('他のタブの実行の結果を完了の行として残せる（列の項目に押し出されても結果を見られる）。重複の判定には使わない', async () => {
-  const q = createQueue();
-  q.add([item('/a')]);
-  const other = q.addDone({ mode: 'verify', command: 'verify /archive', result: { code: 0 } });
-  assert.strictEqual(other.status, 'done');
-  assert.strictEqual(other.mode, 'verify');
-  assert.deepStrictEqual(q.list().map((i) => i.status), ['done', 'waiting']); // 終わった順（待ちより前）
-  assert.deepStrictEqual(q.activeKeys(), ['/a']);
-  assert.strictEqual(q.nextWaiting().source, '/a');
-});
-
 test('取り込み先の保存フォルダにも問い合わせない（つながっていなくても待たない）。目印は同じフォルダを 1 度だけ問い合わせる', async () => {
   const touched = [];
   const asked = [];

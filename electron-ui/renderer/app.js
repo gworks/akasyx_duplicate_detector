@@ -44,6 +44,7 @@ const dom = {
   quickDrop: el('quick-drop'), quickPickFiles: el('quick-pick-files'), quickPickFolders: el('quick-pick-folders'),
   quickMessage: el('quick-message'), quickQueue: el('quick-queue'),
   quickPaused: el('quick-paused'), quickPausedText: el('quick-paused-text'), quickResume: el('quick-resume'),
+  runHistory: el('run-history'), runHistorySummary: el('run-history-summary'), runHistoryList: el('run-history-list'),
 };
 
 let context = { repoRoot: '', dataDir: '', version: '', detectorFound: true };
@@ -84,12 +85,21 @@ let stopRequested = false; // 中断を頼んだ（終わるまで中断は押�
 let starting = false;      // 実行を頼み、始まったという応答を待っている（中断は main が無視するので押させない）
 let finishedUnseen = false; // 他のタブにいる間に終わり、まだ見に行っていない
 // かんたん取り込みの列（#22。main が持つものの写し）と、画面が始めていない実行（列の項目）が始まった回数
-let quickItems = [];
-let quickPaused = false;     // 列が一時停止している（中断した後。再開で続ける）
+// main が持つ列の写し（#36。差分で届き、renderer/list-sync.js で当てる）: { seq, items, meta: { paused } }
+// paused: 列が一時停止している（中断した後。再開で続ける）
+let quickState = { seq: -1, items: [], meta: null };
+// 実行ボタンの実行の出力の履歴（#38。列と同じく差分で届く）: { seq, items: [{ id, mode, command, finishedAt, result }] }
+let historyState = { seq: -1, items: [], meta: null };
+// 出力欄に出している実行の id（消した・始まらなかったら null）。履歴から除くのは、出力欄がその実行の始めからの出力を
+// 持っているときだけ（historyShown。開き直した・実行中にクリアしたなら、終わった後は履歴からも結果（警告の行・失敗の一覧・出力の末尾）を開けるようにする）
+let shownRunId = null;
+// 出力欄が、今の実行の出力を始めから 1 行も捨てずに持っている（実行ボタン・列の項目で始めたときに立て、出力の行を
+// 捨てたら下ろす。捨てるのは、実行中のクリアと、行が多すぎたときの切り詰めの 2 か所だけ）
+let fullOutput = false;
+let hasRunOutput = false;    // 出力欄に、実行の出力の行がある（コマンド・案内の行だけなら false）
 let externalStarts = 0;
 let quickNotice = null;    // ドロップの断り: { level, key（見出しのキー）, lines（訳した文言か { key, vars }） }
 let quickSubmitting = false; // 確認のダイアログを待っている
-let quickQueueEvents = 0;    // 列の写しが届いた回数（起動時の問い合わせより新しい写しを上書きしない）
 let currentRunId = null;     // 見ている実行の id（main の activeRun.id。中断がどの実行へのものかを main が見分ける。#22）
 let stopSentRunId = null;    // 中断を送った実行の id（古い行の中断が「もう走っていない」と返っても、今の実行の印を下ろさない）
 
@@ -123,6 +133,8 @@ function applyLanguage(next) {
   for (const node of document.querySelectorAll('[data-i18n-aria-label]')) {
     node.setAttribute('aria-label', t(node.dataset.i18nAriaLabel));
   }
+  // 辞書が変わったので、描いた履歴の行と控えを捨てる（読み込む前に描いた行も。下の描き直しで作り直す）
+  invalidateHistory();
   dom.langSelect.value = lang;
   document.title = context.version ? `${t('app_title')}  v${context.version}` : t('app_title');
   renderContext();
@@ -135,6 +147,8 @@ function applyLanguage(next) {
   renderRunLabel();
   renderDefaultsLine(lastDefaults);
   renderDefaultArchiveOptions();
+  // 列の行も辞書が変わったら作り直す（辞書を読み込む前に届いた列の写しで描いた行を、同じ言語のまま使い回さない）
+  dom.quickQueue.replaceChildren();
   renderQuick();
 }
 
@@ -539,6 +553,7 @@ function logFragment(entries) {
     line.textContent = `${entry.text}\n`;
     fragment.append(line);
     logLines += 1;
+    if (entry.stream !== 'meta') hasRunOutput = true;
   }
   return fragment;
 }
@@ -573,13 +588,18 @@ function appendLog(entries) {
   if (logLines > LOG_LIMIT) {
     for (let i = 0; i < LOG_TRIM && dom.log.firstChild; i += 1) dom.log.firstChild.remove();
     logLines -= LOG_TRIM;
+    fullOutput = false; // 出力の先頭を捨てた（先頭の警告の行（先頭 10 行まで）は履歴に残るので、終わったら履歴からも開けるようにする。#38）
+    renderHistory(); // 終わった後に届いた行で切り詰めたときも、すぐ履歴に出す
   }
   followLog();
 }
 
 function clearLogLines() {
+  // 出力の行を捨てたら、出力欄はもう始めからの出力を持たない（コマンド・案内の行だけなら捨てたものは無い。#38）
+  if (hasRunOutput) fullOutput = false;
   dom.log.replaceChildren();
   logLines = 0;
+  hasRunOutput = false;
   logFollow = true;
   logScrollTop = 0;
 }
@@ -608,6 +628,8 @@ function clearLog() {
 
 /** 出力の持ち主（実行したタブとその実行のログの場所）を手放す。消したとき・始まらなかったとき。 */
 function releaseOutput() {
+  shownRunId = null; // 消した実行は、出力欄ではなく履歴から開く
+  fullOutput = false;
   runMode = null;
   runLogDir = null;
   runArchiveDb = null;
@@ -924,21 +946,32 @@ function renderProgress(progress) {
 
   renderFailures(progress.failureCount || 0);
 
-  const keys = Object.keys(tally).sort((a, b) => {
-    const ia = RESULT_ORDER.indexOf(a);
-    const ib = RESULT_ORDER.indexOf(b);
-    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
-  });
   dom.chips.replaceChildren(
-    ...keys.map((key) => {
+    ...tallyKinds(tally, progress.failureCount || 0).map((key) => {
       const chip = document.createElement('span');
       chip.className = `chip ${key}`;
-      const labelKey = `result_${key}`;
-      chip.textContent = `${labelKey in dict ? t(labelKey) : key} ${tally[key].toLocaleString(lang)}`;
+      const n = key === 'failed' ? Math.max(tally.failed || 0, progress.failureCount || 0) : tally[key];
+      chip.textContent = `${resultLabel(key)} ${n.toLocaleString(lang)}`;
       return chip;
     })
   );
   renderRunView(); // 帯の進み具合も同じ文言で出す
+}
+
+/**
+ * 判定の内訳の種類を出す順（RESULT_ORDER の順、知らない種類は後ろ）。failureCount があれば、内訳に無くても失敗を
+ * 入れる（実行中の件数・列の行・実行の履歴で同じ数え方にする。#38）。
+ */
+function tallyKinds(tally, failureCount = 0) {
+  const keys = Object.keys(tally);
+  if (failureCount && !keys.includes('failed')) keys.push('failed');
+  const rank = (k) => (RESULT_ORDER.includes(k) ? RESULT_ORDER.indexOf(k) : RESULT_ORDER.length);
+  return keys.sort((a, b) => rank(a) - rank(b));
+}
+
+/** 判定の種類の名前（辞書に無い種類は名前のまま）。 */
+function resultLabel(key) {
+  return `result_${key}` in dict ? t(`result_${key}`) : key;
 }
 
 /** 失敗したファイルの一覧（#18）。CSV を開かなくても、どのファイルが何で失敗したかが分かるように。 */
@@ -1032,6 +1065,7 @@ function renderRunView() {
   const v = RunView.runView({ mode, runMode, running, stopRequested, finishedUnseen, starting });
   const name = runMode ? modeLabel(runMode) : '';
   renderQuickProgress(); // 列の実行中の項目にも、同じ進み具合を出す（#22）
+  renderHistory(); // 出力欄に出している実行が変わったら、履歴に出すものも変わる（#38）
 
   const outputShown = dom.runOutput.hidden && v.showOutput;
   dom.runOutput.hidden = !v.showOutput;
@@ -1148,6 +1182,8 @@ function resumeRun(run) {
   adoptRun(run);
   runCommand = run.command || '';
   currentRunId = run.id ?? null;
+  // 出力欄は開き直した後の出力だけ。終わったら履歴からも結果を開ける（履歴から除かない）
+  fullOutput = false;
   // 実行中にしてから描く（残り時間と処理中のファイルは実行中だけ出す）
   setRunning(true, run.startedAt);
   if (run.stopRequested) {
@@ -1174,6 +1210,7 @@ function resumeRun(run) {
 async function start(extra = {}) {
   if (running || starting) return;
   clearLog(); // 前の出力と、その出力が付けた案内の印を消す（印は出力と運命をともにする）
+  fullOutput = true; // これから始める実行の出力は、始めから出力欄に入る
   runNoteKey = null;
   showRunNote(''); // 「印が変わったので実行していません」などの前の知らせを残さない（始められるのは組めたときだけ）
   const form = { ...collectForm(), ...extra };
@@ -1221,6 +1258,7 @@ async function start(extra = {}) {
   appendLog([{ stream: 'meta', text: `$ ${result.command}` }]);
   runCommand = result.command; // main が実際に組んだもの
   currentRunId = result.runId ?? null;
+  shownRunId = currentRunId;
   renderRunView();
   // 応答より先に終了通知を受けて片付いていたら（onExit が running を落としている）、状態を上書きしない
   if (!running) return;
@@ -1237,11 +1275,24 @@ function logDir(value = el('logDir').value) {
 // 保存先は設定画面の既定の保存フォルダ、設定は取り込みの既定。ドロップしたものは main が確かめて確認のダイアログを出し、
 // 許可されたものだけを列に入れる（コマンドはそのときの設定で固定）。列は main が持ち、変わるたびに写しが届く
 
-/** main から届いた列の写し: { items, paused }。 */
-function applyQuickView(view) {
-  quickItems = view && Array.isArray(view.items) ? view.items : [];
-  quickPaused = !!(view && view.paused);
+const resyncQuick = ListSync.createResync(
+  () => api.quickList(), (m) => receiveQuick(m), (e) => console.error('quick queue', e), () => quickState.seq,
+);
+
+/** main から届いた列の写し（差分か全体。#36）を当てる。通し番号が飛んでいたら（取りこぼした）全体を問い合わせ直す。 */
+function receiveQuick(msg) {
+  const { state, resync } = ListSync.receiveList(quickState, msg);
+  if (resync) {
+    resyncQuick(msg.seq);
+    return;
+  }
+  if (state === quickState) return;
+  quickState = state;
+  renderQuickQueue();
 }
+
+const quickItems = () => quickState.items;
+const quickPaused = () => !!(quickState.meta && quickState.meta.paused);
 
 /** 既定の保存フォルダ（設定画面で選んだ実パス。決まっていなければ空）。 */
 const quickArchiveRoot = () => dom.defaultArchiveRoot.value;
@@ -1268,15 +1319,15 @@ function renderQuick() {
 }
 
 function renderQuickQueue() {
-  const waiting = quickItems.filter((i) => i.status === 'waiting').length;
-  dom.quickPaused.hidden = !quickPaused;
-  if (quickPaused) dom.quickPausedText.textContent = t('quick_paused', { count: waiting.toLocaleString(lang) });
+  const waiting = quickItems().filter((i) => i.status === 'waiting').length;
+  dom.quickPaused.hidden = !quickPaused();
+  if (quickPaused()) dom.quickPausedText.textContent = t('quick_paused', { count: waiting.toLocaleString(lang) });
   // 終わった行は中身が変わらないので使い回す（開いた失敗の一覧を閉じない・大きな一覧を作り直さない）。
-  // 言語を切り替えたら作り直す
+  // 言語を当てたときは applyLanguage が全部作り直す
   const old = new Map([...dom.quickQueue.children].map((li) => [li.dataset.id, li]));
-  dom.quickQueue.replaceChildren(...quickItems.map((item) => {
+  dom.quickQueue.replaceChildren(...quickItems().map((item) => {
     const prev = old.get(String(item.id));
-    const reuse = prev && item.status === 'done' && prev.dataset.status === 'done' && prev.dataset.lang === lang;
+    const reuse = prev && item.status === 'done' && prev.dataset.status === 'done';
     return reuse ? prev : renderQuickItem(item);
   }));
   renderQuickProgress();
@@ -1308,26 +1359,23 @@ function renderQuickItem(item) {
   li.className = `quick-item ${item.status}`;
   li.dataset.id = String(item.id);
   li.dataset.status = item.status;
-  li.dataset.lang = lang;
   const status = document.createElement('span');
   status.className = 'quick-status';
   const body = document.createElement('div');
   body.className = 'quick-body';
   const name = document.createElement('div');
   name.className = 'quick-name';
-  // 他のタブの実行の結果の行（列の項目に押し出された実行。mode を持つ）は、その機能の名前とコマンドを出す
   // まとめた項目（続けて落とした複数のファイル。#37）は、件数（全部が同じフォルダならフォルダ名も）を出し、ツールチップに
   // ファイルを並べる
   // sourceCount が 0 なのは、中断したまとめた項目で 1 件も処理しなかった完了の行（ファイルは列に戻した行にある。全部が同じ
   // フォルダならフォルダ名は出す）
   const count = item.sourceCount ?? 1;
-  if (item.mode) name.textContent = t('quick_other_run', { name: modeLabel(item.mode) });
-  else if (count !== 1 && item.folder) name.textContent = t('quick_batch_name', { folder: fileLabel(item.folder), count: count.toLocaleString(lang) });
+  if (count !== 1 && item.folder) name.textContent = t('quick_batch_name', { folder: fileLabel(item.folder), count: count.toLocaleString(lang) });
   else if (count !== 1) name.textContent = t('quick_batch_name_mixed', { count: count.toLocaleString(lang) });
   else name.textContent = fileLabel(item.source);
   const listedSources = (item.sources || []).join('\n');
   const more = count > (item.sources || []).length ? `\n${t('quick_confirm_more', { count: (count - item.sources.length).toLocaleString(lang) })}` : '';
-  name.title = item.mode ? item.command || '' : count !== 1 ? listedSources + more || item.folder || '' : item.source;
+  name.title = count !== 1 ? listedSources + more || item.folder || '' : item.source;
   const detail = document.createElement('div');
   detail.className = 'quick-detail';
   body.append(name, detail);
@@ -1342,48 +1390,156 @@ function renderQuickItem(item) {
     detail.classList.add('quick-progress'); // 進み具合は renderQuickProgress が入れる
     actions.append(quickButton('stop', 'stop', 'stop'));
   } else {
-    const r = item.result || {};
-    const [key, level] = quickOutcome(r);
-    status.textContent = t(key);
-    status.classList.add(level);
     // 移動・重複・失敗の件数（失敗は 0 件でも出す）
-    const tally = r.tally || {};
-    const chips = document.createElement('div');
-    chips.className = 'chips';
-    // 他のタブの実行は、その実行の判定の内訳をそのまま出す
-    const kinds = item.mode ? RESULT_ORDER.filter((k) => tally[k]) : ['moved', 'duplicate', 'failed'];
-    for (const k of kinds) {
-      const n = k === 'failed' ? Math.max(tally.failed || 0, r.failureCount || 0) : tally[k] || 0;
-      chips.append(chip(`${t(`result_${k}`)} ${Number(n).toLocaleString(lang)}`, k));
-    }
-    detail.append(chips);
-    // 正常でなかった理由（一部失敗・エラー。中断は見出しで分かる。詳細ログは次の項目が始まると消える）
-    if (r.meaning && r.meaning.level !== 'ok' && !r.stoppedByUser) {
-      const why = document.createElement('div');
-      why.textContent = t(r.meaning.key, r.meaning.vars || {});
-      detail.append(why);
-    }
-    // まとめた項目が途中で止まり、始めていないファイル（取り込んでいない。もう一度落とす。#37）
-    if (r.notStarted) {
-      const left = document.createElement('div');
-      left.textContent = t('quick_not_started', { count: Number(r.notStarted).toLocaleString(lang) });
-      detail.append(left);
-    }
-    if (r.failures && r.failures.length) detail.append(quickFailures(r));
-    if (r.notices && r.notices.lines.length) detail.append(quickLines(r.notices, 'quick_notices', 'quick-notices'));
-    if (r.output && r.output.lines.length) detail.append(quickLines(r.output, 'quick_output', 'quick-output', 'quick_output_omitted'));
-    if (r.csvPath) actions.append(quickButton('csv', 'open_csv', 'ghost'));
-    // 出力が示した次の操作（詳細ログと一緒に消えるので、行から辿れるようにする）
-    if (r.adoptPath) actions.append(quickButton('adopt', 'next_adopt_button'));
-    if (r.forgetIds && r.forgetIds.length) actions.append(quickButton('forget', 'next_forget_button'));
+    fillResult(status, detail, actions, item.result || {}, ['moved', 'duplicate', 'failed']);
   }
   li.append(status, body, actions);
   return li;
 }
 
 /**
+ * 終わった実行の結果を行に入れる（列の完了の行と、実行の履歴の行。#38）: 終わり方・件数（kinds の順）・正常でなかった
+ * 理由・始めていないファイル・失敗の一覧・警告の行・出力の末尾と、CSV・次の操作のボタン。
+ */
+function fillResult(status, detail, actions, r, kinds) {
+  const [key, level] = quickOutcome(r);
+  status.textContent = t(key);
+  status.classList.add(level);
+  const tally = r.tally || {};
+  const chips = document.createElement('div');
+  chips.className = 'chips';
+  for (const k of kinds) {
+    const n = k === 'failed' ? Math.max(tally.failed || 0, r.failureCount || 0) : tally[k] || 0;
+    chips.append(chip(`${resultLabel(k)} ${Number(n).toLocaleString(lang)}`, k));
+  }
+  detail.append(chips);
+  // 正常でなかった理由（一部失敗・エラー。中断は見出しで分かる。詳細ログは次の実行が始まると消える）
+  if (r.meaning && r.meaning.level !== 'ok' && !r.stoppedByUser) {
+    const why = document.createElement('div');
+    why.textContent = t(r.meaning.key, r.meaning.vars || {});
+    detail.append(why);
+  }
+  // まとめた項目が途中で止まり、始めていないファイル（取り込んでいない。もう一度落とす。#37）
+  if (r.notStarted) {
+    const left = document.createElement('div');
+    left.textContent = t('quick_not_started', { count: Number(r.notStarted).toLocaleString(lang) });
+    detail.append(left);
+  }
+  if (r.failures && r.failures.length) detail.append(quickFailures(r));
+  if (r.notices && r.notices.lines.length) detail.append(quickLines(r.notices, 'quick_notices', 'quick-notices'));
+  if (r.output && r.output.lines.length) detail.append(quickLines(r.output, 'quick_output', 'quick-output', 'quick_output_omitted'));
+  if (r.csvPath) actions.append(quickButton('csv', 'open_csv', 'ghost'));
+  // 出力が示した次の操作（詳細ログと一緒に消えるので、行から辿れるようにする）
+  if (r.adoptPath) actions.append(quickButton('adopt', 'next_adopt_button'));
+  if (r.forgetIds && r.forgetIds.length) actions.append(quickButton('forget', 'next_forget_button'));
+}
+
+// ------------------------------------------------------- 実行の履歴（#38）
+
+const resyncHistory = ListSync.createResync(
+  () => api.historyList(), (m) => receiveHistory(m), (e) => console.error('run history', e), () => historyState.seq,
+);
+
+/** main から届いた履歴の写し（差分か全体）を当てる。通し番号が飛んでいたら全体を問い合わせ直す。 */
+function receiveHistory(msg) {
+  const { state, resync } = ListSync.receiveList(historyState, msg);
+  if (resync) {
+    resyncHistory(msg.seq);
+    return;
+  }
+  if (state === historyState) return;
+  historyState = state;
+  renderHistory();
+}
+
+/**
+ * 今のタブで実行ボタンから始めた、前の実行（新しい順）。出力欄に出している実行は除く（同じものを 2 つ並べない）。
+ * 出力欄を消したら、その実行もここから開く
+ */
+function historyShown() {
+  // 除くのは、出力欄がその実行の始めからの出力を持っているときだけ（開き直した・実行中にクリアしたなら除かない）
+  const hidden = fullOutput ? shownRunId : null;
+  return historyState.items.filter((e) => e.mode === mode && e.id !== hidden).reverse();
+}
+
+let historyInputs = null;    // 前に描いたときの、出すものを決める値（変わらなければ何もしない）
+let renderedHistory = null; // 前に描いた行の並びと言語（変わらなければ行を付け直さない）
+const historyRows = new Map(); // 描いた履歴の行（実行の id → li。どのタブの行も持つ）
+
+/** 描いた履歴の行と、描くかを決める控えを捨てる（次の renderHistory で作り直す）。 */
+function invalidateHistory() {
+  historyRows.clear();
+  historyInputs = null;
+  renderedHistory = null;
+}
+
+/**
+ * 履歴を描く。出すもの（タブ・出力欄の実行・履歴の写し・言語）が変わったときだけ触る（renderRunView は進み具合の
+ * たびに呼ばれる。行を付け直すと、押しかけたボタン・選んだ文字・中の一覧の位置が失われる）。
+ */
+function renderHistory() {
+  // 出すものを決める値が前と同じなら何もしない（進み具合のたびに呼ばれる）
+  const inputs = `${mode}|${shownRunId}|${fullOutput}|${historyState.seq}|${lang}`;
+  if (inputs === historyInputs) return;
+  // 履歴から消えた行は捨てる（描かないタブにいる間も持ち続けない。言語を替えたときは applyLanguage が全部捨てる）
+  const kept = new Set(historyState.items.map((e) => e.id));
+  for (const id of historyRows.keys()) if (!kept.has(id)) historyRows.delete(id);
+  const entries = historyShown();
+  // 出す行（並び）と言語が変わらなければ触らない（ほかのタブの実行が終わっても、このタブの行を付け直さない）
+  const key = `${lang}|${entries.map((e) => e.id).join(',')}`;
+  if (key === renderedHistory) {
+    historyInputs = inputs;
+    return;
+  }
+  dom.runHistory.hidden = !entries.length;
+  dom.runHistorySummary.textContent = entries.length
+    ? t('history_title', { count: entries.length.toLocaleString(lang) }) : '';
+  // 中身は変わらないので、同じ言語なら使い回す（タブを行き来しても作り直さない・開いた一覧を閉じない）
+  dom.runHistoryList.replaceChildren(...entries.map((e) => {
+    const prev = historyRows.get(e.id);
+    if (prev) return prev;
+    const li = renderHistoryItem(e);
+    historyRows.set(e.id, li);
+    return li;
+  }));
+  // 控えは描き終えてから残す（途中で失敗したら、次の呼び出しで描き直す）
+  renderedHistory = key;
+  historyInputs = inputs;
+}
+
+function renderHistoryItem(entry) {
+  const li = document.createElement('li');
+  li.className = 'quick-item done';
+  li.dataset.id = String(entry.id);
+  const status = document.createElement('span');
+  status.className = 'quick-status';
+  const body = document.createElement('div');
+  body.className = 'quick-body';
+  const name = document.createElement('div');
+  name.className = 'quick-name';
+  // 終わった時刻と、コマンド（長いので 1 行に切り、全体はツールチップに）
+  // 日付も出す（アプリを開いたまま日をまたぐと、時刻だけでは前の日の実行と見分けられない）
+  const time = entry.finishedAt ? new Date(entry.finishedAt).toLocaleString(lang) : '';
+  name.textContent = t('history_item', { time });
+  const command = document.createElement('div');
+  command.className = 'history-command';
+  command.textContent = entry.command || '';
+  command.title = entry.command || '';
+  const detail = document.createElement('div');
+  detail.className = 'quick-detail';
+  body.append(name, command, detail);
+  const actions = document.createElement('div');
+  actions.className = 'quick-actions';
+  const r = entry.result || {};
+  // その実行の判定の内訳をそのまま出す（実行中の件数と同じ数え方）
+  fillResult(status, detail, actions, r, tallyKinds(r.tally || {}, r.failureCount || 0));
+  li.append(status, body, actions);
+  return li;
+}
+
+/**
  * 行に残した出力の行を、たたんだ一覧で出す: 警告・エラーの行（次の項目が始まると詳細ログが消えるので、終わった理由を
- * 残す）と、他のタブの実行の出力の末尾。key は見出しの辞書のキー（{count} は全体の行数）。捨てた行があれば、
+ * 残す）と、実行の履歴の出力の末尾（#38）。key は見出しの辞書のキー（{count} は全体の行数）。捨てた行があれば、
  * ログのファイルにあることを添える。
  */
 function quickLines({ lines, omitted }, key, cls, omittedKey = 'quick_notices_omitted') {
@@ -1483,22 +1639,37 @@ function onQuickQueueClick(e) {
   const row = button && button.closest('.quick-item');
   if (!row) return;
   const id = Number(row.dataset.id);
-  const item = quickItems.find((i) => i.id === id);
+  const item = quickItems().find((i) => i.id === id);
   if (!item) return;
   // 取り消せなかった（その間に始まった）ときは、届く列の写しが実行中の行に描き直す
   if (button.dataset.action === 'cancel') api.quickCancel(id).catch((err) => console.error('quick cancel', err));
   // 行の項目の実行に頼む（その間に終わって次の項目が始まっていたら、main は次を止めない）
   else if (button.dataset.action === 'stop') requestStop(item.runId);
-  else if (button.dataset.action === 'csv' && item.result && item.result.csvPath) api.reveal(item.result.csvPath);
-  else if (button.dataset.action === 'adopt' && item.result && item.result.adoptPath) {
+  else onResultAction(button.dataset.action, item.result);
+}
+
+/** 履歴の行のボタン（#38。列の完了の行と同じ）。 */
+function onHistoryClick(e) {
+  const button = e.target.closest('button[data-action]');
+  const row = button && button.closest('.quick-item');
+  if (!row) return;
+  const entry = historyState.items.find((i) => i.id === Number(row.dataset.id));
+  if (entry) onResultAction(button.dataset.action, entry.result);
+}
+
+/** 終わった実行の行（列の完了の行・履歴の行）のボタン: CSV を開く・次の操作へ。 */
+function onResultAction(action, result) {
+  if (!result) return;
+  if (action === 'csv' && result.csvPath) api.reveal(result.csvPath);
+  else if (action === 'adopt' && result.adoptPath) {
     // 出力の案内と同じ: 実パスをパス欄の正規化で書き換わらない形にして入れ、既存ファイルの登録のタブへ
-    setPathField(el('archiveRoot'), item.result.adoptPath).then(() => setMode('adopt'));
-  } else if (button.dataset.action === 'forget' && item.result) {
+    setPathField(el('archiveRoot'), result.adoptPath).then(() => setMode('adopt'));
+  } else if (action === 'forget') {
     // 出力の案内と同じく、保存フォルダ一覧のその実行の正本 DB の一覧に印を付ける（ID は正本 DB ごと）。
     // 実行中は付けない（印と正本 DB は、走っている実行の出力のもの。上書きすると、その実行の案内と取り違える）
     if (!running) {
-      forgetHint = new Set((item.result.forgetIds || []).map(Number));
-      runArchiveDb = String(item.result.archiveDb || '').trim();
+      forgetHint = new Set((result.forgetIds || []).map(Number));
+      runArchiveDb = String(result.archiveDb || '').trim();
     }
     setMode('archives');
   }
@@ -1538,6 +1709,7 @@ function wireQuick() {
     dom.defaultArchiveRoot.focus();
   });
   dom.quickQueue.addEventListener('click', onQuickQueueClick);
+  dom.runHistoryList.addEventListener('click', onHistoryClick);
   dom.quickResume.addEventListener('click', () => api.quickResume().catch((e) => console.error('quick resume', e)));
   dom.defaultArchiveRoot.addEventListener('change', renderQuick);
 }
@@ -1546,8 +1718,7 @@ function wireQuick() {
 function onRunStarted(run) {
   externalStarts += 1;
   context.run = null; // 開き直した直後に、古い写しで取り戻さない
-  // 前の出力を消す。結果は列の行に残っている（列の項目の結果・警告の行。他のタブの実行なら、main が終わり方・件数・
-  // CSV と出力の本文の末尾を列の完了の行に入れている）
+  // 前の出力を消す。結果は列の行（列の項目）か、実行の履歴（実行ボタンの実行。#38）に残っている
   clearLog();
   // 前の実行に頼んだ中断の印は、この実行のものではない
   stopRequested = false;
@@ -1555,6 +1726,8 @@ function onRunStarted(run) {
   adoptRun(run);
   runCommand = run.command || '';
   currentRunId = run.runId ?? null;
+  shownRunId = currentRunId;
+  fullOutput = true;
   setLogOpen(logOpenFor(run.mode));
   setRunning(true, run.startedAt);
   setStatus('info', 'status_running');
@@ -1722,11 +1895,13 @@ function wireRunControls() {
   });
   // 実行中のクリアはログの行だけ消す。進み具合と失敗の一覧はその実行のもので、main は失敗の一覧を
   // 増えたときにしか送らないので、ここで消すと二度と戻らない
-  // 終わった後のクリアは、前の実行の結果を画面から消す。main にも伝え、列の次の項目が始まるときに列へ残させない（#22）
+  // 終わった後のクリアは、前の実行の結果を出力欄から消す（実行ボタンの実行なら、履歴から開ける。#38）
   dom.clearLog.addEventListener('click', () => {
-    if (running) return clearLogLines();
-    clearLog();
-    return api.outputCleared().catch((e) => console.error('output cleared', e));
+    if (running) {
+      clearLogLines(); // 出力の行を捨てたら fullOutput を下ろす（clearLogLines）
+    } else {
+      clearLog();
+    }
   });
   dom.logToggle.addEventListener('click', () => setLogOpen(dom.log.hidden));
   dom.log.addEventListener('scroll', noteLogPosition, { passive: true });
@@ -1780,12 +1955,10 @@ function wireRunControls() {
 }
 
 function wireRunEvents() {
-  // かんたん取り込み（#22）: 列の写しと、列の項目が始まったこと
-  api.onQuickQueue((view) => {
-    quickQueueEvents += 1;
-    applyQuickView(view);
-    renderQuickQueue();
-  });
+  // かんたん取り込み（#22）: 列の写し（差分。#36）と、列の項目が始まったこと
+  api.onQuickQueue(receiveQuick);
+  // 実行ボタンの実行の出力の履歴（差分。#38）
+  api.onHistory(receiveHistory);
   api.onStarted(onRunStarted);
   api.onLog(appendLog);
   api.onProgress(renderProgress);
@@ -1796,6 +1969,9 @@ function wireRunEvents() {
     archivesStale = true;
     // 実行の素性は main の記録を正とする（開き直した直後、実行を取り戻す前に終わったときもここで決まる）
     if (result.mode) adoptRun(result);
+    // 出力欄に出ている実行（始まったという応答より先に終わっても、履歴と出力欄に同じ実行を並べない。#38）。
+    // 履歴から除くかは fullOutput も見て決める（historyShown）
+    if (result.runId !== undefined && result.runId !== null) shownRunId = result.runId;
     setRunning(false);
     // 実行中の印・残り時間・処理中のファイルを消して描き直す（段階の完了は detector が出したとおり）
     if (result.stage) renderProgress(result);
@@ -1836,15 +2012,12 @@ async function init() {
   wireForm();
   wireRunControls();
   wireQuick();
-  // かんたん取り込みの列（ウィンドウを閉じて開き直したときも、main が持っている列を出す。#22）。
-  // 問い合わせを待つ間に写しが届いたら、そちらが新しい
-  try {
-    const before = quickQueueEvents;
-    const view = await api.quickList();
-    if (quickQueueEvents === before) applyQuickView(view);
-  } catch (e) {
-    console.error('quick queue', e);
-  }
+  // かんたん取り込みの列と実行の履歴（ウィンドウを閉じて開き直したときも、main が持っているものを出す。#22・#38）。
+  // 全体の写しを問い合わせる。待つ間に届いた差分のほうが新しければ、通し番号で見分けて古い写しは当てない（#36）
+  // 問い合わせ直しと同じ道を通す（先に届いた差分が頼んだ問い合わせと 1 本にまとまり、答えより新しい差分を捨てても
+  // もう 1 度問い合わせる。描くときの失敗で起動を止めない）
+  resyncQuick();
+  resyncHistory();
   // 走り続けている実行を先に取り戻す（setMode が archives の一覧を読みに行き、main に断られないように）
   if (context.run) resumeRun(context.run);
   setMode(mode);

@@ -28,6 +28,7 @@
       "commands.js",
       "defaults-summary.js",
       "quick-queue.js",
+      "run-history.js",
       "detector-output.js",
       "i18n.js",
       "locales/**/*",

@@ -41,9 +41,11 @@ contextBridge.exposeInMainWorld('detector', {
   quickList: () => ipcRenderer.invoke('quick:list'),
   quickCancel: (id) => ipcRenderer.invoke('quick:cancel', id),
   quickResume: () => ipcRenderer.invoke('quick:resume'),
-  // 出力を消した（前の実行の結果を列に残さなくてよい）
-  outputCleared: () => ipcRenderer.invoke('run:output-cleared'),
+  // 列の写し（#36）: quickList は全体、onQuickQueue は差分（通し番号つき。renderer/list-sync.js で当てる）
   onQuickQueue: listen('quick:queue'),
+  // 実行ボタンの実行の出力の履歴（#38）: 全体と差分（列と同じ形）
+  historyList: () => ipcRenderer.invoke('run:history-list'),
+  onHistory: listen('run:history'),
   // 画面が始めていない実行（列の項目）が始まった
   onStarted: listen('run:started'),
   onLog: listen('run:log'),
